@@ -49,7 +49,7 @@ fn burn_in(game: &mut Game<'static>, pos: [i32; 3]) {
         f64::from(pos[1]),
         f64::from(pos[2]) + 0.5,
     );
-    game.player = Some(PlayerMotion::new(game.motion, at).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, at).unwrap());
     game.player.as_mut().unwrap().fire_ticks = 100;
     let events = {
         let player = game.player.as_mut().unwrap();
@@ -64,8 +64,8 @@ fn burn_in(game: &mut Game<'static>, pos: [i32; 3]) {
             player,
             scene: &mut game.world,
             assets: &game.pack.assets,
-            collision_binding: game.collision,
-            resources: game.motion,
+            collision_binding: &game.collision,
+            resources: &game.motion,
             health: &game.health_resources,
         };
         w.server_block_damage(at).unwrap();

@@ -16,7 +16,7 @@ use std::sync::Arc;
 fn standing_game() -> Game<'static> {
     let mut game = server_game();
     let feet = Vec3::new(8.5, 70.0, 8.5);
-    game.player = Some(horizon_client::motion::PlayerMotion::new(game.motion, feet).unwrap());
+    game.player = Some(horizon_client::motion::PlayerMotion::new(&game.motion, feet).unwrap());
     game.world
         .chunks
         .insert((0, 0), Arc::new(Chunk::empty(0, 0)));

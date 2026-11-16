@@ -1971,10 +1971,6 @@ impl OptionsUi {
                 Page::Video | Page::Controls | Page::KeyBinds | Page::ModBrowser
             )
     }
-    /// A search box of this screen has the keyboard: the language page's, the video and controls pages'
-    /// (`settings_search_active`), or the pack screen's. A phone shows its system keyboard while this is
-    /// true and puts it away with it, as `winit`'s fields need an IME to be allowed.
-
     /// The search box that has the keyboard, on the current page (GUI pixels), so a phone can tell a finger
     /// on the field from one on the rest of the screen.
     pub fn focused_rect(&self) -> Option<[f32; 4]> {
@@ -2001,6 +1997,9 @@ impl OptionsUi {
     /// Whether the screen's focus is a search box that takes the keys (an
     /// `EditBox` that `canConsumeInput`): the language list's, the settings
     /// search, or the pack screen's.
+    /// A search box of this screen has the keyboard: the language page's, the video and controls pages'
+    /// (`settings_search_active`), or the pack screen's. A phone shows its system keyboard while this is
+    /// true and puts it away with it, as `winit`'s fields need an IME to be allowed.
     pub fn typing(&self) -> bool {
         self.resource_error.is_none()
             && match self.page() {

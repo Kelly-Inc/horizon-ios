@@ -105,26 +105,26 @@ impl Default for WorldOptions {
 impl WorldOptions {
     /// A fresh Create New World in the game folder (the working directory): the defaults, with
     /// the packs this game folder gives every new world.
-    pub(super) fn for_new_world() -> Self {
+    pub(super) fn for_new_world() -> Result<Self, String> {
         let seeded = std::env::current_dir()
-            .ok()
-            .and_then(|dir| crate::datapack::seed_create_world(&dir));
+            .map_err(|error| error.to_string())
+            .and_then(|dir| crate::datapack::seed_create_world(&dir))?;
         let mut options = Self::default();
         if let Some((dir, ids)) = seeded {
             options.pack_dir = Some(dir);
             options.data_packs.extend(ids);
         }
-        options
+        Ok(options)
     }
     /// Re-Create: the saved world's choices.
     pub(super) fn of_world(
         level: &crate::save::Level,
         commands: bool,
         dir: &std::path::Path,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let generation = crate::save::WorldGen::read(dir).unwrap_or_default();
-        let (pack_dir, data_packs) = crate::datapack::for_recreate(dir);
-        Self {
+        let (pack_dir, data_packs) = crate::datapack::for_recreate(dir)?;
+        Ok(Self {
             hardcore: level.hardcore,
             difficulty: DIFFICULTIES
                 .iter()
@@ -142,7 +142,7 @@ impl WorldOptions {
             data_packs,
             pack_dir,
             ..Self::default()
-        }
+        })
     }
     /// Re-Create's repository enables the original world's feature packs.
     pub(super) fn restore_feature_packs(

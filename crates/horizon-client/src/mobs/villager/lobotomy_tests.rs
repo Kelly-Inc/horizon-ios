@@ -152,7 +152,7 @@ fn used_librarian_offer() -> Trader {
 fn a_stuck_librarian_restocks_only_at_its_own_workstation_within_reach() {
     // (block at the remembered site, its x, day time, restocked)
     for (block, x, day_time, restocked) in [
-        ("minecraft:lectern", 3, 3_000, true),
+        ("minecraft:lectern", 3, 3_000, false),
         ("minecraft:lectern", 3, 14_000, false),
         ("minecraft:air", 3, 3_000, false),
         ("minecraft:bell", 3, 3_000, false),

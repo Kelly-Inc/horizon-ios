@@ -21,6 +21,9 @@ use crate::hub::{answer, json_body, refuse};
 use crate::store::Store;
 use crate::{App, game_report, github, take, utc_now};
 
+/// A queued report's row id, kind and submitted fields.
+pub type UnfiledReport = (i64, String, Map<String, Value>);
+
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS hub_queue (
     id INTEGER PRIMARY KEY, kind TEXT NOT NULL, day INTEGER NOT NULL, created TEXT NOT NULL,
@@ -125,7 +128,7 @@ impl Store {
     }
 
     /// Reports (the website's and the game's) whose issue isn't open yet, from `since` on: id, kind and fields.
-    pub fn unfiled(&self, since: u32) -> rusqlite::Result<Vec<(i64, String, Map<String, Value>)>> {
+    pub fn unfiled(&self, since: u32) -> rusqlite::Result<Vec<UnfiledReport>> {
         let mut statement = self.db.prepare(
             "SELECT id, kind, body FROM hub_queue WHERE kind IN ('report', 'game') AND state = 'new' AND day >= ?1 ORDER BY id",
         )?;

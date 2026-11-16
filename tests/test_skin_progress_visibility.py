@@ -26,7 +26,7 @@ def program():
     b = game.index('        // Screen.extractBlurredBackground', a)
     dispatch = game[a:b]
     advance = method(game, 'advance_skin_frame') if 'fn advance_skin_frame(' in game else ''
-    return STUBS + '\nimpl Game {\n' + advance + '\nfn hud(&mut self,size:[u32;2])->HudBatch{' + body_prefix(game, 'hud', '        let mut batch =') + 'self.hud_layers(size)}\nfn hud_layers(&mut self,_:[u32;2])->HudBatch{let show_hud=!self.hide_gui;let mut batch=HudBatch::default();' + dispatch + 'batch}\nfn draw_tab_list(&mut self,_:&mut HudBatch){' + body_prefix(score, 'draw_tab_list', '        let key =') + 'self.remote_tab_players();self.tab_draws+=1;}\nfn remote_tab_players(&mut self){' + body_prefix(remote, 'remote_tab_players', '        let mut players:') + '}\n}\n' + CASES
+    return STUBS + '\nimpl Game {\n' + advance + method((ROOT / 'crates/horizon-client/src/game/hud_room.rs').read_text(), 'overlay_holds_view') + '\nfn hud(&mut self,size:[u32;2])->HudBatch{' + body_prefix(game, 'hud', '        let mut batch =') + 'self.hud_layers(size)}\nfn hud_layers(&mut self,_:[u32;2])->HudBatch{let show_hud=!self.hide_gui;let mut batch=HudBatch::default();' + dispatch + 'batch}\nfn draw_tab_list(&mut self,_:&mut HudBatch){' + body_prefix(score, 'draw_tab_list', '        let key =') + 'self.remote_tab_players();self.tab_draws+=1;}\nfn remote_tab_players(&mut self){' + body_prefix(remote, 'remote_tab_players', '        let mut players:') + '}\n}\n' + CASES
 
 
 STUBS = r'''
@@ -38,12 +38,13 @@ impl HudBatch{fn new(size:[u32;2])->Self{Self{width:size[0]as f32,height:size[1]
 mod hud_kit{pub mod room{pub struct Room;impl Room{pub fn new(_:f32,_:f32)->Self{Self}}}}
 struct Ui{room:hud_kit::room::Room}
 #[derive(Clone,Debug,PartialEq)]struct SkinDto{texture:&'static str,slim:bool}
-struct Game{ui:Ui,title:Option<()>,screen:Screen,hide_gui:bool,cancel_tab:bool,pending:Option<SkinDto>,available:bool,model:SkinDto,flushes:usize,polls:usize,tab_draws:usize}
+struct Game{overlay:bool,ui:Ui,title:Option<()>,screen:Screen,hide_gui:bool,cancel_tab:bool,pending:Option<SkinDto>,available:bool,model:SkinDto,flushes:usize,polls:usize,tab_draws:usize}
 impl Game{
- fn new(hide_gui:bool,cancel_tab:bool)->Self{Self{ui:Ui{room:hud_kit::room::Room},title:None,screen:Screen::Playing,hide_gui,cancel_tab,pending:Some(SkinDto{texture:"skins/custom-NPC",slim:true}),available:false,model:SkinDto{texture:"entity/player/wide/steve",slim:false},flushes:0,polls:0,tab_draws:0}}
+ fn new(hide_gui:bool,cancel_tab:bool)->Self{Self{overlay:false,ui:Ui{room:hud_kit::room::Room},title:None,screen:Screen::Playing,hide_gui,cancel_tab,pending:Some(SkinDto{texture:"skins/custom-NPC",slim:true}),available:false,model:SkinDto{texture:"entity/player/wide/steve",slim:false},flushes:0,polls:0,tab_draws:0}}
  fn flush_skin_slots(&mut self){self.flushes+=1;self.available=self.pending.is_some();}
  fn update_remote_skins(&mut self){self.polls+=1;if self.available{if let Some(ready)=self.pending.take(){self.model=ready;}}}
  fn gui_layer(&mut self,name:&str,b:&mut HudBatch,draw:impl FnOnce(&mut Self,&mut HudBatch)){if name!="minecraft:tab_list"||!self.cancel_tab{draw(self,b);}}
+ fn pad_radial_shown(&self)->bool{self.overlay}
  fn publish_tab_object_skins(&mut self){}
  fn draw_chat(&mut self,_:&mut HudBatch){}
 }
@@ -51,11 +52,11 @@ impl Game{
 
 CASES = r'''
 fn main(){
- for hide_gui in [false,true]{for cancel_tab in [false,true]{
-  let mut g=Game::new(hide_gui,cancel_tab);g.hud([1024,768]);
+ for overlay in [false,true]{for hide_gui in [false,true]{for cancel_tab in [false,true]{
+  let mut g=Game::new(hide_gui,cancel_tab);g.overlay=overlay;g.hud([1024,768]);
   assert_eq!(g.model,SkinDto{texture:"skins/custom-NPC",slim:true},"HUD hidden={hide_gui}, tab hook cancelled={cancel_tab} stopped a completed NPC skin");
   assert_eq!((g.flushes,g.polls),(1,1),"one skin-preparation pass per frame");
- }}
+ }}}
  // The chat screen takes the direct HUD branch; preparation still runs once.
  let mut g=Game::new(false,true);g.screen=Screen::Chat;g.hud([1024,768]);assert_eq!(g.model.texture,"skins/custom-NPC");assert_eq!((g.flushes,g.polls),(1,1));
 }

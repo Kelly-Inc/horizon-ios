@@ -185,7 +185,7 @@ impl Item {
             Item::Splitscreen => "horizon.extras.splitscreen.tooltip",
             Item::ChatAnimation => "horizon.extras.chat_animation.tooltip",
             Item::ChatIndicator => "horizon.extras.chat_indicator.tooltip",
-            Item::WheelCyclesSettings => "horizon.extras.wheel_cycles_settings.tooltip",
+            Item::WheelCyclesSettings => "horizon.extras.wheel_cycles_list_settings.tooltip",
             Item::PackBrowser => "horizon.extras.pack_browser.tooltip",
             Item::Pregen => "horizon.extras.pregen.tooltip",
 

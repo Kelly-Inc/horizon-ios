@@ -2479,7 +2479,16 @@ mod reload_transaction_tests {
         let pack = world.0.join("datapacks/fixture");
         std::fs::create_dir_all(pack.join("data/fixture/function")).unwrap();
         std::fs::create_dir_all(pack.join("data/minecraft/tags/function")).unwrap();
-        std::fs::write(pack.join("pack.mcmeta"), "{}").unwrap();
+        let format = horizon_core::version::DATA_PACK_FORMAT;
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            serde_json::json!({"pack":{
+                "description":"Reload transaction fixture", "pack_format":format.0,
+                "min_format":[format.0,format.1], "max_format":[format.0,format.1]
+            }})
+            .to_string(),
+        )
+        .unwrap();
         std::fs::write(
             world.0.join("datapacks.json"),
             r#"{"enabled":["file/fixture"],"disabled":[]}"#,
@@ -2584,10 +2593,15 @@ mod reload_transaction_tests {
         assert!(game.fns.load_pending);
         assert_eq!(game.fns.schedule, schedule);
         let enabled = game.fns.enabled.clone();
-        // The load tag runs first, then a due preserved schedule, then the tick
-        // tag. It must run once, not once per prepared or superseded candidate.
+        assert!(
+            enabled.iter().any(|id| id == "file/fixture"),
+            "fixture pack was not admitted: {enabled:?}"
+        );
+        // The load and tick tags precede the level's scheduled-function step.
+        // Load runs once, not once per prepared or superseded candidate.
         game.world.game_time = 123;
         game.tick_functions();
+        game.run_scheduled_functions();
         assert_eq!(
             game.score
                 .board

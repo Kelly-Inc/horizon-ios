@@ -1,5 +1,57 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn prepared_preflight_names_a_broken_json_table_link() {
+    let root = std::env::temp_dir().join(format!("horizon-preflight-link-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("horizon-resources.json"), "{}").unwrap();
+    std::os::unix::fs::symlink("missing.json", root.join("gameplay-facts.json")).unwrap();
+    let problem = missing_resources(&root, None);
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(
+        problem
+            .as_deref()
+            .is_some_and(|message| message.contains("gameplay-facts.json")),
+        "{problem:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires a non-root Unix process to exercise denied filesystem access"]
+fn prepared_preflight_reports_denied_manifest_and_directory_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let root =
+        std::env::temp_dir().join(format!("horizon-preflight-access-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let manifest = root.join("horizon-resources.json");
+    std::fs::write(&manifest, "{}").unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let read_denied = std::fs::read(&manifest).is_err();
+    let unreadable = missing_resources(&root, None);
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let manifest_readable = std::fs::read(&manifest).is_ok();
+    let listing_denied = std::fs::read_dir(&root).is_err();
+    let unlistable = missing_resources(&root, None);
+    // Restore and remove the owned fixture before asserting the production
+    // results, including when this regression is run against the broken code.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(
+        read_denied && manifest_readable && listing_denied,
+        "run without root privileges"
+    );
+    assert!(
+        unreadable
+            .as_deref()
+            .is_some_and(|message| message.contains("horizon-resources.json"))
+            && unlistable.is_some(),
+        "denied access was reported as healthy: manifest={unreadable:?}, directory={unlistable:?}"
+    );
+}
+
 #[test]
 fn a_folder_without_prepared_files_is_named_before_loading() {
     let root = std::env::temp_dir().join(format!("horizon-unprepared-{}", std::process::id()));

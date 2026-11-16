@@ -1326,18 +1326,6 @@ pub(super) use super::external::ShadowView;
 /// An arena page's key, native vertices and optional per-quad source records.
 pub(super) type TerrainPage = (u32, wgpu::Buffer, wgpu::Buffer);
 
-/// Header (sprite-rect words, state count), sprite rectangles, then model/fluid ids.
-/// Keeping immutable tables together leaves the existing three storage bindings intact.
-#[cfg(test)]
-pub(super) fn terrain_tables(table: &[i32], rects: &[u32]) -> Vec<i32> {
-    let rects = if rects.is_empty() { &[0, 0][..] } else { rects };
-    [rects.len() as i32, (table.len() / 2) as i32]
-        .into_iter()
-        .chain(rects.iter().map(|&v| v as i32))
-        .chain(table.iter().copied())
-        .collect()
-}
-
 pub(super) fn block_ids(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

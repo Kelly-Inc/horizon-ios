@@ -290,7 +290,7 @@ impl Hdr {
             );
         }
         let shader = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("Horizon HDR"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -1396,7 +1396,7 @@ var<private> params: ReferenceParams;
         use wgpu::util::DeviceExt;
         assert_eq!(source.format(), F::Rgba16Unorm);
         let shader = crate::gfx::shader_module(
-            &device,
+            device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("legacy non-float light oracle"),
                 source: wgpu::ShaderSource::Wgsl(

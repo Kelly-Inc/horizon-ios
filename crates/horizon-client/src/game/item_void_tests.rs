@@ -14,7 +14,7 @@ use std::sync::Arc;
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn items_fall_to_each_dimensions_own_void_floor() {
     let mut game = server_game();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 70.0, 8.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(8.5, 70.0, 8.5)).unwrap());
     for x in -2..=2 {
         for z in -2..=2 {
             game.world

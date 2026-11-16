@@ -2865,7 +2865,7 @@ mod tests {
             serial: next_serial(),
         };
         let recorder = TestRecorder::default();
-        session.start_recording(recorder.clone(), |_| {});
+        session.start_recording(recorder.clone(), |_| {}).unwrap();
         assert!(session.is_recording());
 
         let (thread_writer, thread_configuring, thread_recorder) = (
@@ -2934,12 +2934,14 @@ mod tests {
             pitch: 15.0,
             relatives: 0,
         });
-        session.start_recording(recorder.clone(), |rec| {
-            let encoded = snapshot.encode();
-            let mut reader = horizon_protocol::buf::Reader::new(&encoded);
-            let id = reader.varint().unwrap();
-            rec.record_packet(id, reader.rest());
-        });
+        session
+            .start_recording(recorder.clone(), |rec| {
+                let encoded = snapshot.encode();
+                let mut reader = horizon_protocol::buf::Reader::new(&encoded);
+                let id = reader.varint().unwrap();
+                rec.record_packet(id, reader.rest());
+            })
+            .unwrap();
         let swing_pkt = play::Clientbound::SwingAnimation(play::SwingAnimation {
             id: 42,
             hand: 0,

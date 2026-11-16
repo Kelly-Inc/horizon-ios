@@ -42,7 +42,7 @@ fn game() -> Game<'static> {
         None,
     )
     .unwrap();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 200.0, 4.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(4.5, 200.0, 4.5)).unwrap());
     game.build_registries();
     game.set_allow_commands(true);
     for x in -1..=1 {

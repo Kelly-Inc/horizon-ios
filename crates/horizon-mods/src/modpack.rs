@@ -15,6 +15,7 @@ pub const MANIFEST: &str = "horizon-modpack.toml";
 /// The manifest formats this build reads.
 pub const FORMAT: u32 = 1;
 const OVERRIDES: &str = "overrides/";
+const MAX_MANIFEST: u64 = 1 << 20;
 /// Bytes per override file and in all, unpacked.
 const MAX_OVERRIDE: u64 = 64 << 20;
 const MAX_OVERRIDES: u64 = 256 << 20;
@@ -119,11 +120,19 @@ impl Modpack {
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
         let mut text = String::new();
-        zip.by_name(MANIFEST)
-            .map_err(|_| format!("{MANIFEST}: missing"))?
-            .take(1 << 20)
+        let entry = zip
+            .by_name(MANIFEST)
+            .map_err(|_| format!("{MANIFEST}: missing"))?;
+        if entry.size() > MAX_MANIFEST {
+            return Err(format!("{MANIFEST}: exceeds 1 MiB"));
+        }
+        entry
+            .take(MAX_MANIFEST + 1)
             .read_to_string(&mut text)
             .map_err(|e| format!("{MANIFEST}: {e}"))?;
+        if text.len() as u64 > MAX_MANIFEST {
+            return Err(format!("{MANIFEST}: exceeds 1 MiB"));
+        }
         let manifest = Manifest::parse(&text)?;
         let (mut overrides, mut total) = (Vec::new(), 0u64);
         for i in 0..zip.len() {
@@ -160,23 +169,96 @@ impl Modpack {
         let pack = Modpack::read(path)?;
         let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
-        let mut written = Vec::new();
-        let mut total = 0u64;
-        for name in &pack.overrides {
-            // A zip's declared sizes are the pack's own claim, so the limits
-            // are counted again on the bytes actually inflated.
-            let result = Self::extract_one(&mut zip, name, home, &mut total);
-            match result {
-                Ok(target) => written.push(target),
-                Err(e) => {
-                    for target in &written {
-                        let _ = std::fs::remove_file(target);
-                    }
-                    return Err(e);
-                }
+        // Inflate and CRC-check every entry before touching profile files.
+        std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let staging = loop {
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let candidate = home.join(format!(".hpack-install-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.to_string()),
             }
+        };
+        let mut rollback_failed = false;
+        let result = (|| {
+            let mut total = 0;
+            let incoming = staging.join("incoming");
+            for name in &pack.overrides {
+                Self::extract_one(&mut zip, name, &incoming, &mut total)?;
+            }
+            let mut published: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+            for (index, name) in pack.overrides.iter().enumerate() {
+                let target = home.join(name);
+                let backup = staging.join(format!("backup-{index}"));
+                let mut parked = false;
+                let installed = (|| -> std::io::Result<()> {
+                    // Archive paths are plain, but a profile may already contain
+                    // links. Never follow one to overwrite files outside it.
+                    let mut parent = home.to_path_buf();
+                    let components: Vec<_> = Path::new(name).components().collect();
+                    for component in &components[..components.len() - 1] {
+                        parent.push(component.as_os_str());
+                        match std::fs::symlink_metadata(&parent) {
+                            Ok(metadata) if metadata.file_type().is_dir() => {}
+                            Ok(_) => {
+                                return Err(std::io::Error::other(
+                                    "override parent is not a regular directory",
+                                ));
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                std::fs::create_dir(&parent)?
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    if std::fs::symlink_metadata(&target).is_ok() {
+                        if !std::fs::symlink_metadata(&target)?.file_type().is_file() {
+                            return Err(std::io::Error::other(
+                                "override destination is not a regular file",
+                            ));
+                        }
+                        std::fs::rename(&target, &backup)?;
+                        parked = true;
+                    }
+                    std::fs::rename(incoming.join(name), &target)
+                })();
+                if let Err(error) = installed {
+                    let mut rollback_errors = Vec::new();
+                    if parked && let Err(e) = std::fs::rename(&backup, &target) {
+                        rollback_errors.push(e.to_string());
+                    }
+                    for (target, backup) in published.iter().rev() {
+                        if let Err(e) = std::fs::remove_file(target) {
+                            rollback_errors.push(e.to_string());
+                        }
+                        if let Some(backup) = backup
+                            && let Err(e) = std::fs::rename(backup, target)
+                        {
+                            rollback_errors.push(e.to_string());
+                        }
+                    }
+                    if rollback_errors.is_empty() {
+                        return Err(format!("{name}: {error}"));
+                    }
+                    // Keep backups if filesystem failure also prevented rollback.
+                    rollback_failed = true;
+                    return Err(format!(
+                        "{name}: {error}; restore incomplete; backups at {}: {}",
+                        staging.display(),
+                        rollback_errors.join("; ")
+                    ));
+                }
+                published.push((target, parked.then_some(backup)));
+            }
+            Ok(published.into_iter().map(|(target, _)| target).collect())
+        })();
+        // A backup still present after a failed rollback must remain recoverable.
+        if !rollback_failed {
+            let _ = std::fs::remove_dir_all(&staging);
         }
-        Ok(written)
+        result
     }
 
     fn extract_one(
@@ -259,7 +341,8 @@ sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
     fn write_pack(dir: &Path, manifest: &str, files: &[(&str, &[u8])]) -> PathBuf {
         let path = dir.join("cozy.hpack");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-        let options = zip::write::SimpleFileOptions::default();
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         zip.start_file(MANIFEST, options).unwrap();
         zip.write_all(manifest.as_bytes()).unwrap();
         for (name, bytes) in files {
@@ -301,6 +384,130 @@ sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
         let corner = home.join(format!("horizon-mods/{STORAGE_DIR}/coords_hud/corner.txt"));
         assert!(corner.is_file());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn override_publication_preserves_old_files_on_failure_and_replaces_on_success() {
+        for blocked in [false, true] {
+            let dir = scratch(if blocked { "rollback" } else { "replace" });
+            let path = write_pack(
+                &dir,
+                PACK,
+                &[
+                    ("overrides/horizon-graphics.txt", b"new graphics"),
+                    ("overrides/options.txt", b"new options"),
+                ],
+            );
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("horizon-graphics.txt"), b"old graphics").unwrap();
+            if blocked {
+                std::fs::create_dir(home.join("options.txt")).unwrap();
+            } else {
+                std::fs::write(home.join("options.txt"), b"old options").unwrap();
+            }
+            let result = Modpack::extract_overrides(&path, &home);
+            assert_eq!(result.is_ok(), !blocked);
+            assert_eq!(
+                std::fs::read(home.join("horizon-graphics.txt")).unwrap(),
+                if blocked {
+                    b"old graphics"
+                } else {
+                    b"new graphics"
+                }
+            );
+            if blocked {
+                assert!(home.join("options.txt").is_dir());
+            } else {
+                assert_eq!(
+                    std::fs::read(home.join("options.txt")).unwrap(),
+                    b"new options"
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(&home).unwrap().count(),
+                2,
+                "staging leaked"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn override_cannot_follow_a_profile_directory_link() {
+        let dir = scratch("linked-override");
+        let path = write_pack(
+            &dir,
+            PACK,
+            &[("overrides/resourcepacks/look.zip", b"new pack")],
+        );
+        let home = dir.join("home");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("look.zip"), b"outside original").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("resourcepacks")).unwrap();
+        assert!(Modpack::extract_overrides(&path, &home).is_err());
+        assert_eq!(
+            std::fs::read(outside.join("look.zip")).unwrap(),
+            b"outside original"
+        );
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_override_keeps_existing_profile_files() {
+        let dir = scratch("corrupt-existing");
+        let payload = b"unique broken extra settings";
+        let path = write_pack(
+            &dir,
+            PACK,
+            &[
+                ("overrides/options.txt", b"new options"),
+                ("overrides/horizon-graphics.txt", payload),
+            ],
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes
+            .windows(payload.len())
+            .position(|b| b == payload)
+            .unwrap();
+        bytes[at] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("options.txt"), b"old options").unwrap();
+        std::fs::write(home.join("horizon-graphics.txt"), b"old graphics").unwrap();
+        assert!(Modpack::extract_overrides(&path, &home).is_err());
+        assert_eq!(
+            std::fs::read(home.join("options.txt")).unwrap(),
+            b"old options"
+        );
+        assert_eq!(
+            std::fs::read(home.join("horizon-graphics.txt")).unwrap(),
+            b"old graphics"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_modpack_manifest_is_not_accepted_as_a_valid_prefix() {
+        let dir = scratch("manifest-limit");
+        let text = format!("{PACK}{}", " ".repeat(MAX_MANIFEST as usize - PACK.len()));
+        let path = write_pack(&dir, &text, &[]);
+        assert!(
+            Modpack::read(&path).is_ok(),
+            "exact-limit manifest rejected"
+        );
+        let text = format!("{text} ");
+        let path = write_pack(&dir, &text, &[]);
+        assert!(
+            Modpack::read(&path).is_err(),
+            "oversized manifest was silently truncated"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

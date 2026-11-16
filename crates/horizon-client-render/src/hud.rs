@@ -4611,8 +4611,9 @@ texture=wide",
             (2048, 1024)
         );
         // Nothing Mojang's was walked: only synthetic slots and the exact bundled controller
-        // images. Their names use the resource namespace spelling (`horizon:...`).
+        // and Horizon mark images. Their names use the resource namespace spelling (`horizon:...`).
         let bundled: std::collections::HashSet<String> = crate::pad_glyph::images()
+            .chain(crate::mark_sprite::image())
             .map(|(name, _, _, _)| name)
             .collect();
         let foreign: Vec<&str> = atlas

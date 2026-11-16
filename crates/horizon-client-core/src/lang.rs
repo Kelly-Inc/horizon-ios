@@ -1062,7 +1062,13 @@ mod tests {
                 let key_like = key
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.".contains(&b));
-                if key.matches('.').count() < 2 || !key_like || NOT_KEYS.contains(&key) {
+                // Namespace prefixes in assertions (for example "horizon.extras.")
+                // are not complete translation keys.
+                if key.matches('.').count() < 2
+                    || key.split('.').any(str::is_empty)
+                    || !key_like
+                    || NOT_KEYS.contains(&key)
+                {
                     continue;
                 }
                 found += 1;

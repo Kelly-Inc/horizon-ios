@@ -152,11 +152,22 @@ pub(crate) fn discover_folder_with(
     dir: &Path,
     validator: &crate::packs::DirectoryValidator,
 ) -> Vec<DataPack> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+    discover_folder_impl(dir, validator, false).unwrap_or_default()
+}
+
+fn discover_folder_impl(
+    dir: &Path,
+    validator: &crate::packs::DirectoryValidator,
+    strict: bool,
+) -> std::io::Result<Vec<DataPack>> {
+    let entries = std::fs::read_dir(dir)?;
     let mut packs = Vec::new();
-    for e in entries.flatten() {
+    for e in entries {
+        let e = match e {
+            Ok(entry) => entry,
+            Err(error) if strict => return Err(error),
+            Err(_) => continue,
+        };
         let name = e.file_name().to_string_lossy().into_owned();
         // `PackDetector.detectPackResources`: a link, or a pack holding one, is
         // not a pack unless the validator allows the target; the id stays the
@@ -164,6 +175,7 @@ pub(crate) fn discover_folder_with(
         let path = match crate::packs::detected_pack_path(&e.path(), validator) {
             Ok(Some(path)) => path,
             Ok(None) => continue,
+            Err(err) if strict => return Err(err),
             Err(err) => {
                 log::warn!(
                     "Failed to read properties of '{}', ignoring: {err}",
@@ -172,41 +184,67 @@ pub(crate) fn discover_folder_with(
                 continue;
             }
         };
-        if path.is_dir() && folder_metadata_present(&path) {
-            packs.push(DataPack {
-                id: format!("file/{name}"),
-                source: Source::Dir(path),
-            });
+        if path.is_dir() {
+            let present = match folder_metadata_present(&path) {
+                Ok(present) => present,
+                Err(error) if strict => return Err(error),
+                Err(_) => false,
+            };
+            if present {
+                packs.push(DataPack {
+                    id: format!("file/{name}"),
+                    source: Source::Dir(path),
+                });
+            }
         } else if path
             .file_name()
             .is_some_and(|n| n.to_string_lossy().ends_with(".zip"))
-            && let Ok(z) = Zip::open(&path)
-            && z.contains("pack.mcmeta")
         {
-            packs.push(DataPack {
-                id: format!("file/{name}"),
-                source: Source::Zip(Box::new(z)),
-            });
+            match Zip::open(&path) {
+                Ok(z) if z.contains("pack.mcmeta") => packs.push(DataPack {
+                    id: format!("file/{name}"),
+                    source: Source::Zip(Box::new(z)),
+                }),
+                Err(error) if strict && error.kind() != std::io::ErrorKind::InvalidData => {
+                    return Err(error);
+                }
+                _ => {}
+            }
         }
     }
     packs.sort_by(|a, b| a.id.cmp(&b.id));
-    packs
+    Ok(packs)
+}
+
+/// A missing optional folder is normal; a configured source that cannot be read is not.
+fn optional_packs(dir: &Path) -> Result<Vec<DataPack>, String> {
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}", dir.display())),
+        Ok(_) => {}
+    }
+    discover_folder_impl(dir, &crate::packs::DirectoryValidator::game(), true)
+        .map_err(|error| format!("{}: {error}", dir.display()))
 }
 /// `Pack.readPackMetadata`: even its fallback codec requires a pack section
 /// and description. Keep this folder gate separate from format compatibility
 /// and the existing interpretation of the description component.
-fn folder_metadata_present(path: &Path) -> bool {
-    let Some(meta) = std::fs::read(path.join("pack.mcmeta"))
-        .ok()
-        .and_then(|bytes| crate::packs::parse_meta(&bytes))
-    else {
-        return false;
+fn folder_metadata_present(path: &Path) -> std::io::Result<bool> {
+    let metadata = path.join("pack.mcmeta");
+    let bytes = match std::fs::read(&metadata) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
     };
-    meta.as_object()
+    let Some(meta) = crate::packs::parse_meta(&bytes) else {
+        return Ok(false);
+    };
+    Ok(meta
+        .as_object()
         .and_then(|root| root.get("pack"))
         .and_then(serde_json::Value::as_object)
         .and_then(|pack| pack.get("description"))
-        .is_some_and(|description| !description.is_null())
+        .is_some_and(|description| !description.is_null()))
 }
 /// The resources root's built-in feature packs (`ServerPacksSource`
 /// scanning the game's `data/minecraft/datapacks`): every folder with a
@@ -308,23 +346,25 @@ pub fn screen_packs(dir: &Path, resources: &Path) -> Vec<crate::pack_screen::Pac
 pub const NEW_WORLD_PACKS: &str = "new-world-datapacks";
 
 /// Create World's temporary pack folder holding `game_dir`'s [`NEW_WORLD_PACKS`], and their ids,
-/// to show them selected in the Data Packs screen. `None` when there are none.
-pub fn seed_create_world(game_dir: &Path) -> Option<(PathBuf, Vec<String>)> {
+/// to show them selected in the Data Packs screen. `None` when there are none;
+/// errors stay errors so creation cannot fall back to a different pack set.
+pub fn seed_create_world(game_dir: &Path) -> Result<Option<(PathBuf, Vec<String>)>, String> {
     let from = game_dir.join(NEW_WORLD_PACKS);
-    let ids: Vec<String> = discover_folder(&from).into_iter().map(|p| p.id).collect();
+    let ids: Vec<String> = optional_packs(&from)?.into_iter().map(|p| p.id).collect();
     if ids.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let seeded = temp_folder()
-        .map_err(|e| e.to_string())
-        .and_then(|dir| copy(&from, &dir).map(|()| dir));
-    match seeded {
-        Ok(dir) => Some((dir, ids)),
-        Err(e) => {
-            log::warn!("Horizon: data packs for new worlds: {e}");
-            None
-        }
+    let dir = staged_copy(&from)?;
+    Ok(Some((dir, ids)))
+}
+
+fn staged_copy(from: &Path) -> Result<PathBuf, String> {
+    let dir = temp_folder().map_err(|e| e.to_string())?;
+    if let Err(error) = copy(from, &dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(error);
     }
+    Ok(dir)
 }
 
 /// A world about to be created without Create World (`--world`, the control socket) gets
@@ -332,9 +372,15 @@ pub fn seed_create_world(game_dir: &Path) -> Option<(PathBuf, Vec<String>)> {
 pub fn install_new_world_packs(game_dir: &Path, world: &Path) -> Result<(), String> {
     let from = game_dir.join(NEW_WORLD_PACKS);
     let exists = |name: &str| world.join(name).exists();
-    if !from.is_dir() || exists("level.dat") || exists("level.dat_old") {
+    if exists("level.dat") || exists("level.dat_old") {
         return Ok(());
     }
+    match std::fs::symlink_metadata(&from) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", from.display())),
+        Ok(_) => {}
+    }
+    drop(std::fs::read_dir(&from).map_err(|error| format!("{}: {error}", from.display()))?);
     copy(&from, &world.join("datapacks"))
 }
 
@@ -345,9 +391,24 @@ pub fn temp_folder() -> std::io::Result<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("mcworld-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    temp_folder_at(nanos)
+}
+
+fn temp_folder_at(nanos: u128) -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let base = std::env::temp_dir();
+    std::fs::create_dir_all(&base)?;
+    loop {
+        let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = base.join(format!("mcworld-{}-{nanos}-{next}", std::process::id()));
+        // A clock can repeat, and a previous process can leave its directory.
+        // Only exclusive creation proves this is a new, empty folder we own.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 /// `PackSelectionScreen.onFilesDrop`'s `PackDetector`: a zip is a pack; a
 /// folder is one when it holds a `pack.mcmeta`, or exactly one folder that
@@ -456,8 +517,15 @@ pub fn install(dir: &Path, world: &Path, selected: &[String]) -> Result<(), Stri
 /// world has none), and the selection its `datapacks.json` makes, lowest
 /// priority first (`WorldOpenFlows.recreateWorldData` keeps the world's `DataConfiguration`).
 /// The built-in pack is selected unless the world turned it off.
-pub fn for_recreate(world: &Path) -> (Option<PathBuf>, Vec<String>) {
-    let packs = discover(world);
+/// A source read/copy failure is returned instead of dropping the world's packs.
+pub fn for_recreate(world: &Path) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let source = world.join("datapacks");
+    // Vanilla treats a regular file at this reserved folder name as no repository.
+    let packs = if source.is_file() {
+        Vec::new()
+    } else {
+        optional_packs(&source)?
+    };
     // No flags here: the recreated world keeps the original's
     // `enabled_features`, and the flag-aware load re-adds the feature packs
     // it asks for (`for_recreate`'s selection only seeds the new world's
@@ -472,17 +540,9 @@ pub fn for_recreate(world: &Path) -> (Option<PathBuf>, Vec<String>) {
         selected.insert(0, "vanilla".into());
     }
     if packs.is_empty() {
-        return (None, selected);
+        return Ok((None, selected));
     }
-    let dir = temp_folder().ok().and_then(|dir| {
-        if copy(&world.join("datapacks"), &dir).is_ok() {
-            Some(dir)
-        } else {
-            let _ = std::fs::remove_dir_all(&dir);
-            None
-        }
-    });
-    (dir, selected)
+    Ok((Some(staged_copy(&source)?), selected))
 }
 /// A file, or a folder and everything in it.
 fn copy(from: &Path, to: &Path) -> Result<(), String> {
@@ -491,7 +551,16 @@ fn copy(from: &Path, to: &Path) -> Result<(), String> {
         return std::fs::copy(from, to).map(drop).map_err(err);
     }
     std::fs::create_dir_all(to).map_err(err)?;
-    for e in std::fs::read_dir(from).map_err(err)?.flatten() {
+    copy_entries(from, to, std::fs::read_dir(from).map_err(err)?)
+}
+
+fn copy_entries(
+    from: &Path,
+    to: &Path,
+    entries: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Result<(), String> {
+    for e in entries {
+        let e = e.map_err(|error| format!("{} -> {}: {error}", from.display(), to.display()))?;
         copy(&e.path(), &to.join(e.file_name()))?;
     }
     Ok(())
@@ -1069,6 +1138,98 @@ pub fn worldgen_overrides(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn required_profile_pack_io_errors_are_not_an_empty_profile() {
+        let root = super::temp_folder().unwrap();
+        std::fs::write(root.join(super::NEW_WORLD_PACKS), b"not a directory").unwrap();
+        let result = super::seed_create_world(&root);
+        let new_world = root.join("new");
+        let install = super::install_new_world_packs(&root, &new_world);
+        assert!(!new_world.exists());
+        let existing = root.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("level.dat"), b"existing world marker").unwrap();
+        let existing_install = super::install_new_world_packs(&root, &existing);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable configured source must not become vanilla defaults"
+        );
+        assert!(install.is_err());
+        assert!(
+            existing_install.is_ok(),
+            "existing worlds do not receive profile defaults"
+        );
+    }
+
+    #[test]
+    fn directory_entry_read_errors_abort_recursive_copy() {
+        let result = super::copy_entries(
+            std::path::Path::new("source"),
+            std::path::Path::new("destination"),
+            std::iter::once(Err(std::io::Error::other(
+                "injected directory read failure",
+            ))),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .contains("injected directory read failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires Unix permissions enforced for a non-root user"]
+    fn recreating_a_world_does_not_discard_unreadable_packs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = super::temp_folder().unwrap();
+        let pack = root.join("datapacks/required");
+        let blocked = pack.join("data");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(
+            pack.join("pack.mcmeta"),
+            r#"{"pack":{"description":"required"}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::read_dir(&blocked).is_err();
+        let result = super::for_recreate(&root);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            denied,
+            "this explicit fixture requires permission enforcement"
+        );
+        assert!(
+            result.is_err(),
+            "recreation cannot substitute an empty pack set"
+        );
+    }
+    #[test]
+    fn temporary_pack_folders_are_distinct_when_the_clock_repeats() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let first = super::temp_folder_at(stamp).unwrap();
+        std::fs::write(first.join("keep.txt"), b"first world's staged pack").unwrap();
+        let second = super::temp_folder_at(stamp).unwrap();
+        assert_ne!(
+            first, second,
+            "separate creation requests must not share staged packs"
+        );
+        assert!(
+            std::fs::read_dir(&second).unwrap().next().is_none(),
+            "a new folder must be empty"
+        );
+        assert_eq!(
+            std::fs::read(first.join("keep.txt")).unwrap(),
+            b"first world's staged pack"
+        );
+        std::fs::remove_dir_all(first).unwrap();
+        std::fs::remove_dir_all(second).unwrap();
+    }
     use super::*;
 
     #[test]
@@ -1194,7 +1355,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hz-new-world-packs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (game, world, old) = (root.join("game"), root.join("new"), root.join("old"));
-        assert!(seed_create_world(&game).is_none());
+        assert!(seed_create_world(&game).unwrap().is_none());
         assert_eq!(install_new_world_packs(&game, &world), Ok(()));
         assert!(!world.join("datapacks").exists());
         for pack in ["void", "islands"] {
@@ -1203,7 +1364,7 @@ mod tests {
             std::fs::write(dir.join("pack.mcmeta"), r#"{"pack":{"description":""}}"#).unwrap();
             std::fs::write(dir.join("data/v/function/a.mcfunction"), "say a").unwrap();
         }
-        let (temp, ids) = seed_create_world(&game).unwrap();
+        let (temp, ids) = seed_create_world(&game).unwrap().unwrap();
         assert_eq!(ids, ["file/islands", "file/void"]);
         assert!(temp.join("void/data/v/function/a.mcfunction").is_file());
         let _ = std::fs::remove_dir_all(&temp);

@@ -418,7 +418,8 @@ impl Game<'_> {
                 .and_then(|r| self.remote_passenger_seat(b.id, r.entity_id))
                 .map(|(index, _)| index);
             out.push(json!({"id": b.id, "kind": b.entity_type(), "position": at(b.position), "yaw": b.yaw,
-                "passengers": passengers, "passenger_seat": seat, "controlling": self.remote_controls_boat(b.id)}));
+                "passengers": passengers, "passenger_seat": seat, "controlling": self.remote_controls_boat(b.id),
+                "damage": b.damage, "hurt_time": b.hurt_time}));
         }
         for c in &self.carts {
             out.push(

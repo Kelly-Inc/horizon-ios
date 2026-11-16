@@ -647,6 +647,9 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         guard active, gui.width > 0, gui.height > 0, let surface,
               surface.window?.rootViewController?.presentedViewController == nil else { return false }
+        // Menu scrolling cancels UIKit touches. During play those same touches
+        // own camera movement, so rejecting them in the handler is too late.
+        if gestureRecognizer is UIPanGestureRecognizer && playing { return false }
         if touch.view is CustomTouchView {return false}
         let location = touch.location(in: surface), p = point(location)
         let configuration = configuration()

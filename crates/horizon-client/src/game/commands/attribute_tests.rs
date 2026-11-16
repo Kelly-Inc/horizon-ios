@@ -73,7 +73,7 @@ fn saved_attributes(game: &mut Game<'_>) -> Tag {
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn failed_modifier_value_get_leaves_the_attribute_store_and_its_save_alone() {
     with_game(|game| {
-        game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
+        game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
         let key = game
             .player
             .as_ref()

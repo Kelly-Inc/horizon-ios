@@ -611,7 +611,74 @@ pub fn save_polytone_choices(
         .collect();
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(map))
         .map_err(std::io::Error::other)?;
-    fs::write(path, text)
+    write_polytone_choices_atomic(path, text.as_bytes())
+}
+
+fn write_polytone_choices_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Keep an existing user link: publish beside its target, not over the link.
+    let mut destination = path.to_path_buf();
+    let mut links = 0;
+    loop {
+        match fs::symlink_metadata(&destination) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if links == 40 {
+                    return Err(io::Error::other("Too many configuration symbolic links"));
+                }
+                links += 1;
+                let target = fs::read_link(&destination)?;
+                destination = if target.is_absolute() {
+                    target
+                } else {
+                    destination.parent().unwrap_or(Path::new("")).join(target)
+                };
+            }
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    let permissions = match fs::metadata(&destination) {
+        Ok(meta) if meta.is_dir() => return Err(io::ErrorKind::IsADirectory.into()),
+        // Non-file destinations (for example /dev/null) have no stored snapshot
+        // to replace; retain the ordinary write semantics for those.
+        Ok(meta) if !meta.is_file() => return fs::write(&destination, bytes),
+        Ok(meta) if meta.permissions().readonly() => {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(meta) => Some(meta.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let (temporary, mut file) = loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary =
+            destination.with_file_name(format!(".horizon-polytone-{}-{n}.tmp", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let written = (|| {
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    let result = written.and_then(|()| fs::rename(&temporary, &destination));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 fn pack(id: String, title: Text, source: Source) -> Option<Pack> {
     pack_for(id, title, source, RESOURCE_FORMAT)
@@ -1720,6 +1787,153 @@ impl SelectionModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polytone_choices_replace_complete_snapshots_and_keep_unrelated_files() {
+        use horizon_polytone::pack::ConfigValue;
+        let root = crate::datapack::temp_folder().unwrap();
+        let path = root.join("polytone-config.json");
+        let unrelated = root.join(format!(".horizon-polytone-{}-0.tmp", std::process::id()));
+        fs::write(&unrelated, b"preserve unrelated file").unwrap();
+        let mut choices = BTreeMap::from([
+            ("on".into(), ConfigValue::Bool(true)),
+            ("amount".into(), ConfigValue::Number(0.5)),
+            ("name".into(), ConfigValue::Text("colour".into())),
+        ]);
+        save_polytone_choices(&path, &choices).unwrap();
+        assert_eq!(load_polytone_choices(&path), choices);
+        choices.remove("on");
+        save_polytone_choices(&path, &choices).unwrap();
+        assert_eq!(load_polytone_choices(&path), choices);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"preserve unrelated file");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn polytone_choice_save_keeps_an_existing_link_and_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::datapack::temp_folder().unwrap();
+        let target = root.join("target.json");
+        let link = root.join("choices.json");
+        fs::write(&target, b"{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink("target.json", &link).unwrap();
+        let choices =
+            BTreeMap::from([("on".into(), horizon_polytone::pack::ConfigValue::Bool(true))]);
+        save_polytone_choices(&link, &choices).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(load_polytone_choices(&target), choices);
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(
+            save_polytone_choices(&link, &BTreeMap::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(load_polytone_choices(&target), choices);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        // A user may link the configuration before its first save creates the
+        // target. Keep the link and create the target as an ordinary write did.
+        fs::remove_file(&target).unwrap();
+        save_polytone_choices(&link, &choices).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(load_polytone_choices(&target), choices);
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("choices.json", &link).unwrap();
+        assert!(save_polytone_choices(&link, &choices).is_err());
+        assert_eq!(load_polytone_choices(&target), choices);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_polytone_saves_publish_one_whole_choice_set() {
+        let root = crate::datapack::temp_folder().unwrap();
+        let path = root.join("choices.json");
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    let choices = BTreeMap::from([(
+                        "value".into(),
+                        horizon_polytone::pack::ConfigValue::Text(format!(
+                            "writer{writer}:{}",
+                            "x".repeat(8192)
+                        )),
+                    )]);
+                    save_polytone_choices(path, &choices).unwrap();
+                });
+            }
+        });
+        let choices = load_polytone_choices(&path);
+        assert_eq!(choices.len(), 1);
+        assert!((0..8).any(|writer| choices.get("value")
+            == Some(&horizon_polytone::pack::ConfigValue::Text(format!(
+                "writer{writer}:{}",
+                "x".repeat(8192)
+            )))));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "explicit Unix write-failure fixture; requires Python resource limits"]
+    fn a_failed_polytone_save_preserves_existing_choices() {
+        const CHILD: &str = "HORIZON_TEST_LIMIT_POLYTONE_WRITE";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let choices = BTreeMap::from([(
+                "shader.option".into(),
+                horizon_polytone::pack::ConfigValue::Text("x".repeat(4096)),
+            )]);
+            assert!(save_polytone_choices(Path::new(&path), &choices).is_err());
+            return;
+        }
+        let root = crate::datapack::temp_folder().unwrap();
+        let path = root.join("polytone-config.json");
+        let original = b"{\"old\":true}\n";
+        fs::write(&path, original).unwrap();
+        // Restrict only this child; stdout/stderr are pipes, not regular files.
+        let child = std::process::Command::new("python3").arg("-c")
+            .arg("import os,resource,signal,sys; signal.signal(signal.SIGXFSZ,signal.SIG_IGN); resource.setrlimit(resource.RLIMIT_FSIZE,(64,64)); os.execv(sys.argv[1],sys.argv[1:])")
+            .arg(std::env::current_exe().unwrap()).args(["--ignored", "--exact", "packs::tests::a_failed_polytone_save_preserves_existing_choices", "--nocapture"])
+            .env(CHILD, &path).output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "child must execute its write failure"
+        );
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "failed temporary write must be removed"
+        );
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            after, original,
+            "failed save must not truncate the previous choices"
+        );
+    }
 
     /// `FolderRepositorySource.discoverPacks` + `PackDetector.detectPackResources`:
     /// an entry that is a link, or holds one, is not a pack the game lists.

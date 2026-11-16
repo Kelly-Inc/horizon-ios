@@ -2765,13 +2765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "horizon-dnssd"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "horizon-cosmetics"
 version = "0.1.0"
 dependencies = [
@@ -2782,6 +2775,14 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "horizon-dnssd"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -11,7 +11,15 @@ enum GameFolder {
 
     /// Whether imported game files are in place (`import::resources_root`'s second stop).
     static var hasGameFiles: Bool {
-        FileManager.default.fileExists(atPath: resources.appendingPathComponent("horizon-resources.json").path)
+        containsGameFiles(at: resources)
+    }
+
+    static func containsGameFiles(at resources: URL) -> Bool {
+        // Match the engine's is_file(): follow a link to a regular manifest,
+        // but reject directories, broken links and other non-file entries.
+        let marker = resources.appendingPathComponent("horizon-resources.json").resolvingSymlinksInPath()
+        let attributes = try? FileManager.default.attributesOfItem(atPath: marker.path)
+        return attributes?[.type] as? FileAttributeType == .typeRegular
     }
 }
 
@@ -131,9 +139,13 @@ final class GameLink: ObservableObject {
     }
 
     func refresh() async {
+        guard !Task.isCancelled else { return }
+        // A pull-to-refresh or setup completion can overlap the watcher. Only
+        // the newest read may publish; launch transitions also change this epoch.
+        phaseEpoch = UUID()
         let epoch = phaseEpoch
         let state = await self.send("launcher-state")
-        guard epoch == phaseEpoch else { return }
+        guard epoch == phaseEpoch, !Task.isCancelled else { return }
         let was = phase
         switch state["phase"] as? String {
         case "waiting":

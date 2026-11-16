@@ -76,6 +76,7 @@ impl StartupMenu {
                     seed: Some(options.seed),
                     creative: options.creative,
                     create: None,
+                    from_title: false,
                 })
         };
         let mut menu = Self {
@@ -218,6 +219,7 @@ impl StartupMenu {
                 seed: None,
                 creative: false,
                 create: None,
+                from_title: true,
             },
             Action::Create {
                 folder,
@@ -231,6 +233,7 @@ impl StartupMenu {
                 seed,
                 creative,
                 create: Some(Box::new(options)),
+                from_title: true,
             },
             Action::Connect {
                 address,
@@ -366,7 +369,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 /// Resolve vanilla and native content before applying the selected resource packs.
-
+///
 /// Each generation has its own channel and progress. Pack changes wait for the
 /// old tail before starting another generation, including cache/global writes.
 pub(super) fn spawn_loader(

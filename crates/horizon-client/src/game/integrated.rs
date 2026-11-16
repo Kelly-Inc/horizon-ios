@@ -195,6 +195,7 @@ impl Integrated {
             thread: None,
             tasks,
             world_name: "Controlled reload test".into(),
+            emergency_save: None,
         };
         (
             handle,
@@ -475,6 +476,8 @@ struct Launch {
     seed: Option<i64>,
     creative: bool,
     create: Option<WorldOptions>,
+    /// Held before the client's pack writes, then moved into the world loader.
+    session_lock: Option<horizon_client::save::SessionLock>,
     /// The window's profile: the only one let in until the world is open to
     /// the LAN, and the world's player.
     owner: u128,
@@ -551,6 +554,7 @@ impl Game<'_> {
         seed: Option<i64>,
         creative: bool,
         create: Option<&WorldOptions>,
+        session_lock: horizon_client::save::SessionLock,
     ) -> Result<()> {
         // The window's mod configs before the server's, as on NeoForge.
         self.native_configs_client_start();
@@ -576,6 +580,7 @@ impl Game<'_> {
             seed,
             creative,
             create: create.cloned(),
+            session_lock: Some(session_lock),
             owner,
             player: player.clone(),
             owner_profile: auth.as_ref().map(|a| {
@@ -1473,7 +1478,7 @@ fn serve(
     pack: PackResources,
     options: Options,
     settings: Settings,
-    launch: Launch,
+    mut launch: Launch,
     flags: Arc<Flags>,
     tasks: Receiver<Task>,
     ready: &Sender<Ready>,
@@ -1490,7 +1495,10 @@ fn serve(
     )
     // `IntegratedServer.setSingleplayerProfile`: the account this world belongs to
     // (an older world's offline owner moves to it at open).
-    .map(|request| request.owned_by(&launch.player, launch.owner))
+    .map(|mut request| {
+        request.session_lock = launch.session_lock.take();
+        request.owned_by(&launch.player, launch.owner)
+    })
     .and_then(|request| {
         WorldLoader::start(
             request,
@@ -1606,7 +1614,7 @@ mod tests {
         ));
         game.player = Some(
             horizon_client::motion::PlayerMotion::new(
-                game.motion,
+                &game.motion,
                 horizon_core::geometry::Vec3::new(8.5, 64.0, 8.5),
             )
             .unwrap(),

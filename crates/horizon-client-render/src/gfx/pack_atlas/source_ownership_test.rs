@@ -73,8 +73,13 @@ fn terrain_source_ownership_gpu() {
             ));
         }
     }
-    let declarations = inputs
-        .declarations
+    // The translator normally supplies the pack's lighting policy constants.
+    // This direct input-body probe supplies the same defaults explicitly.
+    let declarations = format!(
+        "const float hz_ao_strength=1.0; const bool hz_old_lighting=true; const bool hz_separate_ao=false;\n{}",
+        inputs.declarations
+    );
+    let compute_declarations = declarations
         .lines()
         .filter(|l| !l.starts_with("layout(location"))
         .collect::<Vec<_>>()
@@ -89,7 +94,7 @@ fn terrain_source_ownership_gpu() {
             .as_str()
     };
     let source = format!(
-        "#version 450\n{declarations}\n\
+        "#version 450\n{compute_declarations}\n\
          layout(local_size_x=1) in;\n\
          layout(set=0,binding=0) buffer Results {{ vec4 result[]; }};\n\
          void main() {{\n\
@@ -113,7 +118,7 @@ fn terrain_source_ownership_gpu() {
         label: Some("Original terrain numeric control"),
         source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
     });
-    let layouts: Vec<_> = [1, 2, 0, 3]
+    let layouts: Vec<_> = [1, 2, 0, 4]
         .into_iter()
         .map(|count| {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -167,16 +172,18 @@ fn terrain_source_ownership_gpu() {
     });
     let slots = storage(bytemuck::cast_slice(&[0u32]));
     let origins = storage(bytemuck::cast_slice(&[[128.0f32, -32.0, -256.0, -1.0]]));
+    // Five table words per state: solid id/variant, fluid id/variant, emission.
     let ids = storage(bytemuck::cast_slice(&[
-        crate::mesher::TerrainSource::new(0, [2, 3, 4], 0, false),
-        crate::mesher::TerrainSource::new(1, [6, 3, 4], 13, false),
-        crate::mesher::TerrainSource::new(1, [6, 3, 4], 13, false),
-        crate::mesher::TerrainSource::new(1, [6, 3, 4], 13, true),
+        31i32, 0, -1, 1, 0, 47, 0, 59, 1, 13,
+    ]));
+    let states = storage(bytemuck::cast_slice(&[
+        crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(0, [2, 3, 4], false)),
+        crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(1, [6, 3, 4], false)),
+        crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(1, [6, 3, 4], false)),
+        crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(1, [6, 3, 4], true)),
     ]));
     let vertex_storage = storage(bytemuck::cast_slice(&vertices));
-    let rects = storage(bytemuck::cast_slice(
-        &super::super::pack_post::terrain_tables(&[31, -1, 47, 59], &[0, 1]),
-    ));
+    let rects = storage(bytemuck::cast_slice(&atlas.rects_table()));
     let group = |set: u32, buffers: &[&wgpu::Buffer]| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -195,7 +202,7 @@ fn terrain_source_ownership_gpu() {
         group(0, &[&result]),
         group(1, &[&slots, &origins]),
         group(2, &[]),
-        group(3, &[&ids, &vertex_storage, &rects]),
+        group(3, &[&ids, &vertex_storage, &states, &rects]),
     ];
     queue.submit([encoder.finish()]);
     let actual = dispatch(&device, &queue, &pipeline, &groups, &result);
@@ -244,7 +251,7 @@ fn terrain_source_ownership_gpu() {
         control=vec4(entity.x,mid.w,hz_Vertex.y+mid.y/64.0,hz_Vertex.x+mid.x/64.0);\n\
         uint corner=uint(gl_VertexIndex)%4u;float q=float(uint(gl_VertexIndex)/4u);\n\
         gl_Position=vec4(-1.0+(q+float(corner>=2u))*0.5,(corner==1u||corner==2u)?1.0:-1.0,0.5,1.0);}}",
-        inputs.declarations,
+        declarations,
         inputs.body,
         attribute("mc_Entity"),
         attribute("at_midBlock")
@@ -381,14 +388,14 @@ fn terrain_source_ownership_gpu() {
 
     // Reload changes only the immutable mapping; the same raw state/owner records
     // resolve to new material ids without baking a previous pack's ids into a mesh.
-    let changed = storage(bytemuck::cast_slice(
-        &super::super::pack_post::terrain_tables(&[211, -1, 223, 59], &[0, 1]),
-    ));
+    let changed = storage(bytemuck::cast_slice(&[
+        211i32, 0, -1, 1, 0, 223, 0, 59, 1, 13,
+    ]));
     let changed_groups = [
         groups[0].clone(),
         groups[1].clone(),
         groups[2].clone(),
-        group(3, &[&ids, &vertex_storage, &changed]),
+        group(3, &[&changed, &vertex_storage, &states, &rects]),
     ];
     let reloaded = dispatch(&device, &queue, &pipeline, &changed_groups, &result);
     for i in 0..vertices.len() {
@@ -409,12 +416,14 @@ fn terrain_source_ownership_gpu() {
         );
         assert_eq!(reloaded[2 * i + 1], actual[2 * i + 1]);
     }
-    let missing = storage(&[0; 8]);
+    let missing = storage(bytemuck::cast_slice(
+        &[crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::UNKNOWN); 4],
+    ));
     let missing_groups = [
         groups[0].clone(),
         groups[1].clone(),
         groups[2].clone(),
-        group(3, &[&missing, &vertex_storage, &rects]),
+        group(3, &[&ids, &vertex_storage, &missing, &rects]),
     ];
     let neutral = dispatch(&device, &queue, &pipeline, &missing_groups, &result);
     for i in 0..vertices.len() {

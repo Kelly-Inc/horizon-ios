@@ -273,7 +273,7 @@ mod tests {
     fn moves_worked_out_ahead_match_those_made_at_each_turn() {
         let mut game = server_game();
         let feet = horizon_core::geometry::Vec3::new(8.5, 70.0, 8.5);
-        game.player = Some(horizon_client::motion::PlayerMotion::new(game.motion, feet).unwrap());
+        game.player = Some(horizon_client::motion::PlayerMotion::new(&game.motion, feet).unwrap());
         // `ChunkMap.prepareEntityTickingChunk`: the chunks within 2 are loaded too.
         for x in -2..=2 {
             for z in -2..=2 {
@@ -352,11 +352,11 @@ mod tests {
             let item = game.dropped.iter().find(|i| i.id == id).unwrap();
             assert!(item.inside_block(
                 &game.world,
-                game.collision,
+                &game.collision,
                 &boxes,
                 Some(game.border.geometry())
             ));
-            assert!(!item.inside_block(&game.world, game.collision, &[], None));
+            assert!(!item.inside_block(&game.world, &game.collision, &[], None));
         }
         for item in game.dropped.iter_mut() {
             item.ticks = 39;

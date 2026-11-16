@@ -2,7 +2,105 @@ import XCTest
 import UIKit
 @testable import LauncherPreview
 
+@MainActor
+final class GameLinkRefreshTests: XCTestCase {
+    func testAnAlreadyCancelledRefreshDoesNotRequestState() async {
+        var requests = 0
+        let game = GameLink { _ in requests += 1; return ["phase": "title"] }
+        let refresh = Task { await game.refresh() }
+        refresh.cancel()
+        await refresh.value
+        XCTAssertEqual(requests, 0)
+        XCTAssertEqual(game.phase, .unknown)
+    }
+
+    func testAnOlderRefreshCannotReplaceNewerStateOrVersion() async {
+        let firstEntered = expectation(description: "first refresh")
+        let secondEntered = expectation(description: "second refresh")
+        var replies: [CheckedContinuation<[String: Any], Never>] = []
+        let game = GameLink { command in
+            XCTAssertEqual(command, "launcher-state")
+            return await withCheckedContinuation { reply in
+                replies.append(reply)
+                if replies.count == 1 { firstEntered.fulfill() }
+                else { secondEntered.fulfill() }
+            }
+        }
+        let first = Task { await game.refresh() }
+        await fulfillment(of: [firstEntered], timeout: 2)
+        let second = Task { await game.refresh() }
+        await fulfillment(of: [secondEntered], timeout: 2)
+        replies[1].resume(returning: ["phase": "title", "version": "current"])
+        await second.value
+        XCTAssertEqual(game.phase, .title)
+        replies[0].resume(returning: ["phase": "waiting", "version": "stale"])
+        await first.value
+        XCTAssertEqual(game.phase, .title)
+        XCTAssertEqual(game.version, "current")
+    }
+
+    func testACancelledRefreshDoesNotPublishItsReply() async {
+        let entered = expectation(description: "held refresh")
+        var hold = false
+        var reply: CheckedContinuation<[String: Any], Never>?
+        let game = GameLink { _ in
+            if !hold { return ["phase": "title", "version": "current"] }
+            return await withCheckedContinuation { pending in
+                reply = pending
+                entered.fulfill()
+            }
+        }
+        await game.refresh()
+        hold = true
+        let refresh = Task { await game.refresh() }
+        await fulfillment(of: [entered], timeout: 2)
+        refresh.cancel()
+        reply?.resume(returning: ["phase": "waiting", "version": "cancelled"])
+        await refresh.value
+        XCTAssertEqual(game.phase, .title)
+        XCTAssertEqual(game.version, "current")
+    }
+}
+
 final class FormattingTests: XCTestCase {
+    func testGameFileDetectionRequiresARegularManifestFile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let marker = root.appendingPathComponent("horizon-resources.json")
+        try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: true)
+        XCTAssertFalse(GameFolder.containsGameFiles(at: root))
+        try FileManager.default.removeItem(at: marker)
+        try Data("{}".utf8).write(to: marker)
+        XCTAssertTrue(GameFolder.containsGameFiles(at: root))
+        try FileManager.default.removeItem(at: marker)
+        let target = root.appendingPathComponent("actual-manifest.json")
+        try Data("{}".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: marker, withDestinationURL: target)
+        XCTAssertTrue(GameFolder.containsGameFiles(at: root))
+        try FileManager.default.removeItem(at: target)
+        XCTAssertFalse(GameFolder.containsGameFiles(at: root))
+        try FileManager.default.removeItem(at: marker)
+        try FileManager.default.createSymbolicLink(at: marker, withDestinationURL: root)
+        XCTAssertFalse(GameFolder.containsGameFiles(at: root))
+    }
+
+    func testSensitiveContinuationsDoNotEndAtAnArbitraryBracket() {
+        let text = "[12:00:00] [Render thread/INFO]: access_token:\n[opaque-fixture-value]\n[12:00:01] [Render thread/INFO]: shader ready\n"
+        let safe = Diagnostics.redactExport(text)
+        XCTAssertFalse(safe.contains("opaque-fixture-value"))
+        XCTAssertTrue(safe.contains("shader ready"))
+    }
+
+    func testBoundedReadDropsTheWholeLeadingPartialMessage() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at: file)}
+        let text = "[12:00:00] [Render thread/INFO]: access_token:\n" + String(repeating: "A", count: Diagnostics.limit) + "\nopaque-fixture-value\n[12:00:01] [Render thread/INFO]: shader ready\n"
+        try Data(text.utf8).write(to: file)
+        let safe = Diagnostics.redactExport(try Diagnostics.read(file))
+        XCTAssertFalse(safe.contains("opaque-fixture-value"))
+        XCTAssertTrue(safe.contains("shader ready"))
+    }
+
     func testFullDiagnosticsExportPreservesNewestGameFailureWithinBudget() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer {try? FileManager.default.removeItem(at: root)}
@@ -405,6 +503,26 @@ final class AutomaticGameFilesTests: XCTestCase {
         await model.startAutomaticallyIfNeeded()
         XCTAssertEqual(calls, 0)
         XCTAssertEqual(model.state, .idle)
+    }
+
+    func testCancelledLocalImportDoesNotLeaveSetupBusy() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".zip")
+        try Data("local-import-fixture".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        var imports = 0
+        let model = GameFilesDownload(importArchive: { _ in
+            imports += 1
+            return ["ok": true]
+        }, diagnostic: { message in
+            if message.contains("file_import_start") {
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        })
+        let operation = Task { await model.importPreparedFile(file) }
+        await operation.value
+        XCTAssertEqual(imports, 0)
+        XCTAssertEqual(model.state, .idle)
+        XCTAssertFalse(model.busy, "Cancelled file hydration must allow a retry")
     }
 
     func testAutomaticDownloadUsesResourceImporterAndKeepsCustomCredentials() async throws {

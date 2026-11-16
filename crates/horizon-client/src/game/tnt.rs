@@ -1084,6 +1084,7 @@ mod tests {
         let world = horizon_client::world::World::test_scene(&assets, &render, 3).unwrap();
         let at = Vec3::new(20.5, 20.0, 20.5);
         let mut tnt = PrimedTnt {
+            used_portal: false,
             rotation: [0.0; 2],
             block_state: None,
             id: 0,

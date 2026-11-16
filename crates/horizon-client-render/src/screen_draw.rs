@@ -690,7 +690,7 @@ impl TextField {
     }
     /// `setValue`.
     pub fn set_value(&mut self, m: &Measure, value: &str) {
-        self.value = crate::ui::utf16_prefix(value, self.max_length);
+        self.value = crate::clipboard::utf16_truncate_utf8(value, self.max_length);
         self.move_cursor_to(m, chars(&self.value), false);
         self.set_highlight(m, self.cursor);
     }

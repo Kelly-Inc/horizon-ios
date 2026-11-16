@@ -260,7 +260,7 @@ fn set_target(game: &mut Game<'_>, id: u32, target: Option<horizon_client::mobs:
 }
 
 fn place_player(game: &mut Game<'_>, x: f64, z: f64) {
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(x, 100.0, z)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(x, 100.0, z)).unwrap());
 }
 
 /// A player on either side is placed and compared like a mob

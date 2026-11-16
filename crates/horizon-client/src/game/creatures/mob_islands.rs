@@ -2059,7 +2059,7 @@ mod tests {
         game.build_registries();
         game.set_allow_commands(true);
         let feet = Vec3::new(104.5, 65.0, 8.5);
-        game.player = Some(horizon_client::motion::PlayerMotion::new(game.motion, feet).unwrap());
+        game.player = Some(horizon_client::motion::PlayerMotion::new(&game.motion, feet).unwrap());
         for x in -3..=16 {
             for z in -3..=3 {
                 let chunk = horizon_client::chunk::Chunk::empty(x, z);
@@ -2089,8 +2089,8 @@ mod tests {
             }
             // Packed 0.6 blocks apart: they push each other.
             for k in 0..110 {
-                let x = f64::from(x0 + 2) + f64::from(k % 10) * 0.6;
-                let z = 2.0 + f64::from(k / 10) * 0.6;
+                let x = f64::from(x0 + 2) + (k % 10) as f64 * 0.6;
+                let z = 2.0 + (k / 10) as f64 * 0.6;
                 let kind = kinds[k as usize % kinds.len()];
                 assert!(game.run_command(&format!("summon {kind} {x:.2} 66 {z:.2}")));
             }

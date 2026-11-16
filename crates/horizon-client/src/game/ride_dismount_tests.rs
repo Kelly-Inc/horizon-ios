@@ -116,7 +116,7 @@ fn getting_off_a_pig_steps_to_the_block_beside_its_facing() {
 fn scene(game: &mut Game<'_>) {
     game.build_registries();
     game.set_allow_commands(true);
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 64.0, 8.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.0, 8.5)).unwrap());
 }
 
 const GHAST: &str = "0000ca3e-0000-0000-0000-000000000007";

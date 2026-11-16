@@ -1,4 +1,5 @@
 {
+  "horizon.import.game_files_only": "The automatic download did not contain game files.",
   "horizon.no_resources.title": "No prepared game files",
   "horizon.no_resources.prepare": "Prepare them with horizon-prepare --prepare, or pass --resources <folder>.",
   "horizon.no_resources.looked_in": "No prepared game files in %s",
@@ -1229,5 +1230,20 @@
   "horizon.perf.copy_hover": "Copy the link.",
   "horizon.perf.retry_button": "[Retry]",
   "horizon.perf.retry_hover": "Try the upload again. The profile is still saved on your computer.",
-  "horizon.perf.link_hover": "Open the shared profile in your browser."
+  "horizon.perf.link_hover": "Open the shared profile in your browser.",
+  "horizon.extras.zoom.tooltip": "Hold the zoom key to zoom; the wheel changes it while held.",
+  "horizon.extras.zoom_key.tooltip": "Click, then press a key. Escape unbinds it.",
+  "horizon.extras.zoom_level.tooltip": "The zoom the key starts at.",
+  "horizon.extras.zoom_smooth.tooltip": "Eases in and out like the spyglass.",
+  "horizon.extras.zoom_sensitivity.tooltip": "Turns slower the more you zoom in.",
+  "horizon.extras.fps.tooltip": "Frames per second in a corner of the screen.",
+  "horizon.extras.overlay_corner.tooltip": "Overlays in one corner stack.",
+  "horizon.extras.fps_lows.tooltip": "The slowest frame and the 1% low of the last 5 seconds.",
+  "horizon.extras.keystrokes.tooltip": "Movement keys, jump and mouse buttons as you press them.",
+  "horizon.extras.keystrokes_cps.tooltip": "Clicks in the last second under each mouse button.",
+  "horizon.extras.minimap.tooltip": "A map of the loaded terrain around you, in map colours.",
+  "horizon.extras.minimap_size.tooltip": "How big the map is on screen.",
+  "horizon.extras.minimap_shape.tooltip": "Square or round.",
+  "horizon.extras.minimap_zoom.tooltip": "Blocks per pixel: smaller shows more detail, larger more land.",
+  "horizon.extras.minimap_rotate.tooltip": "Forward is up; off keeps north up."
 }

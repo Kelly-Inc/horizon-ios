@@ -597,19 +597,39 @@ pub(super) fn missing_resources(
 /// beats serde's bare "expected value at line 1 column 1".
 pub(super) fn damaged_prepared(root: &std::path::Path) -> Option<String> {
     let manifest = root.join("horizon-resources.json");
-    let bytes = std::fs::read(&manifest).ok()?;
+    let bytes = match std::fs::read(&manifest) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(format!("cannot read horizon-resources.json: {error}")),
+    };
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Some("horizon-resources.json is empty".into());
     }
     if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
         return Some("horizon-resources.json is not valid JSON".into());
     }
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => return Some(format!("cannot list prepared resources: {error}")),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Some(format!("cannot read a prepared-resource entry: {error}")),
+        };
         let path = entry.path();
         if path.extension() != Some(std::ffi::OsStr::new("json")) {
             continue;
         }
-        if std::fs::metadata(&path).is_ok_and(|meta| meta.len() == 0) {
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Some(format!(
+                    "cannot inspect {}: {error}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        };
+        if metadata.len() == 0 {
             return Some(format!("{} is empty", entry.file_name().to_string_lossy()));
         }
     }

@@ -44,13 +44,15 @@ BUTTON
 fn container_key_clones(_: i32, _: KeyAction) -> bool { false }
 mod keybinds { pub fn key_name(key: i32) -> Option<&'static str> { (key == 1).then_some("key.keyboard.a") } }
 mod horizon_client { pub(crate) use crate::keybinds; }
-enum Source { Keyboard }
+#[derive(Clone,Copy,Debug,PartialEq)] enum Source { Keyboard, Touch }
 struct Bindings;
 impl Bindings { fn translate_all(&self, _: i32) -> Vec<std::result::Result<i32, i32>> { vec![Ok(10), Ok(11), Err(2)] } }
 struct Settings { keys: Bindings }
-struct Game { expected_raw: i32, ios: bool, extra_releases: usize, native_releases: usize, keys: HashSet<i32>, settings: Settings, screen: bool, title: Option<()>, modifiers: u32,
+struct Touch { synthetic: bool }
+struct Game { touch:Touch, expected_raw: i32, ios: bool, extra_releases: usize, native_releases: usize, keys: HashSet<i32>, settings: Settings, screen: bool, title: Option<()>, modifiers: u32,
     open: bool, cancel: bool, calls: Cell<usize>, handled: usize, released: Vec<(bool, i32)> }
 impl Game {
+    SYNTHETIC
     fn extras_key(&mut self,_:i32,pressed:bool,repeat:bool){assert!(!pressed&&!repeat);self.extra_releases+=1;}
     fn native_key_event(&mut self,_:i32,pressed:bool,repeat:bool){assert!(!pressed&&!repeat);self.native_releases+=1;}
     fn dialog_open(&self) -> bool { false }
@@ -60,11 +62,13 @@ impl Game {
         assert_eq!((*screen, name, modifiers), ("options", "key.keyboard.a", 5));
         self.calls.set(self.calls.get() + 1); *canceled = self.cancel;
     }
-    fn mapped_key(&mut self, key: i32, pressed: bool, repeat: bool, raw: i32, _: Source) -> Result<()> {
+    fn mapped_key(&mut self, key: i32, pressed: bool, repeat: bool, raw: i32, source: Source) -> Result<()> {
+        assert_eq!(source, if self.touch.synthetic {Source::Touch} else {Source::Keyboard});
         assert!(!pressed && !repeat && raw == self.expected_raw); self.released.push((false, key)); Ok(())
     }
     fn shared_default_acts(&self, _: i32, _: Option<&str>) -> bool { true }
-    fn mouse_mapping(&mut self, button: i32, pressed: bool, _: Source) -> Result<()> {
+    fn mouse_mapping(&mut self, button: i32, pressed: bool, source: Source) -> Result<()> {
+        assert_eq!(source, if self.touch.synthetic {Source::Touch} else {Source::Keyboard});
         assert!(!pressed); self.released.push((true, button)); Ok(())
     }
     fn inventory_pick_key(&mut self) { panic!("release cannot clone") }
@@ -77,7 +81,7 @@ impl Game {
 }
 #[test]
 fn release_and_screen_gates() {
-    for ios in [false,true] {
+    for synthetic in [false,true] {for ios in [false,true] {
     for (open, cancel, state, key, expected_calls, handled) in [
         (true, true, ElementState::Released, PhysicalKey::Code(1), 1, 0),
         (true, false, ElementState::Released, PhysicalKey::Code(1), 1, 1),
@@ -85,7 +89,7 @@ fn release_and_screen_gates() {
         (true, true, ElementState::Pressed, PhysicalKey::Code(1), 0, 1),
         (true, true, ElementState::Released, PhysicalKey::Code(2), 0, 1),
         (true, true, ElementState::Released, PhysicalKey::Unidentified, 0, 1)] {
-        let mut game = Game { expected_raw: match key { PhysicalKey::Code(raw) => raw, _ => 0 }, ios,extra_releases:0,native_releases:0, keys: HashSet::from([1]), settings: Settings { keys: Bindings }, screen: false,
+        let mut game = Game { touch:Touch{synthetic}, expected_raw: match key { PhysicalKey::Code(raw) => raw, _ => 0 }, ios,extra_releases:0,native_releases:0, keys: HashSet::from([1]), settings: Settings { keys: Bindings }, screen: false,
             title: None, modifiers: 5, open, cancel, calls: Cell::new(0), handled: 0, released: vec![] };
         let handled=if ios && state==ElementState::Released && matches!(key,PhysicalKey::Code(_)){0}else{handled};
         game.dispatch(WindowEvent::KeyboardInput { event: KeyEvent { state, physical_key: key } }).unwrap();
@@ -104,9 +108,9 @@ fn release_and_screen_gates() {
         game.mapped_key_event(1, false, false).unwrap();
         assert_eq!(game.released, if ios {vec![(false,10),(false,11),(true,2)]}else{vec![(false,10),(false,11)]});
     }
-    }
+    }}
 }
-""".replace("GATE", gate.replace("super::glfw_modifiers", "glfw_modifiers")).replace("MAPPING", mapping).replace("DISPATCH", dispatch).replace("BUTTON", button)
+""".replace("SYNTHETIC", method((ROOT / "crates/horizon-client/src/game/touch.rs").read_text(), "touch_synthetic_input")).replace("GATE", gate.replace("super::glfw_modifiers", "glfw_modifiers")).replace("MAPPING", mapping).replace("DISPATCH", dispatch).replace("BUTTON", button)
         with tempfile.TemporaryDirectory() as folder:
             src, exe = Path(folder) / "release.rs", Path(folder) / "release.exe"
             src.write_text(fixture, encoding="utf-8")

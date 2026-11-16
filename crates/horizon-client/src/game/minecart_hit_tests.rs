@@ -15,7 +15,7 @@ fn game_with_player() -> Game<'static> {
     game.build_registries();
     game.set_allow_commands(true);
     game.player = Some(
-        horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 64.0, 8.5)).unwrap(),
+        horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.0, 8.5)).unwrap(),
     );
     game
 }

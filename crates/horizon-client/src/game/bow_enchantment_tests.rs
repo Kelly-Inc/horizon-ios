@@ -36,7 +36,7 @@ fn game_with_player(root: &std::path::Path) -> Game<'static> {
     game.creative = true;
     game.player = Some(
         horizon_client::motion::PlayerMotion::new(
-            game.motion,
+            &game.motion,
             horizon_core::geometry::Vec3::new(10.5, 64.0, -3.25),
         )
         .unwrap(),

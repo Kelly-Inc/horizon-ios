@@ -203,13 +203,11 @@ fn install_archive(
     resources_only: bool,
 ) -> Result<Installed> {
     let pack = Pack::open(path)?;
-    if resources_only && pack.kind != Kind::Resources {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "The automatic download did not contain game files.",
-        )
-        .into());
-    }
+    let pack = if resources_only {
+        pack.require_game_files()?
+    } else {
+        pack
+    };
     pack.install(home)
 }
 

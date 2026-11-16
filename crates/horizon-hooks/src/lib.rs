@@ -110,6 +110,33 @@ pub trait Hooks: Sync {
     fn get_the_game(&self) -> Option<GetTheGame> {
         None
     }
+
+    /// Base URL for a prepared game-files archive (`<base>/<version>.zip`).
+    /// With no provider, the engine offers manual import instead. Asked before
+    /// first-run setup; the player's explicit URL override takes precedence.
+    fn game_files_base(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Optional name-based skins for offline profiles. Vanilla supplies no such
+    /// service; the first provider's endpoints and HTTP upgrade policy are used.
+    /// May be queried on the skin IO threads as well as the game thread.
+    fn name_skin_service(&self) -> Option<NameSkinService> {
+        None
+    }
+}
+
+/// Endpoints supplied by a higher layer for optional name-based skins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NameSkinService {
+    /// A name appended here returns a map of `SKIN`/`CAPE` texture objects.
+    pub textures: &'static str,
+    /// Fallback: a name appended here returns a Mojang profile ID, whose signed
+    /// textures the engine then requests from the vanilla session service.
+    pub profiles: &'static str,
+    /// An exact HTTP URL prefix whose texture URLs also work over HTTPS.
+    /// Other URLs returned by the service retain their original scheme.
+    pub upgrade_http_prefix: Option<&'static str>,
 }
 
 /// What [`Hooks::get_the_game`] answers. The texts are translation keys of the game's own strings
@@ -372,6 +399,16 @@ pub mod engine {
     pub fn get_the_game() -> Option<GetTheGame> {
         all().iter().find_map(|hooks| hooks.get_the_game())
     }
+
+    /// [`Hooks::game_files_base`]: the first registered provider's base URL.
+    pub fn game_files_base() -> Option<&'static str> {
+        all().iter().find_map(|hooks| hooks.game_files_base())
+    }
+
+    /// [`Hooks::name_skin_service`]: the first registered provider's service.
+    pub fn name_skin_service() -> Option<NameSkinService> {
+        all().iter().find_map(|hooks| hooks.name_skin_service())
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +422,16 @@ mod tests {
     struct Recorder(StdMutex<Vec<String>>);
 
     impl Hooks for Recorder {
+        fn game_files_base(&self) -> Option<&'static str> {
+            Some("https://example.org/prepared/")
+        }
+        fn name_skin_service(&self) -> Option<NameSkinService> {
+            Some(NameSkinService {
+                textures: "https://example.org/skins/",
+                profiles: "https://example.org/profiles/",
+                upgrade_http_prefix: Some("http://example.org/textures/"),
+            })
+        }
         fn started(&self, game: &Started<'_>) {
             self.0
                 .lock()
@@ -578,6 +625,8 @@ mod tests {
 
     #[test]
     fn registered_hooks_hear_the_game_and_late_ones_are_refused() {
+        assert_eq!(Silent.game_files_base(), None);
+        assert_eq!(Silent.name_skin_service(), None);
         register(&RECORDER).unwrap();
         register(&Silent).unwrap();
         engine::started(&Started::new("0.2.31", std::path::Path::new("game")));
@@ -595,6 +644,8 @@ mod tests {
         }
         engine::shutdown();
         assert!(engine::any());
+        assert_eq!(engine::game_files_base(), RECORDER.game_files_base());
+        assert_eq!(engine::name_skin_service(), RECORDER.name_skin_service());
         assert_eq!(
             engine::get_the_game().map(|g| g.address),
             Some("https://example.org")

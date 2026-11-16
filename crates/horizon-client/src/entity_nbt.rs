@@ -6014,9 +6014,6 @@ mod tests {
     }
 }
 
-/// `Brain.Packed`: the guarded-block live ANGRY_AT entry. Its modeled TTL
-/// is relative, including zero until the following brain tick.
-
 /// `Brain`'s two measured Warden Unit memories, using actual existing slots.
 fn write_warden_owned_memories(m: &Mob, map: &mut Compound) {
     let brain = map

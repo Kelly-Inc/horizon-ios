@@ -878,22 +878,41 @@ impl Title {
         self.scroll.set(crate::ui::Scroll::default());
         let worlds = list_worlds(&self.saves);
         self.create_return_to_main = worlds.is_empty();
-        self.mode = if worlds.is_empty() {
-            Self::new_world()
+        if worlds.is_empty() {
+            self.new_world();
         } else {
-            Mode::Select {
+            self.mode = Mode::Select {
                 worlds,
                 selected: None,
-            }
-        };
+            };
+        }
     }
-    pub(crate) fn new_world() -> Mode {
-        Mode::Create {
-            name: lang::get_or("selectWorld.newWorld", "New World"),
-            seed: String::new(),
-            creative: false,
-            focus: 0,
-            options: WorldOptions::for_new_world(),
+    pub(crate) fn new_world(&mut self) {
+        self.new_world_with_options(WorldOptions::for_new_world());
+    }
+    fn new_world_with_options(&mut self, options: Result<WorldOptions, String>) {
+        match options {
+            Ok(options) => {
+                self.mode = Mode::Create {
+                    name: lang::get_or("selectWorld.newWorld", "New World"),
+                    seed: String::new(),
+                    creative: false,
+                    focus: 0,
+                    options,
+                }
+            }
+            Err(message) => {
+                // A failed local preparation must not leave a Realms upload
+                // destination attached to a later singleplayer create action.
+                if let Some(request) = self.realms_create.take() {
+                    let mut screen = crate::realms::Screen::with_saves(Some(self.saves.clone()));
+                    screen.cancel_create_world(request);
+                    self.mode = Mode::Realms(screen);
+                } else if self.create_return_to_main || !matches!(self.mode, Mode::Select { .. }) {
+                    self.mode = Mode::Main;
+                }
+                self.failed(message);
+            }
         }
     }
     /// WorldSelectionList.handleNewLevels: a singleplayer list that comes
@@ -904,7 +923,7 @@ impl Title {
         *self.recent.borrow_mut() = None;
         if worlds.is_empty() {
             self.create_return_to_main = true;
-            self.mode = Self::new_world();
+            self.new_world();
             return;
         }
         let selected = folder.and_then(|folder| {
@@ -1072,7 +1091,7 @@ impl Title {
     pub fn finish_preparing(&mut self) {
         self.preparing = false;
         if !matches!(self.mode, Mode::Create { .. }) {
-            self.mode = Self::new_world();
+            self.new_world();
         }
     }
     /// `PackSelectionScreen.onFilesDrop`: a pack dropped on the window joins
@@ -2631,11 +2650,21 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         Some(info)
     }
 
+    /// Use the visible roster bounds for both painting and interaction.
+    fn button_rect(&self, b: &Button) -> [f32; 4] {
+        if let Mode::Realms(screen) = &self.mode
+            && let Some(rect) = screen.roster_button_rect(b.id)
+        {
+            return rect;
+        }
+        [b.x, b.y, b.w, 20.0]
+    }
+
     /// A button's narration: `gui.narrate.button` of its label, or the icon
     /// buttons' own message and tooltip, in the order the screen adds them.
     fn button_narration(&self, b: &Button) -> crate::widgets::Narratable {
         use crate::widgets::Narratable;
-        let rect = [b.x, b.y, b.w, 20.0];
+        let rect = self.button_rect(b);
         match &self.mode {
             Mode::Main => {}
             Mode::Create {
@@ -3453,20 +3482,24 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         // The hovered button's `Tooltip`, drawn once the widgets are.
         let mut button_tooltip = None;
         for b in self.buttons(w, h) {
-            crate::widgets::record(&b.label, [b.x, b.y, b.w, 20.0], b.enabled);
+            let rect = self.button_rect(&b);
+            let first_vertex = batch.vertices.len();
+            crate::widgets::record(&b.label, rect, b.enabled);
             // Realms' icon buttons have no label to record.
             if b.enabled && b.label.trim().is_empty() {
-                crate::widgets::target([b.x, b.y, b.w, 20.0]);
+                crate::widgets::target(rect);
             }
             if let Some(action) = b.action.filter(|_| !self.preparing) {
-                crate::widgets::declare_action(action, [b.x, b.y, b.w, 20.0], b.enabled);
+                crate::widgets::declare_action(action, rect, b.enabled);
             }
-            let inside =
-                cursor.0 >= b.x && cursor.0 < b.x + b.w && cursor.1 >= b.y && cursor.1 < b.y + 20.0;
+            let inside = cursor.0 >= b.x
+                && cursor.0 < b.x + b.w
+                && cursor.1 >= b.y
+                && cursor.1 < rect[1] + rect[3];
             crate::widgets::narratable(|| self.button_narration(&b).hovered(inside));
             crate::widgets::widget_cursor(inside, b.enabled);
             if inside && let Some(key) = self.button_tooltip(b.id) {
-                button_tooltip = Some((key, [b.x, b.y, b.w, 20.0]));
+                button_tooltip = Some((key, rect));
             }
             let is_focused = self.focused_button == Some(b.id);
             let hover = b.enabled && (inside || is_focused);
@@ -3506,6 +3539,15 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     u32::MAX,
                 );
                 crate::hud_layout::paint(batch, atlas, &draws);
+                if rect[3] < 20.0 {
+                    batch.clip_since(
+                        first_vertex,
+                        rect[0],
+                        rect[1],
+                        rect[0] + rect[2],
+                        rect[1] + rect[3],
+                    );
+                }
                 continue;
             }
             if let Some((icon, size)) = b.icon {
@@ -3520,6 +3562,15 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     size,
                     u32::MAX,
                 );
+                if rect[3] < 20.0 {
+                    batch.clip_since(
+                        first_vertex,
+                        rect[0],
+                        rect[1],
+                        rect[0] + rect[2],
+                        rect[1] + rect[3],
+                    );
+                }
                 continue;
             }
             b.draw_label(batch, atlas, color);
@@ -3533,6 +3584,15 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     size,
                     size,
                     u32::MAX,
+                );
+            }
+            if rect[3] < 20.0 {
+                batch.clip_since(
+                    first_vertex,
+                    rect[0],
+                    rect[1],
+                    rect[0] + rect[2],
+                    rect[1] + rect[3],
                 );
             }
         }
@@ -3750,7 +3810,10 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         let hit = self
             .buttons(w, h)
             .into_iter()
-            .find(|b| b.enabled && x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + 20.0)
+            .find(|b| {
+                let [bx, by, bw, bh] = self.button_rect(b);
+                b.enabled && x >= bx && x < bx + bw && y >= by && y < by + bh
+            })
             .map(|b| b.id);
         if hit.is_some() {
             self.focused_button = hit;
@@ -3854,7 +3917,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                         // upload into the Realm's slot instead of a local world.
                         self.realms_create = Some(request);
                         self.create_return_to_main = false;
-                        self.mode = Self::new_world();
+                        self.new_world();
                         Action::None
                     }
                     crate::realms::Outcome::None => Action::None,
@@ -4015,11 +4078,21 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                             return Action::None;
                         };
                         self.create_return_to_main = false;
-                        let mut options = WorldOptions::of_world(
+                        let mut options = match WorldOptions::of_world(
                             &level,
                             world.commands,
                             &self.saves.join(&world.folder),
-                        );
+                        ) {
+                            Ok(options) => options,
+                            Err(message) => {
+                                self.mode = Mode::Error {
+                                    message,
+                                    return_to: Box::new(self.mode.clone()),
+                                    alert: Some(Alert::Recreate),
+                                };
+                                return Action::None;
+                            }
+                        };
                         options.restore_feature_packs(&self.resources, &level);
                         self.mode = Mode::Create {
                             name: level.name,

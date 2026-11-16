@@ -4,7 +4,11 @@ use horizon_client::{
     chunk::Chunk,
     mobs::{Mob, MobEvent, goals::Cx},
 };
-use horizon_core::{geometry::Vec3, position::ChunkPos, random::RandomSource};
+use horizon_core::{
+    geometry::Vec3,
+    position::ChunkPos,
+    random::{LegacyRandom, RandomSource},
+};
 use std::sync::Arc;
 
 #[test]
@@ -302,7 +306,7 @@ fn leave_block_raw_query_uses_non_mob_presence_and_snapshot_identity() {
             stone
         };
         let mut actor = Mob::new(325, kind.clone(), Vec3::new(3.5, 4.0, 3.5), 0.0);
-        actor.random = LegacyRandom::new(325);
+        *actor.random = LegacyRandom::new(325);
         actor.extra.carried = Some(carried);
         game.mobs.push(actor);
         if pig_kind > 0 {

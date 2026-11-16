@@ -248,134 +248,11 @@ fn terrain_vertices_go_down_to_the_32768th_below_them() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A shader pack's flat terrain inputs read a compact record (`mesher::packed`) as the four
-/// vertices it holds: a whole tinted face with its own ambient occlusion per corner
-/// (`separateAo`), two more, and a slab's top kept as its vertices (`packed::FULL`).
-#[test]
-fn compact_records_feed_a_pack_the_vertices_they_hold() {
-    use crate::mesher::packed;
-    let instance = crate::gfx::test_gpu::instance();
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
-        return;
-    };
-    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: wgpu::Extent3d {
-            width: 16,
-            height: 16,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    let mut atlas = PackAtlas::new(&device, &mut encoder, &[texture], 1, 1, 16).unwrap();
-    queue.submit([encoder.finish()]);
-    atlas.separate_ao = true;
-    let tint = 0x7F_B238u32;
-    let ao = [255u32, 153, 102, 204];
-    let face = |x: f32, y: f32| {
-        let pos = [
-            [x, y, 5.0],
-            [x, y, 6.0],
-            [x + 1.0, y, 6.0],
-            [x + 1.0, y, 5.0],
-        ];
-        let uv = [[0, 0], [16 << 10, 0], [16 << 10, 16 << 10], [0, 16 << 10]];
-        (0..4).map(move |i| {
-            let [r, g, b] = [16, 8, 0].map(|s| 200 * (tint >> s & 255) / 255);
-            TerrainVertex {
-                pos: pos[i],
-                uv: uv[i],
-                layer: 0x8000,
-                light: 0xF0 | 0x40 << 8,
-                color: r | g << 8 | b << 16 | ao[i] << 24,
-            }
-        })
-    };
-    let solid: Vec<_> = [(3.0, 16.0), (5.0, 16.0), (7.0, 16.0), (3.0, 8.5)]
-        .into_iter()
-        .flat_map(|(x, y)| face(x, y))
-        .collect();
-    let records = packed::layout(&solid, &[tint; 4]);
-    assert_eq!(
-        packed::packed_quads(&records, 4),
-        3,
-        "whole faces pack, the slab doesn't"
-    );
-    let page = bytemuck::cast_slice(&records);
-    let packed_range = packed::PACKED_BASE..packed::PACKED_BASE + 16;
-    let origin = f32::from_bits((1. / UV_STEPS).to_bits());
-    let mut failures = Vec::new();
-    for expression in [
-        "gl_Vertex",
-        "gl_Color",
-        "vec4(gl_MultiTexCoord0.xy, gl_MultiTexCoord1.xy)",
-        "vec4(gl_Normal, 0.0)",
-        "at_tangent",
-        "at_midBlock",
-        "vec4(mc_midTexCoord, mc_Entity.xy)",
-    ] {
-        for shadow in [false, true] {
-            let flags = [true, shadow];
-            let wide = sample_probe(&device, &queue, &atlas, &solid, origin, flags, expression);
-            let compact = sample_page(
-                &device,
-                &queue,
-                &atlas,
-                page,
-                packed_range.clone(),
-                origin,
-                flags,
-                expression,
-            );
-            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|f| f.to_bits()).collect::<Vec<_>>();
-            if bits(&wide) != bits(&compact) {
-                failures.push(format!(
-                    "{expression} shadow={shadow}: {wide:?} != {compact:?}"
-                ));
-            }
-            if expression == "gl_Color" {
-                for (corner, want) in ao.iter().enumerate() {
-                    let got = compact[corner][3];
-                    if (got - *want as f32 / 255.0).abs() > 1e-6 {
-                        failures.push(format!("corner {corner}'s alpha {got} != {want}/255"));
-                    }
-                }
-            }
-        }
-    }
-    // A pack's frames keep the translucent quads in the section arena after the solid range: three
-    // records and no `FULL` quad, then a water quad, whose corners must read as its own.
-    let mut page: Vec<[u32; 6]> = packed::layout(&solid[..12], &[tint; 3]);
-    let water: Vec<_> = face(9.0, 15.0).collect();
-    let at = page.len() as u32;
-    page.extend(water.iter().map(|v| bytemuck::cast::<_, [u32; 6]>(*v)));
-    for expression in ["vec4(gl_Normal, 0.0)", "at_tangent", "at_midBlock"] {
-        let flags = [true, false];
-        let wide = sample_probe(&device, &queue, &atlas, &water, origin, flags, expression);
-        let page = bytemuck::cast_slice(&page);
-        let after = sample_page(
-            &device,
-            &queue,
-            &atlas,
-            page,
-            at..at + 4,
-            origin,
-            flags,
-            expression,
-        );
-        if wide != after {
-            failures.push(format!("water {expression}: {wide:?} != {after:?}"));
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
+// Shader packs intentionally use raw terrain with per-quad metadata: see
+// Renderer::follow_packed_layout and SectionMesh::upload_states. Forcing compact
+// records into this shader probe would bypass that contract. The supported raw
+// attribute and lighting paths are exercised end to end in pack_terrain_tests;
+// mesher::packed tests cover compact records used by ordinary terrain rendering.
 
 fn sample(
     device: &wgpu::Device,
@@ -563,7 +440,7 @@ fn sample_page(
     assert_eq!(vertices % 4, 0);
     let quads = vertices / 4;
     let ids = buffer(
-        bytemuck::cast_slice(&vec![0i32; quads * crate::gfx::TERRAIN_STATE_WORDS]),
+        bytemuck::cast_slice(&[-1i32, 0, 0, 0, 0].repeat(quads)),
         wgpu::BufferUsages::STORAGE,
     );
     // The production arena uploads one encoded metadata sidecar per quad at
@@ -579,10 +456,7 @@ fn sample_page(
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
     );
     let rects = buffer(
-        bytemuck::cast_slice(&super::super::pack_post::terrain_tables(
-            &[],
-            &atlas.rects_table(),
-        )),
+        bytemuck::cast_slice(&atlas.rects_table()),
         wgpu::BufferUsages::STORAGE,
     );
     let bindings = [

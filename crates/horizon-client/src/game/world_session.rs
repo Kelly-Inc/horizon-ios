@@ -2,6 +2,53 @@
 //! world on the server thread, and saving and leaving it on exit.
 use super::*;
 
+/// File access and pack preparation can fail without invalidating the client.
+#[derive(Debug)]
+struct WorldPreparationError(String);
+impl std::fmt::Display for WorldPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for WorldPreparationError {}
+
+/// Pack preparation must finish before a server is started. The caller owns the
+/// world's SessionLock throughout; an error leaves staged inputs available.
+pub(super) fn prepare_world_packs(
+    game_dir: &std::path::Path,
+    world: &std::path::Path,
+    resources: &std::path::Path,
+    create: Option<&horizon_client::title::WorldOptions>,
+) -> Result<()> {
+    let io_error =
+        |path: &std::path::Path, error: std::io::Error| format!("{}: {error}", path.display());
+    if let Some(dir) = create.and_then(|o| o.pack_dir.as_deref()) {
+        // Discovery is intentionally tolerant for browsers; creation must not
+        // interpret a missing/unreadable temporary folder as an empty selection.
+        drop(std::fs::read_dir(dir).map_err(|e| io_error(dir, e))?);
+        let packs = create.map_or(&[][..], |o| &o.data_packs[..]);
+        horizon_client::datapack::install(dir, world, packs)?;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    // install writes this itself, including its disabled packs. Only write a
+    // selection here when the Create screen did not supply a temporary folder.
+    if let Some(o) = create.filter(|o| o.pack_dir.is_none()) {
+        std::fs::create_dir_all(world).map_err(|e| io_error(world, e))?;
+        let disabled: Vec<String> = horizon_client::datapack::feature_packs(resources)
+            .into_iter()
+            .map(|p| p.id)
+            .filter(|id| !o.data_packs.contains(id))
+            .collect();
+        let json = serde_json::json!({"enabled": o.data_packs, "disabled": disabled});
+        let file = world.join("datapacks.json");
+        std::fs::write(&file, json.to_string()).map_err(|e| io_error(&file, e))?;
+    }
+    if create.is_none() {
+        horizon_client::datapack::install_new_world_packs(game_dir, world)?;
+    }
+    Ok(())
+}
+
 impl Game<'_> {
     /// `onAbort`: the confirm screen's Back or Escape reopens the Data
     /// Packs screen with the selection it had.
@@ -48,14 +95,18 @@ impl Game<'_> {
                 use horizon_client::clipboard::Clipboard;
                 self.clipboard.set(&text);
             }
-            Action::Play { folder } => self.open_world(&folder, None, None, false, None)?,
+            Action::Play { folder } => {
+                self.open_world_from_title(&folder, None, None, false, None)?
+            }
             Action::Create {
                 folder,
                 name,
                 seed,
                 creative,
                 options,
-            } => self.open_world(&folder, Some(&name), seed, creative, Some(&options))?,
+            } => {
+                self.open_world_from_title(&folder, Some(&name), seed, creative, Some(&options))?
+            }
             Action::Connect {
                 address,
                 lan,
@@ -77,6 +128,44 @@ impl Game<'_> {
             Action::None => {}
         }
         Ok(())
+    }
+    /// UI actions keep recoverable preparation errors in the menu. The raw
+    /// open_world API and non-UI pending requests retain their error result.
+    pub(super) fn open_world_from_title(
+        &mut self,
+        folder: &str,
+        name: Option<&str>,
+        seed: Option<i64>,
+        creative: bool,
+        create: Option<&horizon_client::title::WorldOptions>,
+    ) -> Result<()> {
+        match self.open_world(folder, name, seed, creative, create) {
+            Ok(()) => {
+                if let Some(PendingWorldEntry::Local {
+                    folder: pending,
+                    from_title,
+                    ..
+                }) = self.pending_entry.as_mut()
+                    && pending == folder
+                {
+                    *from_title = true;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if !error.is::<WorldPreparationError>() {
+                    return Err(error);
+                }
+                let Some(title) = self.title.as_mut() else {
+                    return Err(error);
+                };
+                log::warn!("Horizon: opening world {folder}: {error}");
+                title.failed(&error);
+                self.pending_entry = None;
+                self.perf.cancel_world_opening();
+                Ok(())
+            }
+        }
     }
     /// Enter a local world from the client: it runs on the client's server thread.
     pub(super) fn open_world(
@@ -102,55 +191,22 @@ impl Game<'_> {
             seed,
             creative,
             create: create.cloned().map(Box::new),
+            from_title: false,
         })? {
             return Ok(());
         }
         self.join_world_rest()?;
-        // Create World's data packs, in the world before it opens.
-        if let Some(dir) = create.and_then(|o| o.pack_dir.as_deref()) {
-            let world = std::env::current_dir()?.join("saves").join(folder);
-            // Create World's pack copy mutates the destination before its
-            // worker opens it. Do not write into another instance's save.
-            let _pack_lock = horizon_client::save::SessionLock::acquire_validated(
-                &world,
-                &std::env::current_dir()?.join("saves/allowed_symlinks.txt"),
-            )?;
-            let packs = create.map_or(&[][..], |o| &o.data_packs[..]);
-            if let Err(e) = horizon_client::datapack::install(dir, &world, packs) {
-                log::warn!("Horizon: data packs for {folder}: {e}");
-            }
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        // The world's pack selection (`DataPackConfig`), for the pack stack
-        // to read: the picked packs on, the feature packs left out off.
-        // Only when `install` did not run (no Data Packs screen opened): it
-        // writes the file itself, and its `disabled` must not be lost.
-        if let Some(o) = create.filter(|o| o.pack_dir.is_none()) {
-            let world = std::env::current_dir()?.join("saves").join(folder);
-            if let Err(e) = std::fs::create_dir_all(&world) {
-                log::warn!("Horizon: data packs for {folder}: {}: {e}", world.display());
-            } else {
-                let disabled: Vec<String> =
-                    horizon_client::datapack::feature_packs(&self.vanilla_root())
-                        .into_iter()
-                        .map(|p| p.id)
-                        .filter(|id| !o.data_packs.contains(id))
-                        .collect();
-                let json = serde_json::json!({"enabled": o.data_packs, "disabled": disabled});
-                let file = world.join("datapacks.json");
-                if let Err(e) = std::fs::write(&file, json.to_string()) {
-                    log::warn!("Horizon: data packs for {folder}: {}: {e}", file.display());
-                }
-            }
-        }
-        // A new world opened without the Create screen still gets the game folder's packs.
-        if create.is_none() {
-            let game_dir = std::env::current_dir()?;
-            let world = game_dir.join("saves").join(folder);
-            if let Err(e) = horizon_client::datapack::install_new_world_packs(&game_dir, &world) {
-                log::warn!("Horizon: data packs for {folder}: {e}");
-            }
-        }
+        let game_dir = std::env::current_dir()?;
+        let world = game_dir.join("saves").join(folder);
+        // Own the save before Create World's first write, and retain that same
+        // lock through the handoff to the server's WorldRequest.
+        let session_lock = horizon_client::save::SessionLock::acquire_validated(
+            &world,
+            &game_dir.join("saves/allowed_symlinks.txt"),
+        )
+        .map_err(|error| WorldPreparationError(error.to_string()))?;
+        prepare_world_packs(&game_dir, &world, &self.vanilla_root(), create)
+            .map_err(|error| WorldPreparationError(error.to_string()))?;
         // IntegratedServer.initServer's line, which other launchers read in `latest.log` to
         // offer the world again.
         horizon_client::logging::write_as(
@@ -161,7 +217,7 @@ impl Game<'_> {
                 horizon_core::VANILLA_VERSION
             ),
         );
-        self.open_integrated(folder, name, seed, creative, create)
+        self.open_integrated(folder, name, seed, creative, create, session_lock)
     }
 
     /// Load authoritative world state synchronously, without client entry or
@@ -273,5 +329,322 @@ impl Game<'_> {
             return self.leave_server(None);
         }
         self.begin_closing_save(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    struct MenuLoop;
+    impl super::super::event_loop::EventLoopCtl for MenuLoop {
+        fn exit(&self) {
+            panic!("a recoverable menu error must not exit the loop")
+        }
+        fn set_control_flow(&self, _: winit::event_loop::ControlFlow) {}
+    }
+    #[test]
+    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    fn title_world_preparation_failures_are_recoverable_and_keep_creation_inputs() {
+        use horizon_client::title::{Mode, Title, WorldOptions};
+        for deferred in [false, true] {
+            let fixture = Scratch::new();
+            let world = fixture.0.join("world");
+            let staged = fixture.0.join("staged");
+            std::fs::create_dir(&world).unwrap();
+            std::fs::create_dir(&staged).unwrap();
+            std::fs::write(world.join("datapacks"), b"preserve destination").unwrap();
+            let held =
+                deferred.then(|| horizon_client::save::SessionLock::acquire(&world).unwrap());
+            let options = WorldOptions {
+                pack_dir: Some(staged.clone()),
+                ..Default::default()
+            };
+            let mut game = super::super::native_machines::tests::server_game();
+            let mut title = Title::new(fixture.0.join("saves"), &game.options.resources);
+            title.mode = Mode::Create {
+                name: "Kept name".into(),
+                seed: "4242".into(),
+                creative: false,
+                focus: 0,
+                options: options.clone(),
+            };
+            game.title = Some(title);
+            let folder = world.to_str().unwrap();
+            let result = if deferred {
+                game.pending_entry = Some(super::super::PendingWorldEntry::Local {
+                    folder: folder.into(),
+                    name: Some("Kept name".into()),
+                    seed: Some(4242),
+                    creative: false,
+                    create: Some(Box::new(options.clone())),
+                    from_title: true,
+                });
+                game.resume_world_entry()
+            } else {
+                game.title_action(
+                    &MenuLoop,
+                    horizon_client::title::Action::Create {
+                        folder: folder.into(),
+                        name: "Kept name".into(),
+                        seed: Some(4242),
+                        creative: false,
+                        options: options.clone(),
+                    },
+                )
+            };
+            assert!(
+                result.is_ok(),
+                "a recoverable title-screen access error must not terminate the game"
+            );
+            let title = game.title.as_mut().unwrap();
+            assert!(
+                matches!(&title.mode, Mode::Error {message, ..} if message.contains(if deferred {"already open"} else {"datapacks"}))
+            );
+            title.escape();
+            assert!(
+                matches!(&title.mode, Mode::Create {name, seed, options: restored, ..}
+                if name == "Kept name" && seed == "4242" && restored == &options)
+            );
+            assert!(game.pending_entry.is_none());
+            assert!(game.integrated.is_none() && game.integrated_starting.is_none());
+            assert!(!world.join("level.dat").exists());
+            assert!(staged.is_dir());
+            assert_eq!(
+                std::fs::read(world.join("datapacks")).unwrap(),
+                b"preserve destination"
+            );
+            drop(game);
+            drop(held);
+            drop(
+                horizon_client::save::SessionLock::acquire(&world)
+                    .expect("failed entry releases its lock"),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    fn raw_world_requests_keep_error_results_even_when_a_title_exists() {
+        for deferred in [false, true] {
+            let fixture = Scratch::new();
+            let world = fixture.0.join("world");
+            let held = horizon_client::save::SessionLock::acquire(&world).unwrap();
+            let options = horizon_client::title::WorldOptions::default();
+            let mut game = super::super::native_machines::tests::server_game();
+            game.title = Some(horizon_client::title::Title::new(
+                fixture.0.join("saves"),
+                &game.options.resources,
+            ));
+            let folder = world.to_str().unwrap();
+            let result = if deferred {
+                game.pending_entry = Some(super::super::PendingWorldEntry::Local {
+                    folder: folder.into(),
+                    name: Some("raw fixture".into()),
+                    seed: Some(1),
+                    creative: false,
+                    create: Some(Box::new(options.clone())),
+                    from_title: false,
+                });
+                game.resume_world_entry()
+            } else {
+                game.open_world(folder, Some("raw fixture"), Some(1), false, Some(&options))
+            };
+            assert!(result.err().unwrap().to_string().contains("already open"));
+            assert!(matches!(
+                game.title.as_ref().unwrap().mode,
+                horizon_client::title::Mode::Main
+            ));
+            assert!(game.integrated.is_none() && game.integrated_starting.is_none());
+            drop(game);
+            drop(held);
+        }
+    }
+
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "horizon-pack-preparation-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn pack_preparation_propagates_missing_source_selection_and_default_copy_errors() {
+        let fixture = Scratch::new();
+        let game = &fixture.0;
+        let world = game.join("world");
+        let resources = game.join("resources");
+        let options = horizon_client::title::WorldOptions {
+            pack_dir: Some(game.join("missing-staged-packs")),
+            ..Default::default()
+        };
+        assert!(super::prepare_world_packs(game, &world, &resources, Some(&options)).is_err());
+        assert!(!world.join("datapacks.json").exists());
+
+        std::fs::create_dir_all(world.join("datapacks.json")).unwrap();
+        assert!(
+            super::prepare_world_packs(
+                game,
+                &world,
+                &resources,
+                Some(&horizon_client::title::WorldOptions::default())
+            )
+            .is_err()
+        );
+        assert!(world.join("datapacks.json").is_dir());
+
+        std::fs::create_dir(game.join(horizon_client::datapack::NEW_WORLD_PACKS)).unwrap();
+        std::fs::write(
+            game.join(horizon_client::datapack::NEW_WORLD_PACKS)
+                .join("fixture.txt"),
+            b"source",
+        )
+        .unwrap();
+        std::fs::write(world.join("datapacks"), b"preserve destination").unwrap();
+        assert!(super::prepare_world_packs(game, &world, &resources, None).is_err());
+        assert_eq!(
+            std::fs::read(world.join("datapacks")).unwrap(),
+            b"preserve destination"
+        );
+    }
+
+    #[test]
+    fn successful_pack_preparation_keeps_selection_and_copies_both_enabled_and_disabled_packs() {
+        let fixture = Scratch::new();
+        let root = &fixture.0;
+        let staged = root.join("staged");
+        let world = root.join("world");
+        let format = horizon_core::version::DATA_PACK_FORMAT;
+        let metadata = serde_json::json!({"pack":{"min_format":[format.0,format.1],"max_format":[format.0,format.1],"description":"copy fixture"}}).to_string();
+        for name in ["on", "off"] {
+            std::fs::create_dir_all(staged.join(name)).unwrap();
+            std::fs::write(staged.join(name).join("pack.mcmeta"), &metadata).unwrap();
+        }
+        let selected = vec!["vanilla".to_owned(), "file/on".to_owned()];
+        let options = horizon_client::title::WorldOptions {
+            pack_dir: Some(staged.clone()),
+            data_packs: selected.clone(),
+            ..Default::default()
+        };
+        super::prepare_world_packs(root, &world, &root.join("resources"), Some(&options)).unwrap();
+        assert!(!staged.exists());
+        for name in ["on", "off"] {
+            assert!(
+                world
+                    .join("datapacks")
+                    .join(name)
+                    .join("pack.mcmeta")
+                    .is_file()
+            );
+        }
+        let selection: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(world.join("datapacks.json")).unwrap()).unwrap();
+        assert_eq!(selection["enabled"], serde_json::json!(selected));
+        assert_eq!(selection["disabled"], serde_json::json!(["file/off"]));
+    }
+
+    #[test]
+    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_pack_copy_failure_aborts_creation_and_keeps_the_staged_packs() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-pack-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let staged = root.with_extension("packs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(staged.join("fixture")).unwrap();
+        let format = horizon_core::version::DATA_PACK_FORMAT;
+        let metadata = serde_json::json!({"pack":{"min_format":[format.0,format.1],"max_format":[format.0,format.1],"description":"copy fixture"}}).to_string();
+        std::fs::write(staged.join("fixture/pack.mcmeta"), &metadata).unwrap();
+        assert_eq!(horizon_client::packs::folder(&staged, format).len(), 1);
+        // A file at the destination makes the pack-copy operation fail on every OS.
+        std::fs::write(root.join("datapacks"), b"preserve destination").unwrap();
+        let options = horizon_client::title::WorldOptions {
+            pack_dir: Some(staged.clone()),
+            world_type: horizon_client::save::WorldPreset::Flat,
+            structures: false,
+            ..Default::default()
+        };
+        let mut game = super::super::native_machines::tests::server_game();
+        let result = game.open_world(
+            root.to_str().unwrap(),
+            Some("copy fixture"),
+            Some(1),
+            false,
+            Some(&options),
+        );
+        assert!(
+            result.is_err(),
+            "failed pack installation must not start a world"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("fixture/pack.mcmeta")).unwrap(),
+            metadata,
+            "failed installation must preserve the staged input"
+        );
+        assert_eq!(
+            std::fs::read(root.join("datapacks")).unwrap(),
+            b"preserve destination"
+        );
+        assert!(!root.join("level.dat").exists());
+        drop(game);
+        drop(
+            horizon_client::save::SessionLock::acquire(&root)
+                .expect("failed creation releases its lock"),
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(staged).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    fn create_world_cannot_change_pack_selection_before_taking_the_world_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-create-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let original = b"{\"enabled\":[\"file/keep\"],\"disabled\":[]}";
+        std::fs::write(root.join("datapacks.json"), original).unwrap();
+        let held = horizon_client::save::SessionLock::acquire(&root).unwrap();
+        let mut game = super::super::native_machines::tests::server_game();
+        let result = game.open_world(
+            root.to_str().unwrap(),
+            Some("lock fixture"),
+            Some(1),
+            false,
+            Some(&horizon_client::title::WorldOptions::default()),
+        );
+        assert_eq!(
+            std::fs::read(root.join("datapacks.json")).unwrap(),
+            original,
+            "a world owned by another instance must be unchanged"
+        );
+        assert!(result.is_err(), "the existing world lock must refuse entry");
+        drop(game);
+        drop(held);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

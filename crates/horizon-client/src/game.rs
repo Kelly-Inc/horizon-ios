@@ -10017,8 +10017,9 @@ impl Game<'_> {
                     KeyCode::AltLeft | KeyCode::AltRight | KeyCode::SuperLeft | KeyCode::SuperRight
                 )
             )
+            && !self.touch_synthetic_input()
         {
-            if !self.touch_synthetic_input() {self.input_keyboard_used();}
+            self.input_keyboard_used();
         }
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && event.state == ElementState::Pressed
@@ -11306,6 +11307,9 @@ impl Game<'_> {
                             self.sprint_report(&report);
                         }
                     }
+                    // Native recipe-viewer requests belong to the shared client
+                    // frame, including platforms with their own extras UI.
+                    self.recipe_lookups_now();
                     self.extras_frame(elapsed);
                     self.extras_retry()?;
                     self.apply_mouse_look();
@@ -12581,12 +12585,14 @@ pub fn run_with() -> Result<()> {
     // official server in their list (servers.dat in the game folder, the working directory). Not
     // for a server, a benchmark, a run that quits by itself, a harness's fixture or a run that
     // horizon-ctl drives: those start in a source checkout and wrote the list there.
-    if options.execution_role.is_client() && !options.offscreen && !synchronous_startup(&options) {
-        if !horizon_ios_launcher::waiting() {
-            let version = horizon_client::telemetry::version();
-            let game_dir = horizon_client::logging::player_dir();
-            horizon_hooks::engine::started(&horizon_hooks::Started::new(&version, &game_dir));
-        }
+    if options.execution_role.is_client()
+        && !options.offscreen
+        && !synchronous_startup(&options)
+        && !horizon_ios_launcher::waiting()
+    {
+        let version = horizon_client::telemetry::version();
+        let game_dir = horizon_client::logging::player_dir();
+        horizon_hooks::engine::started(&horizon_hooks::Started::new(&version, &game_dir));
     }
     let _retirement = ProcessResourceRetirement {
         home: std::env::current_dir()?,

@@ -171,7 +171,7 @@ mod tests {
             }
         }
         game.player = Some(
-            horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 64.0, 8.5))
+            horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.0, 8.5))
                 .unwrap(),
         );
         game.update_chunk_tickets();

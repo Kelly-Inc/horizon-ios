@@ -680,6 +680,11 @@ fn local_images_keep_their_formats_and_actual_size_limits() {
         site: "https://registry.test/",
         generated: String::new(),
     };
+    use sha2::Digest;
+    let versioned = |path: &str, bytes: &[u8]| {
+        let hash = format!("{:x}", sha2::Sha256::digest(bytes));
+        format!("https://registry.test/{path}?v={}", &hash[..12])
+    };
     let mut errors = Vec::new();
     assert_eq!(
         image(
@@ -689,7 +694,7 @@ fn local_images_keep_their_formats_and_actual_size_limits() {
             "icons/",
             &mut errors
         ),
-        Some("https://registry.test/icons/coords_hud.png".into())
+        Some(versioned("icons/coords_hud.png", &png(128, 128)))
     );
     s.write_bytes("screenshots/coords_hud/1.png", &png(1280, 720));
     assert_eq!(

@@ -69,7 +69,7 @@ fn game() -> (Game<'static>, super::lan::LanHost) {
     assert!(game.run_command("fill 0 99 0 31 99 15 dirt"));
     // A hostile mob spawns and the player takes damage on any but peaceful.
     assert!(game.run_command("difficulty normal"));
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 100.0, 6.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(4.5, 100.0, 6.5)).unwrap());
     game.player.as_mut().unwrap().entity_id = HOST as i32;
     game.lan_host(
         super::lan::LanSettings {

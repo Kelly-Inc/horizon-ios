@@ -142,6 +142,9 @@ impl Config {
             if !rate.is_finite() {
                 return Err(format!("{name} must be finite"));
             }
+            if rate > 0.0 && Duration::try_from_secs_f64(16_384.0 / rate).is_err() {
+                return Err(format!("{name} is too small to represent a transfer delay"));
+            }
         }
         if self.proxy_protocol && self.proxy_from.is_empty() {
             return Err("RELAY_PROXY_PROTOCOL=1 needs RELAY_PROXY_FROM: the load balancers' addresses or \
@@ -961,6 +964,27 @@ mod tests {
         );
         let v6: SocketAddr = "[2001:db8::1]:5000".parse().unwrap();
         assert_eq!(unmap(v6), v6);
+    }
+
+    #[test]
+    fn bandwidth_settings_reject_unrepresentable_transfer_delays() {
+        for rate in [f64::MIN_POSITIVE, 1e-30] {
+            for config in [
+                Config {
+                    session_rate: rate,
+                    ..Config::default()
+                },
+                Config {
+                    total_rate: rate,
+                    ..Config::default()
+                },
+            ] {
+                assert!(
+                    config.check().is_err(),
+                    "accepted an unrepresentable bandwidth delay"
+                );
+            }
+        }
     }
 
     #[test]

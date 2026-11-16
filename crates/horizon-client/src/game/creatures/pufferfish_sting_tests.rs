@@ -44,7 +44,7 @@ fn game_with(silent: bool) -> Game<'static> {
     .unwrap();
     game.creative = false;
     game.lan_acting = Some(7);
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 66.0, 8.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(8.5, 66.0, 8.5)).unwrap());
     let kind = game.res.mob_types()["minecraft:pufferfish"].clone();
     let mut fish = Mob::new(9001, kind, Vec3::new(8.5, 66.0, 8.5), 0.0);
     fish.extra.size = 2;

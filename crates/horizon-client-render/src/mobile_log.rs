@@ -5,11 +5,45 @@ use std::{
     path::Path,
 };
 pub const LIMIT: usize = 1024 * 1024;
+
+fn begins_entry(line: &str) -> bool {
+    line.as_bytes().get(..10).is_some_and(|p| {
+        p[0] == b'['
+            && p[3] == b':'
+            && p[6] == b':'
+            && p[9] == b']'
+            && [1, 2, 4, 5, 7, 8]
+                .into_iter()
+                .all(|i| p[i].is_ascii_digit())
+    })
+}
+
+/// A bounded read may start anywhere inside a multiline message. Its label could
+/// have been cut off, so retain nothing until the next timestamped entry.
+fn complete_tail(text: &str) -> &str {
+    let Some((_, tail)) = text.split_once('\n') else {
+        return "";
+    };
+    let mut offset = 0;
+    for line in tail.split_inclusive('\n') {
+        if begins_entry(line) {
+            return &tail[offset..];
+        }
+        offset += line.len();
+    }
+    ""
+}
 /// Fail closed for authentication messages rather than guessing where a secret ends.
 pub fn redact(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     if [
-        "accesstoken", "refreshtoken", "idtoken", "token =", "token :", "user code", "access_token",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "token =",
+        "token :",
+        "user code",
+        "access_token",
         "refresh_token",
         "id_token",
         "token:",
@@ -64,9 +98,9 @@ pub fn rotate(file: &mut File, dir: &Path) -> io::Result<()> {
         let mut bytes = Vec::new();
         file.take(LIMIT as u64).read_to_end(&mut bytes)?;
         let text = String::from_utf8_lossy(&bytes);
-        // Drop the first partial line so a cut-off secret cannot escape its label.
+        // A whole leading partial message can contain unlabeled secrets.
         let text = if len > LIMIT as u64 {
-            text.split_once('\n').map_or("", |(_, tail)| tail)
+            complete_tail(&text)
         } else {
             &text
         };
@@ -98,4 +132,34 @@ pub fn append(file: &mut File, dir: &Path, text: &str) -> io::Result<()> {
         rotate(file, dir)?;
     }
     writeln!(file, "{safe}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotating_a_bounded_tail_drops_the_whole_partial_message() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-log-tail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("latest.log");
+        let text = "[12:00:00] [Render thread/INFO]: access_token:\n".to_owned()
+            + &"A".repeat(LIMIT)
+            + "\nopaque-fixture-value\n[12:00:01] [Render thread/INFO]: shader ready\n";
+        fs::write(&path, text).unwrap();
+        let mut file = File::options().read(true).write(true).open(&path).unwrap();
+        rotate(&mut file, &dir).unwrap();
+        let previous = fs::read_to_string(dir.join("previous.log")).unwrap();
+        assert!(!previous.contains("opaque-fixture-value"));
+        assert!(previous.contains("shader ready"));
+        drop(file);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

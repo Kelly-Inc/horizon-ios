@@ -52,7 +52,17 @@ pub fn neutralise(text: &str) -> String {
         i += 1;
     }
     // github.com/owner/repo/issues/12 links cross-reference the issue: shown, not linked.
-    out.replace("github.com/", "github.com\u{200b}/")
+    // Hostnames are case-insensitive. ASCII folding preserves UTF-8 byte offsets;
+    // insert from the end so earlier matches retain their positions.
+    let domains: Vec<_> = out
+        .to_ascii_lowercase()
+        .match_indices("github.com/")
+        .map(|(at, _)| at + "github.com".len())
+        .collect();
+    for at in domains.into_iter().rev() {
+        out.insert(at, '\u{200b}');
+    }
+    out
 }
 
 /// Whether `rest` starts with `GH-` and a digit, as GitHub's issue autolink reads it.

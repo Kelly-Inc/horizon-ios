@@ -27,6 +27,16 @@ pub const OFFICIAL_SERVER_STATUS: &str = "play.playhorizon.dev:24454";
 /// files sends the player there.
 pub const WEBSITE: &str = "https://playhorizon.dev";
 
+/// Prepared files for mobile first-run setup. An explicit
+/// `HORIZON_GAME_FILES_URL` overrides this base.
+pub const GAME_FILES: &str = "https://cdn.gayfeet.lol/horizon/";
+
+/// Optional skins by name for offline players, with a legacy Mojang lookup as
+/// fallback. These are supplied to the engine by the official app's hooks.
+pub const NAME_SKIN_TEXTURES: &str = "https://skinsystem.ely.by/textures/";
+pub const NAME_SKIN_PROFILES: &str = "https://api.mojang.com/users/profiles/minecraft/";
+pub const NAME_SKIN_HTTP_PREFIX: &str = "http://ely.by/";
+
 /// The cosmetics service: cosmetics, emotes, "Show me as a Horizon player"
 /// (`HORIZON_COSMETICS_API` overrides it).
 pub const COSMETICS_API: &str = "https://cosmetics.playhorizon.dev";

@@ -8,7 +8,7 @@ use horizon_client::motion::PlayerMotion;
 /// A server's game with a player standing at the origin's block.
 fn player_game() -> Game<'static> {
     let mut game = server_game();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     // A fixed name: no generated horizon-player.txt in the working directory.
     game.options.player_name = Some("PotionContents".into());
     game.build_registries();

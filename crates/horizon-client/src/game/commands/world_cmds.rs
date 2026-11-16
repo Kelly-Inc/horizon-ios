@@ -2917,7 +2917,7 @@ mod attribute_modifier_command_tests {
     #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
     fn a_command_modifier_is_saved_with_the_player() {
         with_game(|game| {
-            game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+            game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
             assert!(game.run_command(
                 "attribute @s minecraft:step_height modifier add test:a 0.4 add_value"
             ));
@@ -2944,7 +2944,7 @@ mod attribute_modifier_command_tests {
                 _ => false,
             };
             assert!(holds, "saved attributes: {saved:?}");
-            let mut back = PlayerMotion::new(game.motion, Vec3::ZERO).unwrap();
+            let mut back = PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap();
             back.apply_saved_attributes(Some(&saved)).unwrap();
             assert_eq!(
                 back.attribute("minecraft:step_height").unwrap(),

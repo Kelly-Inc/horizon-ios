@@ -579,11 +579,9 @@ fn take(window: &mut VecDeque<Instant>, max: usize) -> bool {
 /// The origin a URL names: `scheme://host[:port]`, without a path. An
 /// `Origin` is a page's origin and never carries a path, while
 /// `REGISTRY_PUBLIC_URL` may: the form's pages are below the site's root.
-fn url_origin(url: &str) -> &str {
-    let host = url.find("://").map_or(0, |scheme| scheme + 3);
-    url[host..]
-        .find('/')
-        .map_or(url, |path| &url[..host + path])
+fn url_origin(text: &str) -> Option<String> {
+    let url = url::Url::parse(text).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
 }
 
 /// Whether a change comes from the site's own pages: its `Origin` is the
@@ -591,7 +589,21 @@ fn url_origin(url: &str) -> &str {
 /// another site can't send its origin, so this is a whole origin's match,
 /// case folded the way a host name is.
 fn from_the_site(public_url: &str, origin: Option<&str>) -> bool {
-    origin.is_some_and(|origin| origin.eq_ignore_ascii_case(url_origin(public_url)))
+    let Some(origin) = origin else { return false };
+    // An Origin header is an origin, not a page URL. URL parsing canonicalizes
+    // default ports but must not make paths, credentials or whitespace acceptable.
+    let Some((_, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@', '\\'])
+        || origin
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return false;
+    }
+    url_origin(public_url).is_some_and(|expected| url_origin(origin).as_ref() == Some(&expected))
 }
 
 /// A change sent by the site's own pages: from its origin, signed in, with
@@ -1555,19 +1567,19 @@ mod tests {
         // pages are below its root (#6159).
         assert_eq!(
             url_origin("https://playhorizon.dev/mods"),
-            "https://playhorizon.dev"
+            Some("https://playhorizon.dev".into())
         );
         assert_eq!(
             url_origin("https://playhorizon.dev/mods/submit/"),
-            "https://playhorizon.dev"
+            Some("https://playhorizon.dev".into())
         );
         assert_eq!(
             url_origin("https://playhorizon.dev"),
-            "https://playhorizon.dev"
+            Some("https://playhorizon.dev".into())
         );
         assert_eq!(
             url_origin("http://localhost:8080/mods"),
-            "http://localhost:8080"
+            Some("http://localhost:8080".into())
         );
         // The configured site's origin, path or no path, and a host name's
         // case folded as a browser folds it.
@@ -1600,6 +1612,39 @@ mod tests {
             Some("https://playhorizon.dev.evil.test")
         ));
         assert!(!from_the_site("::", Some("null")));
+    }
+
+    #[test]
+    fn default_ports_are_equivalent_without_accepting_non_origin_headers() {
+        for (public, origin) in [
+            (
+                "https://playhorizon.dev:443/mods",
+                "https://playhorizon.dev",
+            ),
+            (
+                "https://playhorizon.dev/mods",
+                "https://playhorizon.dev:443",
+            ),
+            ("http://localhost:80/mods", "http://localhost"),
+            ("https://[::1]:443/mods", "https://[::1]"),
+        ] {
+            assert!(from_the_site(public, Some(origin)), "{public} / {origin}");
+        }
+        for invalid in [
+            "https://playhorizon.dev/path",
+            "https://playhorizon.dev/",
+            "https://playhorizon.dev?query",
+            "https://user@playhorizon.dev",
+            "https://playhorizon.dev#fragment",
+            " https://playhorizon.dev",
+            "null",
+        ] {
+            assert!(
+                !from_the_site("https://playhorizon.dev", Some(invalid)),
+                "{invalid}"
+            );
+        }
+        assert!(!from_the_site("::", Some("::")));
     }
 
     #[test]

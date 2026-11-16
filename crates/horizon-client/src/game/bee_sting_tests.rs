@@ -73,7 +73,7 @@ fn a_refused_sting_leaves_the_bee_alone() {
     game.mobs.clear();
     game.audio.capture = Some(Vec::new());
     game.creative = true;
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     let bee = spawn(&mut game, 43, "minecraft:bee", Vec3::new(1.5, 64.0, 0.5));
     sting(&mut game, bee, Who::Player);
     let bee_mob = game.mobs.iter().find(|m| m.id == bee).unwrap();
@@ -83,7 +83,7 @@ fn a_refused_sting_leaves_the_bee_alone() {
     game.mobs.clear();
     game.audio.capture = Some(Vec::new());
     game.creative = false;
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     game.yaw = 0.0;
     game.offhand = Some(ItemStack::new("minecraft:shield", 1));
     // `BlocksAttacks.blockDelayTicks` of the shield: 0.25s.

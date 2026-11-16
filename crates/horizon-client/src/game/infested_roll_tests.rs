@@ -75,7 +75,7 @@ fn game_with_player() -> Game<'static> {
     game.creative = false;
     game.lan_acting = Some(7);
     let at = Vec3::new(8.5, 4.0, 8.5);
-    game.player = Some(PlayerMotion::new(game.motion, at).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, at).unwrap());
     game
 }
 

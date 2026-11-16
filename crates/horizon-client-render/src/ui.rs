@@ -1636,7 +1636,7 @@ impl EditBox {
         self.focused && (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2)
     }
     pub fn set_value(&mut self, value: &str) {
-        self.value = utf16_prefix(value, self.max_length);
+        self.value = crate::clipboard::utf16_truncate_utf8(value, self.max_length);
         self.move_cursor_to_end(false);
     }
     fn selected(&self) -> (usize, usize) {

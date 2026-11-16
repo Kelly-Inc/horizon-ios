@@ -1016,7 +1016,13 @@ mod tests {
         let debug = error.downcast_ref::<DebugCrash>().unwrap();
         // The stack starts where the crash was raised (DebugCrash::new, in this file).
         let first = debug.stack.lines().next().unwrap();
-        assert!(first.contains("crash.rs"), "{}", debug.stack);
+        // Function symbols remain available when release/dev builds omit DWARF
+        // filenames. The first frame must still be the actual crash origin.
+        assert!(
+            first.contains("DebugCrash") && first.contains("new"),
+            "{}",
+            debug.stack
+        );
     }
 
     #[test]
@@ -1064,7 +1070,11 @@ mod tests {
         assert!(report.error.contains("crash.rs"));
         // The first frame is the test's own code, not the panic machinery.
         let first = report.stack.lines().next().unwrap();
-        assert!(first.contains("crash.rs"), "{}", report.stack);
+        assert!(
+            first.contains("a_panic_becomes_a_report"),
+            "{}",
+            report.stack
+        );
         let text = report.text();
         assert!(text.contains("Description: Unexpected error"));
         assert!(text.contains(&format!(

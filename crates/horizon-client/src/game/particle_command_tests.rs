@@ -61,7 +61,7 @@ fn game() -> Game<'static> {
         .add_empty_chunk(horizon_core::position::ChunkPos::new(0, 0))
         .unwrap();
     assert!(game.run_command("fill 0 99 0 15 99 15 stone"));
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 100.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 100.0, 0.5)).unwrap());
     game
 }
 
@@ -137,7 +137,7 @@ fn block_crumble_draws_the_block_it_names() {
     let level = ParticleLevel {
         world: &game.world,
         facts: game.res.facts(),
-        collision: game.collision,
+        collision: &game.collision,
         player: None,
         cached_chunk: std::cell::Cell::new(None),
     };

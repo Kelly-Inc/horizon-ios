@@ -236,7 +236,7 @@ fn roll(file: &mut File, dir: &Path, date: NaiveDate) -> io::Result<()> {
     #[cfg(target_os = "ios")]
     {
         let _ = date;
-        return mobile_log::rotate(file, dir);
+        mobile_log::rotate(file, dir)
     }
     #[cfg(not(target_os = "ios"))]
     {

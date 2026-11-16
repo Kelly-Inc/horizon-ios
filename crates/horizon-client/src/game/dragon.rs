@@ -3661,7 +3661,8 @@ impl Dragon {
         if let Some(h) = nbt_value::float(tag.get("Health")) {
             self.health = h as f32;
         }
-        self.sitting_damage = nbt_value::float(tag.get("sitting_damage_received")).unwrap_or(0.0) as f32;
+        self.sitting_damage =
+            nbt_value::float(tag.get("sitting_damage_received")).unwrap_or(0.0) as f32;
         if let Some(p) = nbt_value::number(tag.get("DragonPhase")) {
             self.phase = Phase::from_id(p as i32);
         }
@@ -5902,6 +5903,7 @@ mod spawn_egg_processing_tests {
                             pos: [6, 199, 6],
                             face: [0, 1, 0],
                             point: [6.5, 200.0, 6.5],
+                            inside: false,
                         });
                         game.guest_use = Some(GuestUse::OnBlock(Hand::Main));
                         let used = game.use_item().unwrap();

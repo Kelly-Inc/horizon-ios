@@ -61,7 +61,7 @@ mod game{pub mod boats{use crate::*;pub const CHEST_SLOTS:usize=27;SAVED_FIRE}pu
 impl Cart{fn to_nbt(&self,u:[i32;4],raw:Option<&Tag>)->Tag{entity_nbt::boat_to_nbt("cart",[0.;3],[0.;3],[0.;2],(false,0.),u,raw,Some(&self.items))}fn load(&mut self,tag:&Tag)->Option<()>{self.items=save::decode_items(tag.get("Items"),27);Some(())}}
 #[derive(Clone)]struct Boat{id:u32,chest:bool,items:Vec<Option<ItemStack>>,position:[f64;3],previous:[f64;3],velocity:[f64;3],yaw:f32,previous_yaw:f32,pitch:f32,no_gravity:bool,on_ground:bool,fire_ticks:i32,ticks_frozen:i32,fall_distance:f64}impl Boat{fn entity_type(&self)->String{"boat".into()}}
 enum BlockEntity{Chest(Vec<Option<ItemStack>>)}struct World{block_entities:HashMap<(i32,i32,i32),BlockEntity>}
-#[derive(Clone,Copy)]enum Target{Boat(u32),Cart(u32),Mob(u32),Item(u32),Stand(u32),Frame(u32),Other(u32),Fangs(u32),Tnt(u32),Orb(u32),Cushion(u32),Trident(u32),Projectile(u32),Rocket(u32),Player}
+#[derive(Clone,Copy)]enum Target{Painting(u32),Boat(u32),Cart(u32),Mob(u32),Item(u32),Stand(u32),Frame(u32),Other(u32),Fangs(u32),Tnt(u32),Orb(u32),Cushion(u32),Trident(u32),Projectile(u32),Rocket(u32),Player}
 struct Persist{raw:HashMap<u32,Tag>}
 #[derive(Default)]struct Scoreboard{teams:HashSet<String>,members:HashMap<String,String>}impl Scoreboard{fn team(&self,t:&str)->Option<()>{self.teams.contains(t).then_some(())}fn add_to_team(&mut self,n:&str,t:&str){self.members.insert(n.into(),t.into());}}
 #[derive(Clone,Copy,PartialEq)]pub enum Slots{Block((i32,i32,i32))}

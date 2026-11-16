@@ -3290,7 +3290,9 @@ fn prune_named_roots(
         };
         // A start may have refreshed the stamp while we were acquiring the lease.
         if old_enough(&path, stamp, keep)
-            && let Err(error) = fs::remove_dir_all(&path)
+            && let Err(error) = fs::remove_dir_all(&path).inspect(|_| {
+                let _ = fs::remove_file(used_path(&path));
+            })
         {
             log::warn!(
                 "Horizon: old resource root stays: {}: {error}",

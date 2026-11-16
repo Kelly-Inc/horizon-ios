@@ -253,7 +253,10 @@ mod tests {
     fn command_parser_ids_are_mapped_before_reading_their_properties() {
         // Old component (17) has no properties; time (42) has an i32; resource (45) a registry name.
         let mut w = Writer::new();
-        w.varint(3);
+        w.varint(4);
+        // A valid root links the three argument nodes. Decoder validation must
+        // stay enabled while this fixture checks the old parser ID mapping.
+        w.bytes(&[0, 3, 1, 2, 3]);
         for (name, parser) in [("text", 17), ("duration", 42), ("item", 45)] {
             w.bytes(&[2, 0]);
             w.string(name);
@@ -282,11 +285,11 @@ mod tests {
         assert_eq!(
             p.nodes
                 .iter()
-                .map(|n| n.parser.as_ref().unwrap().0)
+                .filter_map(|n| n.parser.as_ref().map(|parser| parser.0))
                 .collect::<Vec<_>>(),
             [18, 43, 46]
         );
-        assert_eq!(p.nodes[1].parser.as_ref().unwrap().1, 20i32.to_be_bytes());
-        assert_eq!(p.nodes[2].name, "item");
+        assert_eq!(p.nodes[2].parser.as_ref().unwrap().1, 20i32.to_be_bytes());
+        assert_eq!(p.nodes[3].name, "item");
     }
 }

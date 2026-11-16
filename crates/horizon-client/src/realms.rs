@@ -4862,6 +4862,23 @@ impl Screen {
         };
     }
 
+    /// Visible bounds from the last roster draw, also used by the title wrapper.
+    pub(crate) fn roster_button_rect(&self, id: u8) -> Option<[f32; 4]> {
+        if !matches!(
+            self.subscreen,
+            SubScreen::Configure {
+                tab: ConfigureTab::Players,
+                ..
+            }
+        ) {
+            return None;
+        }
+        self.players_button_rects
+            .borrow()
+            .iter()
+            .find_map(|(rect, button)| (*button == id).then_some(*rect))
+    }
+
     pub fn click(&mut self, hit: Option<u8>, x: f32, y: f32, (w, h): (f32, f32)) -> Outcome {
         if self.after_save.is_some() {
             return Outcome::None;
@@ -7432,7 +7449,10 @@ impl Screen {
                 if *tab == ConfigureTab::Players && matches!(detail, Some(Ok(_))) {
                     // The rows' buttons as the draw laid them out; the sprites sit to
                     // the right of each label (the port's trailing slot).
-                    for ([bx, by, bw, _bh], id) in self.players_button_rects.borrow().iter() {
+                    for ([bx, by, bw, bh], id) in self.players_button_rects.borrow().iter() {
+                        if *bh <= 0.0 {
+                            continue;
+                        }
                         let (label, icon) = match id % 3 {
                             0 => (
                                 t("mco.configure.world.invites.normal.tooltip"),

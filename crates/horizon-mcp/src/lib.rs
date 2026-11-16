@@ -140,14 +140,25 @@ impl<'a> Server<'a> {
     where
         F: FnMut(&str, &Value) -> Result<Value, (i64, String)>,
     {
+        if !message.is_object()
+            || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || message.get("method").and_then(Value::as_str).is_none()
+        {
+            return Some(error(
+                Value::Null,
+                -32600,
+                "A request must be a JSON-RPC 2.0 object with a string method".into(),
+                None,
+            ));
+        }
         // A request has an id, a notification has none and gets no reply.
         let id = match message.get("id") {
             None => return None,
-            Some(Value::Null) => {
+            Some(id) if !(id.is_string() || id.is_i64() || id.is_u64()) => {
                 return Some(error(
                     Value::Null,
                     -32600,
-                    "A request's id is a string or an integer, not null".into(),
+                    "A request's id must be a string or an integer".into(),
                     None,
                 ));
             }
@@ -157,7 +168,18 @@ impl<'a> Server<'a> {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        let params = match message.get("params") {
+            None => json!({}),
+            Some(params @ Value::Object(_)) => params.clone(),
+            Some(_) => {
+                return Some(error(
+                    id,
+                    -32602,
+                    "Request parameters must be an object".into(),
+                    None,
+                ));
+            }
+        };
         Some(match self.dispatch(method, &params, app) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(Fault {
@@ -454,6 +476,79 @@ mod tests {
         let line = json!({ "jsonrpc": "2.0", "id": null, "method": "tools/list" });
         let reply = SERVER.handle_line(&line.to_string(), &mut app).unwrap();
         assert_eq!(reply["error"]["code"], json!(-32600));
+    }
+
+    #[test]
+    fn invalid_request_ids_never_dispatch_a_tool() {
+        let mut calls = 0;
+        for id in [Value::Null, json!(true), json!(1.5), json!([]), json!({})] {
+            let line = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": "save"}});
+            let reply = SERVER
+                .handle_line(&line.to_string(), &mut |_, _| {
+                    calls += 1;
+                    Ok(json!({}))
+                })
+                .unwrap();
+            assert_eq!(reply["error"]["code"], json!(-32600), "id {id}");
+            assert_eq!(reply["id"], Value::Null);
+        }
+        assert_eq!(calls, 0);
+        for id in [json!("request-1"), json!(0), json!(-1), json!(u64::MAX)] {
+            let line = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"});
+            let reply = SERVER
+                .handle_line(&line.to_string(), &mut |_, _| Ok(json!({})))
+                .unwrap();
+            assert_eq!(reply["id"], id);
+            assert!(reply.get("error").is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_envelopes_are_rejected_before_dispatch() {
+        let mut calls = 0;
+        for message in [
+            json!({"id": 1, "method": "tools/call"}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "tools/call"}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": true}),
+            json!([]),
+            json!("tools/call"),
+            Value::Null,
+        ] {
+            let reply = SERVER
+                .handle_line(&message.to_string(), &mut |_, _| {
+                    calls += 1;
+                    Ok(json!({}))
+                })
+                .expect("an invalid envelope is not a notification");
+            assert_eq!(reply["error"]["code"], json!(-32600), "{message}");
+            assert_eq!(reply["id"], Value::Null);
+        }
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn invalid_parameters_never_dispatch_a_tool() {
+        let mut calls = 0;
+        for params in [
+            Value::Null,
+            json!(true),
+            json!(42),
+            json!("save"),
+            json!([]),
+        ] {
+            let line =
+                json!({"jsonrpc":"2.0", "id":"bad-params", "method":"tools/call", "params":params});
+            let reply = SERVER
+                .handle_line(&line.to_string(), &mut |_, _| {
+                    calls += 1;
+                    Ok(json!({}))
+                })
+                .unwrap();
+            assert_eq!(reply["error"]["code"], json!(-32602), "{params}");
+            assert_eq!(reply["id"], json!("bad-params"));
+        }
+        assert_eq!(calls, 0);
     }
 
     #[test]

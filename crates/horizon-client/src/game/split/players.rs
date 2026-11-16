@@ -115,7 +115,7 @@ fn profile_settings(
     let made = if options.exists() {
         None
     } else {
-        std::fs::create_dir_all(&profile)?;
+        std::fs::create_dir_all(profile)?;
         let mut new = inherited.clone();
         // The Controller setting is P1's, as on the profile page (`join`).
         new.controller.enabled |= controller_join;

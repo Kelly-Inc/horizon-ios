@@ -328,10 +328,7 @@ fn sample(
         wgpu::BufferUsages::STORAGE,
     );
     let rects = buffer(
-        bytemuck::cast_slice(&super::super::pack_post::terrain_tables(
-            &[],
-            &atlas.rects_table(),
-        )),
+        bytemuck::cast_slice(&atlas.rects_table()),
         wgpu::BufferUsages::STORAGE,
     );
     let binding = |n, storage| wgpu::BindGroupLayoutEntry {

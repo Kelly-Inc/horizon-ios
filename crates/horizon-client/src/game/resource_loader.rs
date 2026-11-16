@@ -213,6 +213,8 @@ pub(super) enum PendingWorldEntry {
         seed: Option<i64>,
         creative: bool,
         create: Option<Box<horizon_client::title::WorldOptions>>,
+        /// A title-screen action reports recoverable access errors in that UI.
+        from_title: bool,
     },
     Server {
         address: String,
@@ -265,9 +267,7 @@ pub(super) fn write_report(game: &Game<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The ordinary launch: load the resources on a worker while the window shows
-/// the loading screen, then swap in the game on the main thread.
-
+/// Resource-loading tails retained until their worker and resource lease finish.
 pub(super) fn retired_rest_loaders() -> &'static std::sync::Mutex<Vec<RestHandle>> {
     static RETIRED: std::sync::Mutex<Vec<RestHandle>> = std::sync::Mutex::new(Vec::new());
     &RETIRED

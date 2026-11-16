@@ -620,6 +620,8 @@ Horizon's own and third-party addresses (Horizon layer):
 | `telemetry.playhorizon.dev` | opt-in telemetry, the "I'm playing" ping, benchmark uploads | `horizon-addresses` (#12993) |
 | `stun.cloudflare.com`, `stun.l.google.com` | Play with Friends NAT discovery | `horizon-addresses` (#12993) |
 | `afri-network.co.za` | the withdrawn partner server, so the game can remove the entry it added | `horizon-addresses` |
+| `cdn.gayfeet.lol/horizon/` | prepared game files for mobile first-run setup; `HORIZON_GAME_FILES_URL` overrides it | `horizon-addresses`, supplied by `horizon-official` through `Hooks::game_files_base` |
+| `skinsystem.ely.by`, `ely.by`, `api.mojang.com/users/profiles/minecraft/` | optional name-based offline skins and their legacy profile fallback; absent from the plain engine | `horizon-addresses`, supplied by `horizon-official` through `Hooks::name_skin_service` |
 | `horizon-rust.github.io/horizon-mods`, `github.com/horizon-rust/horizon-mods` | the mod registry index and files: a build of this repository alone asks the player for a registry | `mod_registry.rs`, `horizon-mods/src/index*.rs`, `cargo-horizon-mod` |
 | `api.modrinth.com`, `cdn.modrinth.com` | the in-game resource pack browser, modpack porting | `pack_browser.rs`, `horizon-port-pack` |
 | `github.com`, `raw.githubusercontent.com`, `gitlab.com`, `maven.neoforged.net` | modpack porting's sources | `horizon-port-pack` |

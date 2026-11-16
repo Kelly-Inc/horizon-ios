@@ -394,7 +394,19 @@ pub(super) fn start_game<'a>(
                     game.settings.simulation_distance = 2;
                 }
                 // Headless, but with the same server and memory connection as play.
-                game.open_integrated(&folder, None, Some(seed), creative, None)?;
+                let game_dir = std::env::current_dir()?;
+                let world = game_dir.join("saves").join(&folder);
+                let session_lock = horizon_client::save::SessionLock::acquire_validated(
+                    &world,
+                    &game_dir.join("saves/allowed_symlinks.txt"),
+                )?;
+                super::world_session::prepare_world_packs(
+                    &game_dir,
+                    &world,
+                    &game.vanilla_root(),
+                    None,
+                )?;
+                game.open_integrated(&folder, None, Some(seed), creative, None, session_lock)?;
             } else {
                 // Start after the window is handed over, so --world uses the
                 // same responsive initialization path as the title screen.
@@ -411,6 +423,7 @@ pub(super) fn start_game<'a>(
                     seed: Some(seed),
                     creative,
                     create: None,
+                    from_title: false,
                 });
             }
         }

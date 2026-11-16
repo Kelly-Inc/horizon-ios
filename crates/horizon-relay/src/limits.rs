@@ -51,7 +51,7 @@ impl Bucket {
         if self.tokens >= 0.0 || self.rate <= 0.0 {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(-self.tokens / self.rate)
+            Duration::try_from_secs_f64(-self.tokens / self.rate).unwrap_or(Duration::MAX)
         }
     }
 }
@@ -415,6 +415,15 @@ impl Limiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrepresentable_bandwidth_debt_saturates_instead_of_panicking() {
+        let now = Instant::now();
+        let mut bucket = Bucket::new(1e-30, 0.0, now);
+        assert_eq!(bucket.take(16_384.0, now), Duration::MAX);
+        let mut unlimited = Bucket::new(0.0, 0.0, now);
+        assert_eq!(unlimited.take(16_384.0, now), Duration::ZERO);
+    }
 
     #[test]
     fn an_address_holds_only_so_many_connections_open() {

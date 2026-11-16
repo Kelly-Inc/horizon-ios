@@ -62,7 +62,7 @@ fn lan_game() -> (Game<'static>, mpsc::Receiver<horizon_client::lan::Out>) {
     let mut game = crate::game::native_machines::tests::server_game();
     game.build_registries();
     game.set_allow_commands(true);
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 66.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 66.0, 0.5)).unwrap());
     game.lan_host(
         crate::game::lan::LanSettings {
             port: 0,

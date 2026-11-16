@@ -12,7 +12,8 @@ use horizon_platform::hooks::{self, Hooks};
 use horizon_platform::{pages, settings};
 
 /// Every Horizon part in the game, in the order its hooks run.
-const PARTS: [&dyn Hooks; 5] = [
+const PARTS: [&dyn Hooks; 6] = [
+    &SERVICES,
     // The anonymous "I'm playing" ping.
     &horizon_heartbeat::HOOKS,
     // Play with Friends: `friend:` addresses join through its tunnel.
@@ -24,6 +25,22 @@ const PARTS: [&dyn Hooks; 5] = [
     // Open and Share for saved performance captures.
     &horizon_perf_share::HOOKS,
 ];
+
+struct Services;
+static SERVICES: Services = Services;
+impl Hooks for Services {
+    fn game_files_base(&self) -> Option<&'static str> {
+        Some(horizon_addresses::GAME_FILES)
+    }
+
+    fn name_skin_service(&self) -> Option<hooks::NameSkinService> {
+        Some(hooks::NameSkinService {
+            textures: horizon_addresses::NAME_SKIN_TEXTURES,
+            profiles: horizon_addresses::NAME_SKIN_PROFILES,
+            upgrade_http_prefix: Some(horizon_addresses::NAME_SKIN_HTTP_PREFIX),
+        })
+    }
+}
 /// Their settings, in the player's settings files.
 const STORES: [&dyn settings::Store; 1] = [&horizon_discord::SETTING];
 /// Their rows and pages in the options screens.
@@ -39,5 +56,22 @@ pub fn register() {
             // The executable registered after starting the game: a bug, not a player's problem.
             log::warn!("Horizon: an in-game part did not register: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shipped_entry_includes_its_file_and_offline_skin_services() {
+        assert_eq!(
+            PARTS.iter().find_map(|part| part.game_files_base()),
+            Some(horizon_addresses::GAME_FILES)
+        );
+        assert_eq!(
+            PARTS.iter().find_map(|part| part.name_skin_service()),
+            SERVICES.name_skin_service()
+        );
     }
 }

@@ -37,7 +37,7 @@ fn game() -> Game<'static> {
         None,
     )
     .unwrap();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     // Facing the goat, which stands to the south.
     game.yaw = 0.0;
     game.build_registries();

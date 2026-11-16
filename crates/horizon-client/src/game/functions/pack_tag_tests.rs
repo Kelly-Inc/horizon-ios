@@ -52,7 +52,8 @@ fn a_packs_own_item_and_block_tags_admit_and_match_its_functions() {
     );
     game.world_root = dir.clone();
     game.player = Some(
-        horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(4.5, 200.0, 4.5)).unwrap(),
+        horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(4.5, 200.0, 4.5))
+            .unwrap(),
     );
     game.build_registries();
     game.set_allow_commands(true);

@@ -39,7 +39,7 @@ fn game(creative: bool) -> Game<'static> {
         None,
     )
     .unwrap();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
     game.creative = creative;
     game.mode = if creative {
         horizon_client::command::args::GameMode::Creative

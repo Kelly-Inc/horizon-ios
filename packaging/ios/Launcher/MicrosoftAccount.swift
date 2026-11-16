@@ -224,11 +224,16 @@ final class MicrosoftAccount: ObservableObject {
               link.scheme == "https"
         else { throw AccountError("Microsoft didn't give a sign-in code.") }
         state = .code(code, link)
-        var interval = UInt64(min(60, max(1, start["interval"] as? Int ?? 5)))
+        var interval = UInt64(max(1, start["interval"] as? Int ?? 5))
+        let maximumInterval = UInt64.max / 1_000_000_000
+        guard interval <= maximumInterval else {throw AccountError("Microsoft returned an invalid sign-in polling interval.")}
         let deadline = now().addingTimeInterval(TimeInterval(start["expires_in"] as? Int ?? 900))
         while now() < deadline {
-            try await sleep(interval * 1_000_000_000)
+            let remaining = deadline.timeIntervalSince(now())
+            guard remaining > 0 else {break}
+            try await sleep(UInt64(min(Double(interval), remaining) * 1_000_000_000))
             try Task.checkCancellation()
+            guard now() < deadline else {break}
             let answer = try await net.form(
                 "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
                 ["grant_type": "urn:ietf:params:oauth:grant-type:device_code", "client_id": client,
@@ -242,7 +247,9 @@ final class MicrosoftAccount: ObservableObject {
                 else { throw AccountError("Microsoft's answer had no token.") }
                 return (access, refresh)
             case "authorization_pending": continue
-            case "slow_down": interval = min(60, interval + 5)
+            case "slow_down":
+                guard interval <= maximumInterval - 5 else {throw AccountError("Microsoft returned an invalid sign-in polling interval.")}
+                interval += 5
             case "authorization_declined": throw AccountError("The sign-in was declined.")
             case "expired_token": throw AccountError("The code expired. Try again.")
             default: throw AccountError("Microsoft refused the sign-in. Try again or check this build’s app configuration.")

@@ -1800,6 +1800,7 @@ fn streamed_texture(bytes: &[u8], kind: Kind, active: &impl Fn() -> bool) -> Opt
 
 /// A GET over HTTP or HTTPS (textures.minecraft.net serves both; vanilla
 /// uses https): the body of a 2xx answer, 16 MiB at most, after redirects.
+#[cfg(test)]
 fn http_get(url: &str) -> Option<Vec<u8>> {
     http_get_cancellable(url, &|| true)
 }
@@ -1827,15 +1828,16 @@ fn http_get_cancellable(url: &str, active: &impl Fn() -> bool) -> Option<Vec<u8>
     active().then_some(body)
 }
 
-/// SHA-1 (FIPS 180-4).
-/// Ely.by's skin system: a skin from a player's name alone, with no account and no signature, so offline
-/// players (single player, LAN, offline-mode servers) wear the skin they chose there. Ely.by answers with its
-/// own skins, or Mojang's for a name it doesn't hold, and `204 No Content` for neither.
-pub const ELY_TEXTURES: &str = "https://skinsystem.ely.by/textures/";
-
 /// The textures of an Ely.by `textures/<name>` answer: `{"SKIN":{"url":…,"metadata":{"model":"slim"}},"CAPE":…}`.
 /// Counted as signed: the game asked Ely.by for them itself, so nobody else chose them.
 pub fn ely_textures(body: &str) -> Textures {
+    ely_textures_with_upgrade(
+        body,
+        horizon_hooks::engine::name_skin_service().and_then(|service| service.upgrade_http_prefix),
+    )
+}
+
+fn ely_textures_with_upgrade(body: &str, upgrade: Option<&str>) -> Textures {
     let mut out = Textures {
         signed: true,
         ..Textures::default()
@@ -1848,9 +1850,11 @@ pub fn ely_textures(body: &str) -> Textures {
         let Some(url) = texture.get("url").and_then(|u| u.as_str()) else {
             continue;
         };
-        // Ely.by names its own files over plain HTTP; the same address answers over HTTPS.
-        let url = match url.strip_prefix("http://ely.by/") {
-            Some(rest) => format!("https://ely.by/{rest}"),
+        // Only the origin supplied by the provider promises an HTTPS equivalent.
+        let url = match upgrade
+            .filter(|prefix| prefix.starts_with("http://") && url.starts_with(prefix))
+        {
+            Some(_) => url.replacen("http:", "https:", 1),
             None => url.to_owned(),
         };
         match kind.as_str() {
@@ -1871,12 +1875,13 @@ pub fn ely_textures(body: &str) -> Textures {
 
 /// The Mojang account `name`'s textures: its profile id, then the session server's signed profile. Counted
 /// as signed for the same reason as Ely.by's.
-fn mojang_textures_cancellable(name: &str, active: &impl Fn() -> bool) -> Option<Textures> {
+fn mojang_textures_cancellable(
+    name: &str,
+    profiles: &str,
+    active: &impl Fn() -> bool,
+) -> Option<Textures> {
     let parse = |body: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&body).ok();
-    let id = parse(http_get_cancellable(
-        &format!("{MOJANG_NAMES}{name}"),
-        active,
-    )?)?;
+    let id = parse(http_get_cancellable(&format!("{profiles}{name}"), active)?)?;
     let profile = parse(http_get_cancellable(
         &format!("{MOJANG_PROFILES}{}", id.get("id")?.as_str()?),
         active,
@@ -1896,7 +1901,6 @@ fn mojang_profile_textures(profile: &serde_json::Value) -> Option<Textures> {
     Some(unpack(value, Signature::Signed, &TEXTURE_URIS)).filter(|t| t.skin.is_some())
 }
 
-const MOJANG_NAMES: &str = "https://api.mojang.com/users/profiles/minecraft/";
 const MOJANG_PROFILES: &str = "https://sessionserver.mojang.com/session/minecraft/profile/";
 
 /// Whether `name` is one Ely.by could hold, and safe to put in its URL as it is.
@@ -1935,11 +1939,14 @@ impl ElySkins {
     }
     /// Ask Ely.by once for this session, using the game's owned IO service.
     pub fn ask(&mut self, uuid: u128, name: &str) {
+        let Some(service) = horizon_hooks::engine::name_skin_service() else {
+            return;
+        };
         if !ely_name(name) || !self.asked.insert(uuid) {
             return;
         }
         let (url, send, name) = (
-            format!("{ELY_TEXTURES}{name}"),
+            format!("{}{name}", service.textures),
             self.send.clone(),
             name.to_owned(),
         );
@@ -1948,9 +1955,15 @@ impl ElySkins {
             move |stopping, scope| {
                 let active = || io_active(stopping, scope);
                 let ely = http_get_cancellable(&url, &active)
-                    .map(|body| ely_textures(&String::from_utf8_lossy(&body)))
+                    .map(|body| {
+                        ely_textures_with_upgrade(
+                            &String::from_utf8_lossy(&body),
+                            service.upgrade_http_prefix,
+                        )
+                    })
                     .filter(|t| t.skin.is_some());
-                if let Some(textures) = ely.or_else(|| mojang_textures_cancellable(&name, &active))
+                if let Some(textures) =
+                    ely.or_else(|| mojang_textures_cancellable(&name, service.profiles, &active))
                     && active()
                 {
                     let _ = send.send((uuid, textures));
@@ -3370,8 +3383,9 @@ mod tests {
 
     #[test]
     fn ely_answers_become_textures() {
-        let slim = super::ely_textures(
+        let slim = super::ely_textures_with_upgrade(
             r#"{"SKIN":{"url":"http://ely.by/storage/skins/69c6.png","metadata":{"model":"slim"}},"CAPE":{"url":"http://ely.by/storage/capes/1.png"}}"#,
+            Some("http://ely.by/"),
         );
         assert_eq!(
             slim.skin.as_deref(),
@@ -3392,6 +3406,25 @@ mod tests {
         // 204 No Content: nothing to wear.
         assert_eq!(super::ely_textures(""), super::Textures::default());
         assert!(super::ely_name("Steve_01") && !super::ely_name("a b") && !super::ely_name("../x"));
+    }
+
+    #[test]
+    fn only_the_providers_exact_texture_prefix_is_upgraded() {
+        let body = r#"{"SKIN":{"url":"http://example.org/textures/skin.png"},"CAPE":{"url":"http://example.org.evil/textures/cape.png"}}"#;
+        let plain = super::ely_textures_with_upgrade(body, None);
+        assert_eq!(
+            plain.skin.as_deref(),
+            Some("http://example.org/textures/skin.png")
+        );
+        let upgraded = super::ely_textures_with_upgrade(body, Some("http://example.org/textures/"));
+        assert_eq!(
+            upgraded.skin.as_deref(),
+            Some("https://example.org/textures/skin.png")
+        );
+        assert_eq!(
+            upgraded.cape.as_deref(),
+            Some("http://example.org.evil/textures/cape.png")
+        );
     }
 
     /// SkinManager.registerTextures combines the body/cape/wings futures with

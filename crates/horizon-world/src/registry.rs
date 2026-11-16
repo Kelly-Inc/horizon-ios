@@ -75,11 +75,13 @@ fn cacheable_saved_state(tag: &Tag) -> bool {
     }
 }
 /// Equal when they hold the same states in the same order and the same block
-/// defaults. The indexes are built from the states, and the saved-entry cache
-/// only ever resolves to the same ids, so neither counts.
+/// defaults and lookup indexes. Saved-entry memoization does not change identity.
 impl PartialEq for BlockRegistry {
     fn eq(&self, other: &Self) -> bool {
-        self.states == other.states && self.defaults == other.defaults
+        self.states == other.states
+            && self.defaults == other.defaults
+            && self.ids == other.ids
+            && self.collided == other.collided
     }
 }
 impl Eq for BlockRegistry {}

@@ -211,6 +211,8 @@ address. The script then checks, from both sides, what a guest's game used to ge
 - boats:     the host (single player, on its server thread or not) and the guest each right-click a
              boat on water and ride it, paddle it forward (the other side sees it move), sneak out,
              and break it with their fists (#1222).
+- shared-boat: host and guest share one boat in both boarding orders; seat 0 alone drives,
+             seat 1 cannot move it, and the other client observes its movement.
 - boat_shoved: the host and the guest each sit in a boat a piston shoves and /tp moves; the server
              takes the new spot as the boat's last good position, so the rider's next moves pass: at most a few
              "moved wrongly" lines, not an endless loop of them.
@@ -14883,6 +14885,62 @@ def check_loot_give_guest(host, guest, out):
 
 CHECKS += ['loot_give_guest']
 CHECK_FNS['loot_give_guest'] = check_loot_give_guest
+
+
+def check_shared_boat(host, guest, out):
+    """Two clients share a boat; only the server-selected first passenger drives (#1222)."""
+    spots = apart(host, guest)
+    x, y, z = spots['host']
+    x += 3
+    z += 4
+    host('command', command=f'fill {x - 3} {y} {z - 3} {x + 3} {y + 4} {z + 25} minecraft:air')
+    host('command', command=f'fill {x - 3} {y - 2} {z - 3} {x + 3} {y - 1} {z + 25} minecraft:stone')
+    host('command', command=f'fill {x - 2} {y - 1} {z - 2} {x + 2} {y - 1} {z + 24} minecraft:water')
+    results = {}
+    for first, second, first_name, second_name in [(host, guest, host.player, GUEST_NAME), (guest, host, GUEST_NAME, host.player)]:
+        for name in [host.player, GUEST_NAME]:
+            host('command', command=f'ride {name} dismount')
+        host('command', command='kill @e[tag=audit_shared_boat]')
+        host('command', command=f'summon minecraft:oak_boat {x + 0.5} {y - 0.1} {z + 0.5} {{Tags:["audit_shared_boat"],Rotation:[0f,0f]}}')
+        for name in [first_name, second_name]:
+            host('command', command=f'ride {name} mount @e[tag=audit_shared_boat,limit=1]')
+        first.wait(40)
+        second.wait(20)
+
+        def boat(g):
+            status = g('status')
+            riding = status.get('riding')
+            matches = [o for o in status['objects'] if o['id'] == riding and o['kind'] == 'minecraft:oak_boat']
+            assert len(matches) == 1, (g.name, riding, matches)
+            return matches[0]
+        a, b = (boat(first), boat(second))
+        assert a['id'] == b['id'], (a, b)
+        assert (a['controlling'], a['passenger_seat']) == (True, 0), a
+        assert (b['controlling'], b['passenger_seat']) == (False, 1), b
+        assert len(a['passengers']) == len(b['passengers']) == 2, (a, b)
+        start = a['position']
+        second.raw('key', 'w', 'down')
+        second.wait(30)
+        second.raw('key', 'w', 'up')
+        first.wait(10)
+        still = boat(first)['position']
+        passenger_distance = math.dist(start, still)
+        assert passenger_distance < 0.3, ('passenger drove boat', passenger_distance)
+        first.raw('key', 'w', 'down')
+        first.wait(30)
+        first.raw('key', 'w', 'up')
+        second.wait(10)
+        driven, peer = (boat(first), boat(second))
+        distance = math.dist(still, driven['position'])
+        assert distance > 0.5, ('driver did not move', distance)
+        assert math.dist(driven['position'], peer['position']) < 1, (driven, peer)
+        results[first.name] = {'seats': [a['passenger_seat'], b['passenger_seat']], 'passenger_movement': passenger_distance, 'driver_movement': distance}
+        (out / f'shared-{first.name}.json').write_text(json.dumps({'first': driven, 'second': peer, 'measurements': results[first.name]}, indent=2))
+    return results
+
+
+CHECKS = (*CHECKS, 'shared-boat')
+CHECK_FNS['shared-boat'] = check_shared_boat
 
 
 if __name__ == '__main__':

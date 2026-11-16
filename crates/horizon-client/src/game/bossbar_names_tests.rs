@@ -48,7 +48,7 @@ fn game_with_two_guests() -> Game<'static> {
     game.set_allow_commands(true);
     game.player = Some(
         PlayerMotion::new(
-            game.motion,
+            &game.motion,
             horizon_core::geometry::Vec3::new(10.5, 64.0, -3.25),
         )
         .unwrap(),

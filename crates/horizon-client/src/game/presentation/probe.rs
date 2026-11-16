@@ -375,6 +375,7 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
                     path: a.clone(),
                     size: None,
                     scaled: false,
+                    background: false,
                 });
             ready(game, &mut serial)?;
             assert!(std::fs::metadata(&a)?.len() > 100, "real A pixels saved");
@@ -396,6 +397,7 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
                     path: b.clone(),
                     size: None,
                     scaled: false,
+                    background: false,
                 });
             assert!(!frame(game, &mut serial)?, "resize must remain pending");
             let target = options_target();
@@ -492,7 +494,7 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
     game.renderer
         .as_mut()
         .unwrap()
-        .set_world_post(0.5, false, false, 1.0);
+        .set_world_post(0.5, false, false, 1.0, 0.0);
     assert!(!game.renderer.as_ref().unwrap().presentation_current());
     ready(game, &mut serial)?;
     eprintln!("presentation_probe GUI-scale and render-scale invalidate before new input");
@@ -506,6 +508,7 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
         path: screenshot,
         size: None,
         scaled: true,
+        background: false,
     });
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

@@ -36,7 +36,7 @@ fn volume(path: &str) -> Option<String> {
         return Some(format!(r"\\{server}\{share}").to_lowercase());
     }
     let bytes = path.as_bytes();
-    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
         .then(|| path[..2].to_ascii_uppercase())
 }
 
@@ -104,5 +104,12 @@ mod tests {
             aside_dirs(r"C:\Games\Horizon Launcher", "tmp"),
             vec![r"C:\Games".to_string()]
         );
+        for relative in [r"C:Temp", "C:"] {
+            assert_eq!(
+                aside_dirs(r"C:\Games\Horizon Launcher", relative),
+                vec![r"C:\Games".to_string()],
+                "a drive-relative TEMP is not an absolute location: {relative}"
+            );
+        }
     }
 }

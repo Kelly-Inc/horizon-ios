@@ -41,7 +41,7 @@ fn a_withers_nether_star_lives_12000_ticks() {
             game.world.set(x, 199, z, stone).unwrap();
         }
     }
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 200.0, 8.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(8.5, 200.0, 8.5)).unwrap());
     game.update_chunk_tickets();
     assert!(game.entity_ticking_area()(4, 4), "the drops tick");
     let wither = game

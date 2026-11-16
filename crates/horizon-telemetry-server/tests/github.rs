@@ -26,6 +26,14 @@ fn gh_references_link_nothing_either() {
 }
 
 #[test]
+fn issue_url_neutralisation_is_case_insensitive_and_preserves_unicode() {
+    assert_eq!(
+        neutralise("🧱 https://GitHub.COM/a/b/issues/1 and https://GITHUB.com/x/y/issues/2"),
+        "🧱 https://GitHub.COM\u{200b}/a/b/issues/1 and https://GITHUB.com\u{200b}/x/y/issues/2"
+    );
+}
+
+#[test]
 fn a_report_reads_as_the_template() {
     let fields: Map<String, Value> = serde_json::from_value(json!({
         "title": "Water is black\non AMD", "did": "Opened a world", "happened": "Black water",

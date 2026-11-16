@@ -23,7 +23,7 @@ fn rain_and_snow_leave_depth_alone_whatever_rain_depth_says() {
             let mut post = pack(&device, &queue, &adapter, program, property);
             // Retain the pipelines for another frame, then resize their targets.
             for size in [[6, 1], [6, 1], [12, 2]] {
-                post.resize(&device, &queue, size).unwrap();
+                wait_resize(&mut post, &device, &queue, size);
                 let mut encoder = device.create_command_encoder(&Default::default());
                 let targets = post.targets.as_ref().unwrap();
                 let color = &targets.color[0].as_ref().unwrap()[0];
@@ -136,13 +136,20 @@ fn pack(
     .unwrap();
     let macros = horizon_shaders::Macros::standard();
     let properties = horizon_shaders::Properties::parse(property, &macros);
+    let vertex_inputs = super::super::pack_weather::inputs();
     let post = horizon_shaders::load_post(
         &pack,
         "",
         &properties,
         &macros,
         &horizon_shaders::GameInputs {
-            weather: Some(super::super::pack_weather::inputs()),
+            // The generic textured-lit fixture is also a fallback for these
+            // stages. Supply their inputs so whole-pack admission can validate
+            // it; this oracle draws only the weather geometry below.
+            terrain: (program == "gbuffers_textured_lit").then(|| vertex_inputs.clone()),
+            entities: (program == "gbuffers_textured_lit").then(|| vertex_inputs.clone()),
+            hand: (program == "gbuffers_textured_lit").then(|| vertex_inputs.clone()),
+            weather: Some(vertex_inputs),
             ..Default::default()
         },
     );

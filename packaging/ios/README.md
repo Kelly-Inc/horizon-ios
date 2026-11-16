@@ -1,4 +1,15 @@
-# The iOS app shell: what Horizon's simulation says on an iPhone
+# iOS packaging and native launcher
+
+The current app is the `HorizonGame` target: the `horizon-official` Rust executable plus
+`HorizonLauncherKit`, the native Swift launcher. The authoritative build and artifact audit
+steps are in [the iOS workflow](../../.github/workflows/ios.yml). It uploads the
+`horizon-ios-game` artifact containing `Horizon-game-unsigned.ipa`.
+
+The shell/probe commands below document the earlier packaging prototypes; they are not
+a complete build of the current native-launcher app. Use the workflow’s `Build the game`
+and `Bundle it` steps together to reproduce the current distributable.
+
+## Historical shell prototype
 
 Three files and one crate make the app shell, and a fourth puts the game itself in a bundle beside it.
 
@@ -227,21 +238,21 @@ first-run flow. This does not verify physical iOS input, orientation, or shader
 appearance. Native launcher download/import presentation is covered separately by
 `tools/test_ios_game_files.py` on the Simulator.
 
-## Why the game, when it comes, is the Cargo executable and not another static library
+## Why the app bundles a Rust executable
 
-`crates/horizon-ios` is a library, so `cargo rustc --crate-type staticlib` works for it. The game is not a
-library: `Game` and `game::run()` live in the **bin** target (`crates/horizon-client/src/main.rs`, `game.rs`,
-`src/game/`), and the lib cannot see them. rustc will not emit a library from a bin -- both
-`crate-type = ["staticlib"]` in a `[[bin]]` and `cargo rustc --bin … --crate-type staticlib` are hard errors
-("crate types can only be specified for libraries and example libraries"). winit 0.30's iOS backend removes the
-need for that detour anyway: `EventLoop::run_app` calls `UIApplicationMain` itself, so a Rust executable built
-by `cargo build --target aarch64-apple-ios` is a legitimate `Payload/Horizon.app/Horizon`, which is what
-`.github/workflows/ios.yml` now produces beside this shell.
+Gameplay and startup now live in the `horizon-client` library (`src/lib.rs`, `game.rs`,
+`src/game/`). Its executable is a thin entry point; `horizon-official` provides the shipped
+Horizon app entry. The earlier claim that gameplay existed only in a binary target is obsolete.
+
+The iOS build still packages a Cargo executable because winit’s UIKit backend starts the
+application event loop. Xcode bundles that executable with `HorizonLauncherKit` and the app’s
+resources, and `tools/ci/ios_release.py` stamps and audits the final app and IPA.
 
 ### Unsigned builds in GitHub Releases
 
-After this workflow is merged, each successful `main` push in `heyskylo/horizon-ios`
-creates a versioned prerelease containing an unsigned IPA and its `.sha256` checksum.
+A successful trusted `main` push publishes a regular release containing an unsigned IPA
+and its `.sha256` checksum. `tools/ci/publish-ios-release.sh` explicitly clears the
+prerelease flag and only updates a tag whose source commit matches the build.
 The app's build number is the workflow run number and attempt (for example `42.1`),
 and its source commit is recorded in `Info.plist`. Release tags use `ios-build-42.1`;
 assets are named `Horizon-iOS-<version>-build42.1-unsigned.ipa`.

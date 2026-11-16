@@ -87,14 +87,14 @@ void main() {
     let pack = horizon_shaders::Pack::open(&root).unwrap();
     let macros = horizon_shaders::Macros::standard();
     let properties = horizon_shaders::Properties::parse("alphaTest.gbuffers_terrain=off", &macros);
+    let vertex = horizon_shaders::GbuffersInputs {
+        body: "vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2)); hz_Vertex=vec4(p*2.0-1.0,0.0,1.0);".into(),
+        paged_maps: true, water_mask: false, water_patches: false,
+        ..Default::default()
+    };
     let inputs = horizon_shaders::GameInputs {
-        terrain: Some(horizon_shaders::GbuffersInputs {
-            body: "vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2)); hz_Vertex=vec4(p*2.0-1.0,0.0,1.0);".into(),
-            paged_maps: true,
-            water_mask: false,
-            water_patches: false,
-            ..Default::default()
-        }),
+        terrain: Some(vertex.clone()),
+        entities: Some(vertex),
         ..Default::default()
     };
     let post = horizon_shaders::load_post(&pack, "", &properties, &macros, &inputs);
@@ -134,11 +134,33 @@ void main() {
         .terrain
         .take()
         .unwrap_or_else(|| panic!("terrain pipeline must compile: {:?}", post.notes));
+    // The production terrain layout requires the per-page metadata group,
+    // even when this full-screen shader reads none of its buffers.
+    let unused = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Paged-map oracle unused terrain metadata"),
+        size: 32,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let terrain_group = post.block_ids.as_ref().map(|(layout, ids, rects)| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &[ids, &unused, &unused, rects]
+                .into_iter()
+                .enumerate()
+                .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect::<Vec<_>>(),
+        })
+    });
     // As the entity passes are (`paged`), with the maps the renderer hands over.
     pass.paged = true;
     post.set_paged_maps([Some(map), None]);
     post.copied |= 1;
-    post.resize(&device, &queue, [8, 1]);
+    wait_resize(&mut post, &device, &queue, [8, 1]);
     let read = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 256,
@@ -166,6 +188,9 @@ void main() {
         let mut render = post.begin(&mut encoder, &pass);
         render.set_pipeline(pass.render());
         render.set_bind_group(0, &group, &[]);
+        if let Some(group) = &terrain_group {
+            render.set_bind_group(3, group, &[]);
+        }
         if pass.draw {
             post.draws.bind(&mut render, "TERRAIN_SOLID");
         }

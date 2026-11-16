@@ -667,14 +667,6 @@ impl Part {
         }
     }
 }
-/// `Renderer::compact_arena`'s and `shrink_translucent`'s moves: what the meshes
-/// hold on `page` of `arena` (`part`) goes to its other pages in video memory,
-/// until the next range would pass `budget` bytes (it keeps what is left; the
-/// first range moves whatever its size, so none keeps the page closed), the
-/// copies into `encoder`, the ranges' flat draw ids (`flat`) and, in the
-/// section arena, GPU culling's records (`records`) along. False when the other
-/// pages have no room left.
-
 /// Starts moving a page of a large arena far larger than its ranges in use
 /// (`Arena::oversized`) into a new page of the size they get (`Arena::open_page`),
 /// for `Renderer::shrink_translucent`: the page closes and `move_off_page` empties
@@ -1525,7 +1517,7 @@ pub struct Renderer {
     /// Vanilla's menu background blur, made on first use.
     menu_blur: Option<crate::menu_blur::MenuBlur>,
     /// `post_effect` chains, made on first use.
-    post_effects: Option<crate::post_chain::PostEffects>,
+    post_effects: Option<Box<crate::post_chain::PostEffects>>,
     /// Where a screenshot's frame is drawn when the swapchain cannot be read back.
     readback: readback::Readback,
     pub info: wgpu::AdapterInfo,
@@ -1573,7 +1565,7 @@ pub struct Renderer {
     /// The Improved transparency option (`GameRenderer.useImprovedTransparency`).
     pub improved_transparency: bool,
     /// Its passes and targets, made when first drawn with.
-    oit: Option<oit::Oit>,
+    oit: Option<Box<oit::Oit>>,
     /// Advance animated block textures (Horizon setting; vanilla always does).
     pub animated_textures: bool,
     present_modes: Vec<wgpu::PresentMode>,
@@ -7113,12 +7105,6 @@ impl Renderer {
                 .measure(&self.device, &self.queue, &views, hdr.masks);
         }
     }
-    /// Whether what the system reports for the display changed (another output, the
-    /// player recalibrating the desktop): the settings' Auto values follow it then, so
-    /// apply them again.
-
-    /// The share of real frames frame generation shows a made frame before (1 while it
-    /// keeps up), `None` while it isn't running.
     /// The posed models' store size (`SkinFrame::base`), with entity skinning.
     pub fn skinned_models(&self) -> Option<u32> {
         self.entity_skin
@@ -7148,6 +7134,8 @@ impl Renderer {
         self.skins_entities() && !self.improved_transparency && self.pack_post.is_none()
     }
 
+    /// The share of real frames frame generation shows a made frame before (1 while it
+    /// keeps up), `None` while it isn't running.
     pub fn frame_generation_share(&self) -> Option<f32> {
         self.frame_gen.made_share
     }
@@ -10130,7 +10118,7 @@ impl Renderer {
             ];
             self.oit
                 .get_or_insert_with(|| {
-                    oit::Oit::new(
+                    Box::new(oit::Oit::new(
                         device,
                         layout,
                         flat.as_ref(),
@@ -10138,7 +10126,7 @@ impl Renderer {
                         [&clouds[0], &clouds[1]],
                         sprites,
                         format,
-                    )
+                    ))
                 })
                 .prepare(
                     &self.device,
@@ -12289,7 +12277,7 @@ impl Renderer {
             let device = &self.device;
             let post = self
                 .post_effects
-                .get_or_insert_with(|| crate::post_chain::PostEffects::new(device));
+                .get_or_insert_with(|| Box::new(crate::post_chain::PostEffects::new(device)));
             // The chains a spectated mob applies compile in the background from the
             // first frame in a world, not in the frame that first needs one.
             post.preload(

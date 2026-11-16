@@ -13180,6 +13180,7 @@ mod tests {
         let landing_hooks = free_hooks(include_str!("../landing.rs"));
         let motion_hooks = free_hooks(include_str!("../motion.rs"));
         let sound_hooks = free_hooks(include_str!("../sound_playback.rs"));
+        let death_hooks = free_hooks(include_str!("../living_death.rs"));
         // The chat relay's (`horizon_client_lib::lan::hub::chat`).
         let chat_hooks = free_hooks(include_str!("../lan/hub/chat.rs"));
         // The mob AI's (`horizon_client_lib::mobs::ai`).
@@ -13208,6 +13209,7 @@ mod tests {
             .chain(landing_hooks.iter().copied())
             .chain(motion_hooks.iter().copied())
             .chain(sound_hooks.iter().copied())
+            .chain(death_hooks.iter().copied())
             .chain(chat_hooks.iter().copied())
             .chain(mob_hooks.iter().copied())
             .chain(conn_hooks.iter().copied())
@@ -13243,6 +13245,8 @@ mod tests {
                 format!("horizon_client_lib::motion::native_{name}")
             } else if sound_hooks.contains(name) {
                 format!("horizon_client_lib::sound_playback::native_{name}")
+            } else if death_hooks.contains(name) {
+                format!("horizon_client_lib::living_death::native_{name}")
             } else if chat_hooks.contains(name) {
                 format!("horizon_client_lib::lan::hub::chat::native_{name}")
             } else if menu_hooks.contains(name) {

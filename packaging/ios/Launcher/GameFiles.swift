@@ -161,13 +161,22 @@ final class GameFilesDownload: NSObject, ObservableObject {
 
     /// Import through the same resource-only validator as automatic setup.
     func importPreparedFile(_ url: URL) async {
-        guard !busy else { return }
+        guard !busy, !Task.isCancelled else { return }
         resourcesOnly = false
         attempt = UUID()
         startedAt = ProcessInfo.processInfo.systemUptime
         trace("file_import_start")
         traceStorage()
         let generation = attempt
+        defer {
+            // File-provider hydration runs off the main actor. If its caller is
+            // cancelled while waiting, release this attempt's busy state so
+            // another import can start. Never overwrite a newer attempt.
+            if generation == attempt, Task.isCancelled, state == .installing {
+                trace("file_import_cancelled")
+                state = .idle
+            }
+        }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let local = Self.destination

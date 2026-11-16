@@ -3007,7 +3007,7 @@ mod registered_slot_source_preservation_tests {
         let (mut game, _) = scene("slot-source-player-this-world");
         game.player = Some(
             horizon_client::motion::PlayerMotion::new(
-                game.motion,
+                &game.motion,
                 horizon_core::geometry::Vec3::new(0.5, 101.0, 0.5),
             )
             .unwrap(),

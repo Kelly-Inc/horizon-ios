@@ -517,11 +517,25 @@ impl Game<'_> {
             v["distance"] = json!(dist(eye, hit.point));
             v
         });
-        let entity = self.mob_hit().map(|(i, d, _)| {
+        let mut entity = self.mob_hit().map(|(i, d, _)| {
             let m = &self.mobs[i];
             json!({ "id": m.id, "type": m.kind.id, "health": m.health, "distance": d,
                     "pos": [m.position.x, m.position.y, m.position.z] })
         });
+        // The attack/pick path also targets non-mob objects. Keep their
+        // reported identity consistent with the existing object status schema.
+        if let Some(hit) = self.remote_object_hit(true)
+            && entity
+                .as_ref()
+                .is_none_or(|m| hit.distance < m["distance"].as_f64().unwrap_or(f64::INFINITY))
+            && let Some(object) = self
+                .objects_status()
+                .into_iter()
+                .find(|object| object["id"].as_u64() == Some(u64::from(hit.id as u32)))
+        {
+            entity = Some(json!({"id": hit.id as u32, "type": object["kind"],
+                "health": Value::Null, "distance": hit.distance, "pos": object["position"]}));
+        }
         let kind = match (&block, &entity) {
             (Some(b), Some(e)) if e["distance"].as_f64() <= b["distance"].as_f64() => "entity",
             (_, Some(_)) if block.is_none() => "entity",
@@ -2390,6 +2404,66 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn crosshair_state_reports_boat_and_cart_targets_before_blocks() {
+        use super::super::{
+            boats::Boat,
+            minecarts::{CartKind, Minecart},
+        };
+        let mut game = super::super::native_machines::tests::server_game();
+        game.player = Some(
+            horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.0, 8.5))
+                .unwrap(),
+        );
+        game.yaw = 0.0;
+        game.pitch = 40.0;
+        let air = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:air")
+            .unwrap();
+        for y in 64..=66 {
+            for z in 8..=12 {
+                game.world.set(8, y, z, air).unwrap();
+            }
+        }
+        for cart in [false, true] {
+            if cart {
+                game.carts.push(Minecart::new(
+                    901,
+                    CartKind::Rideable,
+                    Vec3::new(8.5, 64.0, 10.5),
+                ));
+            } else {
+                game.boats.push(Boat::new(
+                    901,
+                    "oak".into(),
+                    Vec3::new(8.5, 64.0, 10.5),
+                    0.0,
+                ));
+            }
+            assert!(
+                game.remote_object_hit(true).is_some(),
+                "fixture must actually aim at a vehicle"
+            );
+            let seen = game.looking_at();
+            assert_eq!(seen["kind"], "entity");
+            assert_eq!(seen["entity"]["id"], 901);
+            assert_eq!(
+                seen["entity"]["type"],
+                if cart {
+                    "minecraft:minecart"
+                } else {
+                    "minecraft:oak_boat"
+                }
+            );
+            game.carts.clear();
+            game.boats.clear();
+        }
+    }
 
     #[test]
     fn whole_goto_coordinates_name_a_block() {

@@ -79,6 +79,9 @@ def main():
             result = subprocess.run([
                 "xcodebuild", "-xctestrun", str(fixture), "-destination", destination,
                 "-parallel-testing-enabled", "NO",
+                # This loopback fixture records its own requests and test log.
+                # Automatic simulator diagnostics can stall after tests finish.
+                "-collect-test-diagnostics", "never",
                 "-only-testing:LauncherLogicTests/AutomaticGameFilesTests",
                 "-only-testing:LauncherPreviewUITests/LauncherLayoutTests/testFirstRunAutomaticallyDownloadsAndEnablesPlay",
                 "-only-testing:LauncherPreviewUITests/LauncherLayoutTests/testImportCommitKeepsPlayDisabledUntilAcknowledged",

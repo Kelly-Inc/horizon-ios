@@ -52,8 +52,19 @@ impl Game<'_> {
                 seed,
                 creative,
                 create,
+                from_title,
             }) => {
-                self.open_world(&folder, name.as_deref(), seed, creative, create.as_deref())?;
+                if from_title {
+                    self.open_world_from_title(
+                        &folder,
+                        name.as_deref(),
+                        seed,
+                        creative,
+                        create.as_deref(),
+                    )?;
+                } else {
+                    self.open_world(&folder, name.as_deref(), seed, creative, create.as_deref())?;
+                }
             }
             Some(PendingWorldEntry::Server {
                 address,

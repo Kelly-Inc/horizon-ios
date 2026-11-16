@@ -234,7 +234,7 @@ impl Game<'_> {
         }
         // The world a backup made before its upgrade opens (EditWorldScreen's callback).
         if let Some(folder) = self.title.as_mut().and_then(|t| t.take_open_request())
-            && let Err(error) = self.open_world(&folder, None, None, false, None)
+            && let Err(error) = self.open_world_from_title(&folder, None, None, false, None)
         {
             self.error = Some(error);
             event_loop.exit();

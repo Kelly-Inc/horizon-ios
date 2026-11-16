@@ -14,7 +14,7 @@ use horizon_world::registry::BlockStateId;
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn a_ground_jump_awards_the_jump_statistic() {
     let mut game = server_game();
-    let mut player = PlayerMotion::new(game.motion, Vec3::new(2.5, 64.0, 2.5)).unwrap();
+    let mut player = PlayerMotion::new(&game.motion, Vec3::new(2.5, 64.0, 2.5)).unwrap();
     player.ground.on_ground = true;
     {
         let mut world = MotionWorld {
@@ -22,8 +22,8 @@ fn a_ground_jump_awards_the_jump_statistic() {
             player: &mut player,
             scene: &mut game.world,
             assets: &game.pack.assets,
-            collision_binding: game.collision,
-            resources: game.motion,
+            collision_binding: &game.collision,
+            resources: &game.motion,
             health: &game.health_resources,
         };
         world.jump_from_ground().unwrap();
@@ -42,7 +42,7 @@ fn a_ground_jump_awards_the_jump_statistic() {
 #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
 fn a_worn_out_helmet_awards_the_broken_statistic() {
     let mut game = server_game();
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 64.0, 2.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(2.5, 64.0, 2.5)).unwrap());
     let mut helmet = ItemStack::new("minecraft:leather_helmet", 1);
     helmet.damage = 54;
     game.armor[0] = Some(helmet);
@@ -88,7 +88,7 @@ fn sleeping_in_a_straw_bed_awards_its_own_statistic() {
     // `Level.isDarkOutside`: midnight, so a bed may be slept in.
     game.world.day_time = 18000;
     let straw = place_bed(&mut game, 2, "minecraft:straw_bed");
-    game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 64.0, 3.5)).unwrap());
+    game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(2.5, 64.0, 3.5)).unwrap());
     game.try_sleep(straw);
     assert_eq!(
         game.sleeping,

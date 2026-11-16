@@ -57,7 +57,7 @@ fn a_ridden_hopper_cart_takes_one_item_a_tick() {
     game.carts.push(ridden);
     game.carts.push(empty);
     game.player = Some(
-        horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 64.5, 8.5)).unwrap(),
+        horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.5, 8.5)).unwrap(),
     );
     // A hopper cart's interact opens its menu (`AbstractMinecartContainer.interact`),
     // so a player only gets in with `/ride`, whose `RideCommand.mount` forces

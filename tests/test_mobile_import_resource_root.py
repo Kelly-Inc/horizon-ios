@@ -148,7 +148,7 @@ fn main(){
  // is already parked, and the new tree has not yet moved into resources/.
  let gap_home=root.join("publication-gap");let final_root=gap_home.join("resources");
  files(&gap_home.join("resources.previous"),b"previous generation");
- let staged=gap_home.join("resources.unpacking");files(&staged,b"published new generation");
+ let staged=gap_home.join("resources.staged");files(&staged,b"published new generation");
  assert!(!final_root.exists());
  let explicit_gap_root=root.join("gap-explicit");files(&explicit_gap_root,b"valid explicit");
  let mut explicit_gap=Loading::new(explicit_gap_root.clone(),root.join("not-a-vanilla-overlay"));

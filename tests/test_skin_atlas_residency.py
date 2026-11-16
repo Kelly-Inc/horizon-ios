@@ -21,7 +21,7 @@ def program():
     downloader = source[a:b]
     methods = '\n'.join(method(source, n) for n in (
         'new', 'image', 'remember_image', 'remember', 'queue', 'again', 'set_resource_root',
-        'prioritize', 'take_ready', 'drawn', 'begin_draw', 'finish_draw', 'take_drawn'))
+        'forget_resource', 'prioritize', 'take_ready', 'drawn', 'begin_draw', 'finish_draw', 'take_drawn'))
     # Resolver::new precedes Downloader::new; take this constructor from its
     # own impl instead of silently pulling the unrelated profile cache in.
     methods = methods.replace(method(source, 'new'), method(source[source.index('impl Downloader {'):], 'new'), 1)

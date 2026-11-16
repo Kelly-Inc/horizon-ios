@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import LauncherPreview
 
 /// Only a presence marker for the in-memory engine; never actual Minecraft assets.
@@ -210,6 +211,49 @@ final class AccountTests: XCTestCase {
         guard case .failed = account.state else { return XCTFail("fixture add did not fail") }
         XCTAssertEqual(account.profile, alice); XCTAssertEqual(account.accounts, [alice, bob])
         XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-old-refresh")
+    }
+    func testDeviceSignInRespectsLongIntervalsAndEverySlowDown() async throws {
+        for initial in [60, 120] {
+            AuthURLProtocol.response = { request in
+                if request.url!.path.hasSuffix("/devicecode") {
+                    return (200, ["device_code": "fixture-device", "user_code": "FIXTURE", "verification_uri": "https://microsoft.com/link", "expires_in": 900, "interval": initial])
+                }
+                return (400, ["error": "slow_down"])
+            }
+            var waits: [UInt64] = []
+            let observed = expectation(description: "three poll delays at \(initial) seconds")
+            let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: {self.instant}, sleep: { delay in
+                waits.append(delay)
+                if waits.count == 3 {observed.fulfill(); throw CancellationError()}
+            }, client: "fixture-client")
+            account.signIn()
+            await fulfillment(of: [observed], timeout: 5)
+            account.cancel()
+            XCTAssertEqual(waits, [initial, initial + 5, initial + 10].map {UInt64($0) * 1_000_000_000})
+        }
+    }
+    func testDeviceSignInStopsIfTheCodeExpiresWhileWaiting() async throws {
+        var tokenRequests = 0
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/devicecode") {
+                return (200, ["device_code": "fixture-device", "user_code": "FIXTURE", "verification_uri": "https://microsoft.com/link", "expires_in": 1, "interval": 5])
+            }
+            self.lock.withLock {tokenRequests += 1}
+            return (400, ["error": "expired_token"])
+        }
+        var clock = instant
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: {clock}, sleep: { delay in
+            clock.addTimeInterval(Double(delay) / 1_000_000_000)
+        }, client: "fixture-client")
+        let finished = expectation(description: "expired code ends sign-in")
+        let observation = account.$state.sink {state in
+            if case .failed = state {finished.fulfill()}
+        }
+        account.signIn()
+        await fulfillment(of: [finished], timeout: 5)
+        observation.cancel(); account.cancel()
+        let count = lock.withLock {tokenRequests}
+        XCTAssertEqual(count, 0, "An expired device code must never be polled")
     }
     func testCancelAddCannotReplaceSelection() async throws {
         try seed(expired: false); network()

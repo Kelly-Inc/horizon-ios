@@ -79,7 +79,7 @@ fn the_raid_bar_keeps_a_viewer_until_the_next_twenty_tick_beat() {
     let ints = [0, 0, 0, 1];
     game.level.player_uuid = Some(ints);
     game.player =
-        Some(super::super::PlayerMotion::new(game.motion, Vec3::new(8.5, 200.0, 8.5)).unwrap());
+        Some(super::super::PlayerMotion::new(&game.motion, Vec3::new(8.5, 200.0, 8.5)).unwrap());
     assert!(game.raid_command_create([8, 200, 8], 1));
     // The first tick is a beat (the countdown is 300 ticks): the player joins.
     game.tick_raids();

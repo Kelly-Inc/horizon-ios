@@ -40,7 +40,7 @@ fn a_click_from_inside_a_scaffolding_block_places_on_the_opposite_face() {
         .unwrap();
     game.player = Some(
         PlayerMotion::new(
-            game.motion,
+            &game.motion,
             Vec3::new(
                 f64::from(COLUMN[0]) + 0.5,
                 f64::from(COLUMN[1]) - 1.0,

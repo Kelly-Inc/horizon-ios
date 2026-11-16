@@ -176,7 +176,7 @@ pub struct Installed {
 /// dotfolder iOS neither shows nor lets a player create. A desktop is not asked (`home` is `None`)
 /// because a `resources` folder under its working directory means something else there.
 pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let has = |dir: &Path| dir.join(Kind::Resources.marker()).exists();
+    let has = |dir: &Path| dir.join(Kind::Resources.marker()).is_file();
     if has(sibling) {
         return Some(sibling.to_owned());
     }
@@ -295,6 +295,22 @@ pub struct Pack {
 }
 
 impl Pack {
+    /// Require prepared game files before automatic setup can mutate the home.
+    /// General manual import still accepts worlds and resource packs.
+    pub fn require_game_files(self) -> Result<Self> {
+        if self.kind != Kind::Resources {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::lang::get_or(
+                    "horizon.import.game_files_only",
+                    "The automatic download did not contain game files.",
+                ),
+            )
+            .into());
+        }
+        Ok(self)
+    }
+
     /// Look inside an archive and say what it is, writing nothing. Only the central directory is
     /// read, so this is cheap even for a prepared tree.
     pub fn open(path: &Path) -> Result<Self> {
@@ -370,15 +386,22 @@ impl Pack {
     /// `into` again: the game must never see a half tree.
     fn unpack(&mut self, into: &Path) -> Result<(usize, u64)> {
         fs::create_dir_all(into)?;
+        let result = self.unpack_entries(into);
+        if result.is_err() {
+            // CRC, decompression and filesystem failures also leave partial
+            // output. A world marker may already be visible in that output.
+            let _ = fs::remove_dir_all(into);
+        }
+        result
+    }
+
+    fn unpack_entries(&mut self, into: &Path) -> Result<(usize, u64)> {
         let mut files = 0;
         let mut written = 0u64;
         for index in 0..self.archive.len() {
             let file = self.archive.by_index(index)?;
             let name = file.name()?.replace('\\', "/");
-            let failure = |message: String| {
-                let _ = fs::remove_dir_all(into);
-                Err::<(usize, u64), _>(message.into())
-            };
+            let failure = |message: String| Err::<(usize, u64), _>(message.into());
             // Not `ZipArchive::extract`, which would create these: an archive from a stranger must
             // not be able to point a later write somewhere else in the container.
             if file.is_symlink() {
@@ -491,8 +514,15 @@ impl Pack {
                     let scratch = home.join("resources.unpacking");
                     let _ = fs::remove_dir_all(&scratch);
                     let (files, bytes) = self.unpack(&scratch)?;
+                    // Only this rename proves extraction finished. A marker inside
+                    // `resources.unpacking` may have been the very first ZIP entry.
+                    let staged = home.join("resources.staged");
+                    if staged.exists() {
+                        fs::remove_dir_all(&staged)?;
+                    }
+                    fs::rename(&scratch, &staged)?;
                     let dest = home.join(folder);
-                    publish(&scratch, &dest)?;
+                    publish(&staged, &dest)?;
                     fs::remove_file(&archive)?;
                     (dest, files, bytes)
                 }
@@ -539,22 +569,29 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
     }
     with_home_access(home, || {
         let scratch = home.join("resources.unpacking");
+        let staged = home.join("resources.staged");
         let dest = home.join(Kind::Resources.folder());
         let previous = home.join("resources.previous");
-        if scratch.is_dir() && !dest.exists() {
-            fs::rename(&scratch, &dest)?;
-            horizon_core::prepared_files::invalidate(&dest);
-            return Ok(Some(dest));
-        }
-        if !dest.exists() && previous.is_dir() {
+        let restored = if !dest.exists() && staged.is_dir() {
+            fs::rename(&staged, &dest)?;
+            true
+        } else if !dest.exists() && previous.is_dir() {
+            // Older builds used the same scratch name before and after
+            // extraction. Prefer the known previous tree over ambiguous scratch.
             fs::rename(&previous, &dest)?;
+            true
+        } else {
+            false
+        };
+        if restored {
             horizon_core::prepared_files::invalidate(&dest);
-            return Ok(Some(dest));
         }
-        // Both landed: the new tree is in place, so what is left over is scratch and the old copy.
+        // An unfinished first install has no recoverable tree. Keep its ZIP for
+        // retry, but never let the launcher see partial resources as ready.
         let _ = fs::remove_dir_all(&scratch);
+        let _ = fs::remove_dir_all(&staged);
         let _ = fs::remove_dir_all(&previous);
-        Ok(None)
+        Ok(restored.then_some(dest))
     })
 }
 
@@ -625,12 +662,55 @@ pub fn pack(folder: &Path, out: &Path, mut progress: impl FnMut(usize, u64)) -> 
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or("the folder has no name to give the archive")?;
+    let root = fs::canonicalize(folder)?;
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let destination =
+        fs::canonicalize(parent)?.join(out.file_name().ok_or("the archive needs a file name")?);
+    // Canonicalize an existing regular output to retain its actual spelling on
+    // case-insensitive volumes. Do not follow an output symlink: replacing the
+    // link must not replace its target.
+    let destination = if fs::symlink_metadata(&destination).is_ok_and(|m| m.is_file()) {
+        fs::canonicalize(&destination)?
+    } else {
+        destination
+    };
+    if destination == root.join(kind.marker()) {
+        return Err("the archive cannot replace the source folder's metadata".into());
+    }
+    // A nested output may replace an earlier export of this kind, but never
+    // an input payload (region data, textures, or a different kind of archive).
+    if destination.starts_with(&root)
+        && fs::symlink_metadata(&destination).is_ok()
+        && !Pack::open(&destination).is_ok_and(|archive| archive.kind == kind)
+    {
+        return Err("the archive cannot overwrite a file in the source folder".into());
+    }
+    let temporary = unique(&destination.with_extension("zip.exporting"));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let file = File::create(out)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
     let written = (|| -> Result<(usize, u64)> {
         let mut zip = ZipWriter::new(file);
-        let counts = write_tree(&mut zip, &top, folder, folder, options, &mut progress)?;
-        zip.finish()?;
+        let excluded = [destination.as_path(), temporary.as_path()];
+        let counts = write_tree(
+            &mut zip,
+            &top,
+            &root,
+            &root,
+            options,
+            &excluded,
+            &mut progress,
+        )?;
+        let file = zip.finish()?;
+        file.sync_all()?;
+        drop(file);
+        // The previous archive stays intact until its replacement is complete.
+        fs::rename(&temporary, &destination)?;
         Ok(counts)
     })();
     match written {
@@ -641,7 +721,7 @@ pub fn pack(folder: &Path, out: &Path, mut progress: impl FnMut(usize, u64)) -> 
             bytes,
         }),
         Err(error) => {
-            let _ = fs::remove_file(out);
+            let _ = fs::remove_file(&temporary);
             Err(error)
         }
     }
@@ -656,6 +736,7 @@ fn write_tree(
     root: &Path,
     dir: &Path,
     options: SimpleFileOptions,
+    excluded: &[&Path],
     progress: &mut impl FnMut(usize, u64),
 ) -> Result<(usize, u64)> {
     let mut files = 0;
@@ -663,12 +744,17 @@ fn write_tree(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        // Exporting inside the source is supported, but neither an old archive
+        // nor the file currently being written belongs inside the new ZIP.
+        if excluded.contains(&path.as_path()) {
+            continue;
+        }
         let kind = entry.file_type()?;
         if kind.is_symlink() {
             return Err(format!("not packing the symbolic link {}", path.display()).into());
         }
         if kind.is_dir() {
-            let (more, written) = write_tree(zip, top, root, &path, options, progress)?;
+            let (more, written) = write_tree(zip, top, root, &path, options, excluded, progress)?;
             files += more;
             bytes += written;
             continue;
@@ -917,6 +1003,7 @@ mod tests {
                 entered.send(()).unwrap();
                 release_rx.recv().unwrap();
                 fs::write(scratch.join("complete.txt"), "complete")?;
+                fs::rename(&scratch, writer_home.join("resources.staged"))?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
@@ -1543,14 +1630,105 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_archive_removes_partial_tree_and_keeps_originals() {
+        for resources in [false, true] {
+            let home = temp_home(if resources {
+                "crc-resources"
+            } else {
+                "crc-world"
+            });
+            fs::create_dir_all(home.join("saves/kept")).unwrap();
+            fs::write(home.join("saves/kept/level.dat"), "existing world").unwrap();
+            fs::create_dir_all(home.join("resources")).unwrap();
+            fs::write(home.join("resources/facts.json"), "existing resources").unwrap();
+            let archive = home.join("broken.zip");
+            let marker = if resources {
+                "horizon-resources.json"
+            } else {
+                "level.dat"
+            };
+            let payload = "unique corruptible region payload";
+            write_archive(&archive, &[(marker, "{}"), ("region/r.0.0.mca", payload)]);
+            let mut bytes = fs::read(&archive).unwrap();
+            let offset = bytes
+                .windows(payload.len())
+                .position(|part| part == payload.as_bytes())
+                .unwrap();
+            bytes[offset] ^= 1;
+            fs::write(&archive, bytes).unwrap();
+            assert!(Pack::open(&archive).unwrap().install(&home).is_err());
+            let partial = if resources {
+                "resources.unpacking"
+            } else {
+                "saves/broken"
+            };
+            assert!(
+                !home.join(partial).exists(),
+                "failed extraction left {partial} visible"
+            );
+            assert!(
+                archive.exists(),
+                "failed import consumed the original archive"
+            );
+            assert_eq!(
+                fs::read_to_string(home.join("saves/kept/level.dat")).unwrap(),
+                "existing world"
+            );
+            assert_eq!(
+                fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+                "existing resources"
+            );
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_interrupted_extraction_is_never_published_as_ready() {
+        for previous in [false, true] {
+            let home = temp_home(if previous {
+                "partial-with-old"
+            } else {
+                "partial-first"
+            });
+            fs::create_dir_all(home.join("resources.unpacking")).unwrap();
+            fs::write(
+                home.join("resources.unpacking/horizon-resources.json"),
+                "partial",
+            )
+            .unwrap();
+            if previous {
+                fs::create_dir_all(home.join("resources.previous")).unwrap();
+                fs::write(
+                    home.join("resources.previous/facts.json"),
+                    "old complete tree",
+                )
+                .unwrap();
+            }
+            let recovered = recover(&home).unwrap();
+            assert!(
+                !home.join("resources/horizon-resources.json").exists(),
+                "incomplete extraction was published"
+            );
+            if previous {
+                assert_eq!(recovered, Some(home.join("resources")));
+                assert_eq!(
+                    fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+                    "old complete tree"
+                );
+            } else {
+                assert!(recovered.is_none());
+                assert!(!home.join("resources").exists());
+            }
+            assert!(!home.join("resources.unpacking").exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
     fn a_swap_left_half_done_is_finished() {
         let home = temp_home("swap");
-        fs::create_dir_all(home.join("resources.unpacking")).unwrap();
-        fs::write(
-            home.join("resources.unpacking/horizon-resources.json"),
-            "{}",
-        )
-        .unwrap();
+        fs::create_dir_all(home.join("resources.staged")).unwrap();
+        fs::write(home.join("resources.staged/horizon-resources.json"), "{}").unwrap();
         assert_eq!(recover(&home).unwrap(), Some(home.join("resources")));
         assert!(home.join("resources/horizon-resources.json").is_file());
         fs::remove_dir_all(home).unwrap();
@@ -1636,6 +1814,78 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn failed_export_preserves_an_existing_archive() {
+        let home = temp_home("failed-export");
+        let source = home.join("World");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("level.dat"), "world metadata").unwrap();
+        std::os::unix::fs::symlink("missing", source.join("bad-link")).unwrap();
+        let archive = home.join("backup.zip");
+        fs::write(&archive, "previous good backup").unwrap();
+        assert!(pack(&source, &archive, |_, _| {}).is_err());
+        assert_eq!(
+            fs::read_to_string(&archive).unwrap(),
+            "previous good backup"
+        );
+        assert_eq!(
+            fs::read_dir(&home).unwrap().count(),
+            2,
+            "temporary export leaked"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn export_does_not_overwrite_source_payload_files() {
+        let home = temp_home("export-source-payload");
+        let source = home.join("World");
+        fs::create_dir_all(source.join("region")).unwrap();
+        fs::write(source.join("level.dat"), "world metadata").unwrap();
+        let region = source.join("region/r.0.0.mca");
+        fs::write(&region, "original chunk data").unwrap();
+        assert!(pack(&source, &region, |_, _| {}).is_err());
+        assert_eq!(fs::read_to_string(&region).unwrap(), "original chunk data");
+        fs::create_dir_all(source.join("resourcepacks")).unwrap();
+        let resource_pack = source.join("resourcepacks/look.zip");
+        write_archive(&resource_pack, &[("pack.mcmeta", "{}")]);
+        let original = fs::read(&resource_pack).unwrap();
+        assert!(pack(&source, &resource_pack, |_, _| {}).is_err());
+        assert_eq!(fs::read(&resource_pack).unwrap(), original);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn export_inside_source_excludes_its_own_output() {
+        let home = temp_home("nested-export");
+        let source = home.join("World");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("level.dat"), "world metadata").unwrap();
+        let archive = source.join("backup.zip");
+        for _ in 0..2 {
+            let exported = pack(&source, &archive, |_, _| {}).unwrap();
+            assert_eq!(exported.files, 1, "export included its own ZIP");
+            let mut zip = ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+            assert_eq!(zip.len(), 1);
+            assert_eq!(zip.by_index(0).unwrap().name().unwrap(), "World/level.dat");
+        }
+        if source.join("BACKUP.zip").exists() {
+            assert_eq!(
+                pack(&source, &source.join("BACKUP.zip"), |_, _| {})
+                    .unwrap()
+                    .files,
+                1
+            );
+        }
+        assert!(pack(&source, &source.join("level.dat"), |_, _| {}).is_err());
+        assert_eq!(
+            fs::read_to_string(source.join("level.dat")).unwrap(),
+            "world metadata"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_real_folder_round_trips_through_the_archive() {
         let home = temp_home("round");
         let source = home.join("Horizon-26.3");
@@ -1656,6 +1906,44 @@ mod tests {
                 .is_file()
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_directory_does_not_hide_a_valid_imported_root() {
+        let root = temp_home("root-file-type");
+        let sibling = root.join("bundle");
+        let home = root.join("Documents");
+        let imported = home.join("resources");
+        fs::create_dir_all(imported.join("horizon-resources.json")).unwrap();
+        let invalid_imported = resources_root(&sibling, Some(&home));
+        fs::remove_dir(imported.join("horizon-resources.json")).unwrap();
+        fs::write(imported.join("horizon-resources.json"), "{}").unwrap();
+        fs::create_dir_all(sibling.join("horizon-resources.json")).unwrap();
+        let selected = resources_root(&sibling, Some(&home));
+        fs::remove_dir(sibling.join("horizon-resources.json")).unwrap();
+        fs::write(sibling.join("horizon-resources.json"), "{}").unwrap();
+        assert_eq!(resources_root(&sibling, Some(&home)), Some(sibling.clone()));
+        #[cfg(unix)]
+        {
+            let marker = sibling.join("horizon-resources.json");
+            fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(imported.join("horizon-resources.json"), &marker).unwrap();
+            assert_eq!(resources_root(&sibling, Some(&home)), Some(sibling.clone()));
+            fs::remove_file(imported.join("horizon-resources.json")).unwrap();
+            assert_eq!(resources_root(&sibling, Some(&home)), None);
+            fs::write(imported.join("horizon-resources.json"), "{}").unwrap();
+            fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(&imported, &marker).unwrap();
+            assert_eq!(
+                resources_root(&sibling, Some(&home)),
+                Some(imported.clone())
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            invalid_imported.is_none() && selected == Some(imported),
+            "directory markers selected: imported={invalid_imported:?}, bundle={selected:?}"
+        );
     }
 
     #[test]

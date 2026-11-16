@@ -141,9 +141,50 @@ fn lacks_languages(resources: &Path) -> bool {
     !resources.join("assets/pack.mcmeta").is_file()
 }
 
-/// What the game's sound registry reads (horizon-client sound_events.rs).
+/// The registry and its actual samples must both have arrived. Copying the
+/// manifest first (or interrupting the asset copy) must not mark silent resources
+/// complete. Event references name other events, not files of their own.
 fn lacks_sounds(resources: &Path) -> bool {
-    !resources.join("assets/minecraft/sounds.json").is_file()
+    let assets = resources.join("assets");
+    let Ok(Value::Object(events)) = read_json(&assets.join("minecraft/sounds.json")) else {
+        return true;
+    };
+    for (_, event) in events {
+        if event.as_object().is_none() {
+            return true;
+        }
+        let Some(sounds) = event.get("sounds") else {
+            continue;
+        };
+        let Some(sounds) = sounds.as_array() else {
+            return true;
+        };
+        for sound in sounds {
+            let name = if let Some(name) = sound.as_str() {
+                name
+            } else {
+                match sound.get("type").and_then(Value::as_str) {
+                    Some("event") => continue,
+                    None | Some("file") => {}
+                    _ => return true,
+                }
+                let Some(name) = sound.get("name").and_then(Value::as_str) else {
+                    return true;
+                };
+                name
+            };
+            let (namespace, path) = name.split_once(':').unwrap_or(("minecraft", name));
+            let Some(relative) =
+                crate::artifacts::safe_relative(&format!("{namespace}/sounds/{path}.ogg"))
+            else {
+                return true;
+            };
+            if !std::fs::metadata(assets.join(relative)).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -207,6 +248,36 @@ mod tests {
             lacking[0].ends_with("horizon-prepare --prepare"),
             "{lacking:?}"
         );
+    }
+
+    #[test]
+    fn sound_manifest_alone_does_not_prove_samples_were_copied() {
+        let root = folder("sound-samples");
+        let ns = root.join("assets/minecraft");
+        file(
+            &ns.join("sounds.json"),
+            br#"{
+            "test": {"sounds": ["test/first", {"name": "minecraft:test/second"},
+                                {"name": "other_event", "type": "event"}]}
+        }"#,
+        );
+        assert!(
+            lacks_sounds(&root),
+            "manifest without audio was marked complete"
+        );
+        file(&ns.join("sounds/test/first.ogg"), b"audio");
+        assert!(
+            lacks_sounds(&root),
+            "partially copied audio was marked complete"
+        );
+        file(&ns.join("sounds/test/second.ogg"), b"");
+        assert!(lacks_sounds(&root), "empty audio was marked complete");
+        file(&ns.join("sounds/test/second.ogg"), b"audio");
+        assert!(
+            !lacks_sounds(&root),
+            "event references are not audio filenames"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

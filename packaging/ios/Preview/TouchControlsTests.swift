@@ -11,6 +11,23 @@ final class TouchControlsTests: XCTestCase {
     }
     override func tearDown() { defaults.removePersistentDomain(forName: suite) }
 
+    @MainActor func testMenuScrollCannotCancelGameplayFingers() throws {
+        let bridge = TouchGestureBridge(configuration: { TouchConfiguration() })
+        let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: view)
+        let scroll = try XCTUnwrap(view.gestureRecognizers?.compactMap { $0 as? UIPanGestureRecognizer }.first)
+        XCTAssertTrue(scroll.cancelsTouchesInView)
+        let touch = PositionedTouch(CGPoint(x: 300, y: 110))
+        // Title and in-world menus retain two-finger scrolling.
+        for flags: UInt32 in [8, 0] {
+            _ = bridge.poll(screen: 91, flags: flags, width: 600, height: 300, scale: 1, capacity: 64)
+            XCTAssertTrue(bridge.gestureRecognizer(scroll, shouldReceive: touch))
+        }
+        _ = bridge.poll(screen: 91, flags: 1, width: 600, height: 300, scale: 1, capacity: 64)
+        XCTAssertFalse(bridge.gestureRecognizer(scroll, shouldReceive: touch),
+                       "A menu-only recognizer must not cancel world camera fingers")
+    }
+
     @MainActor func testTitleTapsIgnoreHiddenGameplayHitboxesAndGesturePreference() {
         var config = TouchConfiguration()
         config.mouseGestures = false

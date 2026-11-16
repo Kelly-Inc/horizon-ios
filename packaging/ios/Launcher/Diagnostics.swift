@@ -10,6 +10,10 @@ enum Diagnostics {
             .appendingPathComponent("HorizonDiagnostics", isDirectory: true)
     }
     private static let patterns: [NSRegularExpression] = [#"https?://[^\s]+"#, #"\beyJ[A-Za-z0-9_.-]+"#, #"[A-Za-z0-9_./+=-]{129,}"#, #"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#, #"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"#, #"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"#, #"/(?:Users|var/mobile)/[^\s]+"#].compactMap {try? NSRegularExpression(pattern:$0,options:.caseInsensitive)}
+    private static let entryStart = try? NSRegularExpression(pattern: #"^(?:\[\d{2}:\d{2}:\d{2}\]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"#)
+    private static func beginsEntry(_ line: String) -> Bool {
+        entryStart?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
+    }
     static func redact(_ text: String) -> String {
         let sensitive = ["accesstoken", "refreshtoken", "idtoken", "token =", "token :", "user code", "access_token", "refresh_token", "id_token", "token:", "token=", "token\"", "authorization", "bearer", "password", "secret", "cookie", "xbl3.0", "device_code", "user_code", "sessionid", "session_id", "api_key", "accesskey"]
         if sensitive.contains(where: {text.lowercased().contains($0)}) {return "[redacted sensitive log message]"}
@@ -55,13 +59,17 @@ enum Diagnostics {
         try file.seek(toOffset: length > UInt64(limit) ? length - UInt64(limit) : 0)
         let data = try file.read(upToCount: limit) ?? Data()
         let text = String(decoding: data, as: UTF8.self)
-        return length > UInt64(limit) ? String(text.drop(while: {$0 != "\n"}).dropFirst()) : text
+        guard length > UInt64(limit) else {return text}
+        // A truncated message may leave a short secret after its label was cut off.
+        let completeLines = String(text.drop(while: {$0 != "\n"}).dropFirst()).components(separatedBy: "\n")
+        guard let first = completeLines.firstIndex(where: beginsEntry) else {return ""}
+        return completeLines[first...].joined(separator: "\n")
     }
     static func redactExport(_ text:String) -> String {
         var hidingContinuation = false
         return text.components(separatedBy:.newlines).map { line in
             // Rust entries start with [time]; launcher entries start with an ISO date.
-            if line.hasPrefix("[") || line.range(of:#"^\d{4}-\d{2}-\d{2}T"#,options:.regularExpression) != nil {hidingContinuation = false}
+            if beginsEntry(line) {hidingContinuation = false}
             let safe = redact(line)
             if safe == "[redacted sensitive log message]" {hidingContinuation = true;return safe}
             return hidingContinuation ? "[redacted continuation]" : safe

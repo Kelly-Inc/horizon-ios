@@ -15,7 +15,7 @@ fn game_loading(order: &[(i32, i32)]) -> Game<'static> {
     game.settings.simulation_distance = 5;
     game.settings.render_distance = 8;
     game.player = Some(
-        horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 65.0, 8.5)).unwrap(),
+        horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 65.0, 8.5)).unwrap(),
     );
     game.world.chunks.clear();
     for &(x, z) in order {

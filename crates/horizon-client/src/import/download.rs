@@ -19,18 +19,19 @@ use std::{
 
 use super::{Installed, MAX_PACKED, Pack};
 
-/// Where the game files are downloaded from: this followed by `<version>.zip`.
-/// `HORIZON_GAME_FILES_URL` replaces it (a folder URL ending in `/`).
-pub const BASE_URL: &str = "https://cdn.gayfeet.lol/horizon/";
-
-/// The archive's address for this version.
-pub fn url(version: &str) -> String {
+/// The archive's address for this version, from the player's override or the
+/// app's registered provider. A plain engine without either uses manual import.
+pub fn url(version: &str) -> Option<String> {
     let base = std::env::var("HORIZON_GAME_FILES_URL")
         .ok()
         .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| BASE_URL.to_owned());
+        .or_else(|| horizon_hooks::engine::game_files_base().map(str::to_owned))?;
+    Some(archive_url(version, &base))
+}
+
+fn archive_url(version: &str, base: &str) -> String {
     let base = if base.ends_with('/') {
-        base
+        base.to_owned()
     } else {
         format!("{base}/")
     };
@@ -55,7 +56,8 @@ pub struct Download {
 }
 
 impl Download {
-    /// Start downloading `url` into `home` and installing it there. A finished archive already in
+    /// Start downloading prepared game files at `url` into `home` and installing them there.
+    /// Worlds and resource packs are rejected before installation. A finished archive already in
     /// `home` (an earlier download, or `<version>.zip` copied in by hand) is installed without one.
     pub fn start(url: String, home: PathBuf) -> io::Result<Self> {
         let received = Arc::new(AtomicU64::new(0));
@@ -78,14 +80,19 @@ impl Download {
                 };
                 let result = archive.and_then(|archive| {
                     i.store(1, Ordering::Relaxed);
-                    let opened = Pack::open(&archive);
-                    if opened.is_err() && archive.file_name() == Some(DOWNLOADED.as_ref()) {
+                    let downloaded = archive.file_name() == Some(DOWNLOADED.as_ref());
+                    let opened = Pack::open(&archive).and_then(Pack::require_game_files);
+                    if opened.is_err() && downloaded {
                         // A download that ends as no archive is downloaded again from the start next time.
                         let _ = fs::remove_file(&archive);
                     }
-                    opened
+                    let result = opened
                         .and_then(|pack| pack.install(&home))
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| e.to_string());
+                    if downloaded && !archive.exists() {
+                        let _ = fs::remove_file(home.join(DOWNLOADED_SOURCE));
+                    }
+                    result
                 });
                 let _ = sender.send(result);
             })?;
@@ -120,16 +127,34 @@ impl Download {
 
 /// The finished download's name in `home`, and the partial one's.
 const DOWNLOADED: &str = "horizon-download.zip";
+/// A completed cache is reusable only for this requested URL's SHA-256. Never
+/// persist URLs themselves: a custom source may contain an access token.
+const DOWNLOADED_SOURCE: &str = "horizon-download.zip.source";
 const PARTIAL: &str = "horizon-download.zip.part";
-/// The `ETag` of the file the partial download is part of: a resumed request names it in `If-Range`, so a file
-/// that changed on the server since comes again whole instead of being stitched onto the old one's start.
+/// The requested/final URL hashes and strong `ETag` of the partial download. ETags identify
+/// a representation only within its resource, so another source or redirect target must restart.
 const PARTIAL_TAG: &str = "horizon-download.zip.etag";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResumeTag {
+    source: String,
+    target: String,
+    etag: String,
+}
+
+fn source_hash(url: &str) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(url.as_bytes()))
+}
 
 /// A whole archive of game files already in `home`: a download that finished but was not installed,
 /// or the archive itself (`26.3.zip`) put there by hand.
 fn local_archive(url: &str, home: &Path) -> Option<PathBuf> {
     let name = url.rsplit('/').next().filter(|n| n.ends_with(".zip"));
-    [Some(DOWNLOADED), name]
+    let cached = fs::read_to_string(home.join(DOWNLOADED_SOURCE))
+        .is_ok_and(|source| source == source_hash(url))
+        .then_some(DOWNLOADED);
+    [cached, name.filter(|name| *name != DOWNLOADED)]
         .into_iter()
         .flatten()
         .map(|name| home.join(name))
@@ -191,7 +216,16 @@ fn fetch(
             }
         }
     }
+    // Invalidate the old cache's identity before replacing its bytes. A crash
+    // between the rename and recording the new source leaves an unidentified
+    // cache, never new bytes falsely labelled as an older source.
+    match fs::remove_file(home.join(DOWNLOADED_SOURCE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
     fs::rename(&part, &archive).map_err(|e| e.to_string())?;
+    fs::write(home.join(DOWNLOADED_SOURCE), source_hash(url)).map_err(|e| e.to_string())?;
     let _ = fs::remove_file(home.join(PARTIAL_TAG));
     Ok(archive)
 }
@@ -205,9 +239,12 @@ fn fetch_once(
     total: &AtomicU64,
 ) -> Result<(), Stop> {
     let tag_file = part.with_file_name(PARTIAL_TAG);
-    let tag = fs::read_to_string(&tag_file)
+    let source = source_hash(url);
+    let saved = fs::read(&tag_file)
         .ok()
-        .filter(|tag| !tag.is_empty());
+        .and_then(|bytes| serde_json::from_slice::<ResumeTag>(&bytes).ok())
+        .filter(|saved| saved.source == source && !saved.etag.is_empty());
+    let tag = saved.as_ref().map(|saved| saved.etag.as_str());
     // A part whose file can't be named is not resumed: it could be the start of another file.
     let have = match &tag {
         Some(_) => fs::metadata(part).map(|m| m.len()).unwrap_or(0),
@@ -219,10 +256,18 @@ fn fetch_once(
             .set("Range", &format!("bytes={have}-"))
             .set("If-Range", tag);
     }
+    // Never splice an unverified range onto a previous archive. Clearing the
+    // validator also makes the bounded retry loop request the whole file.
+    let restart = || {
+        let _ = fs::remove_file(&tag_file);
+        let _ = fs::remove_file(part);
+        Stop::Broke("the server could not resume this archive; restarting".into())
+    };
     let response = match request.call() {
         Ok(response) => response,
-        // Nothing past what is here: the part is the whole file (the zip check says if not).
-        Err(ureq::Error::Status(416, _)) if have > 0 => return Ok(()),
+        // A 416 can also mean the remote file shrank or the local part is stale.
+        // It is not proof that our partial archive is complete.
+        Err(ureq::Error::Status(416, _)) if have > 0 => return Err(restart()),
         Err(ureq::Error::Status(status, _)) => {
             return Err(Stop::Failed(format!(
                 "the server answered {status} for {url}"
@@ -230,37 +275,74 @@ fn fetch_once(
         }
         Err(other) => return Err(Stop::Broke(format!("could not reach {url}: {other}"))),
     };
+    let target = source_hash(response.get_url());
     // 206: the rest of the same file. 200: all of it, the file having changed or the server not doing ranges.
     let resumed = have > 0 && response.status() == 206;
-    let start = if resumed { have } else { 0 };
-    if !resumed {
-        // A strong ETag names this file for the next resume; a weak one can't (If-Range takes only strong ones).
-        match response.header("ETag").filter(|tag| !tag.starts_with("W/")) {
-            Some(tag) => {
-                let _ = fs::write(&tag_file, tag);
-            }
-            None => {
-                let _ = fs::remove_file(&tag_file);
-            }
+    let range = if response.status() == 206 {
+        let parsed = response.header("Content-Range").and_then(|header| {
+            let (span, total) = header.strip_prefix("bytes ")?.split_once('/')?;
+            let (first, last) = span.split_once('-')?;
+            Some((
+                first.parse::<u64>().ok()?,
+                last.parse::<u64>().ok()?,
+                total.parse::<u64>().ok()?,
+            ))
+        });
+        let Some((first, last, length)) = parsed.filter(|&(first, last, length)| {
+            resumed && first == have && first <= last && last < length
+        }) else {
+            return Err(restart());
+        };
+        if response
+            .header("ETag")
+            .is_some_and(|value| Some(value) != tag)
+            || saved.as_ref().is_none_or(|saved| saved.target != target)
+        {
+            return Err(restart());
         }
-    }
+        Some((last + 1, length, last - first + 1))
+    } else {
+        None
+    };
+    let start = if resumed { have } else { 0 };
     let rest = response
         .header("Content-Length")
         .and_then(|l| l.parse::<u64>().ok())
         .unwrap_or(0);
-    let size = if rest != 0 { start + rest } else { 0 };
-    if size > MAX_PACKED {
+    if range.is_some_and(|(_, _, expected)| rest != 0 && rest != expected) {
+        return Err(restart());
+    }
+    let size = match range {
+        Some((end, _, _)) => end,
+        None => rest,
+    };
+    let whole = range.map_or(size, |(_, length, _)| length);
+    if whole > MAX_PACKED {
         return Err(Stop::Failed(
             "the archive is larger than this will unpack".into(),
         ));
     }
-    total.store(size, Ordering::Relaxed);
+    total.store(whole, Ordering::Relaxed);
     let file = if resumed {
         fs::OpenOptions::new().append(true).open(part)
     } else {
         File::create(part)
     };
     let mut file = file.map_err(|e| Stop::Failed(format!("could not save the download: {e}")))?;
+    if !resumed {
+        // Truncate the old bytes before replacing their validator. If creation fails,
+        // its old validator still belongs to the old bytes. Never persist URL secrets.
+        let _ = fs::remove_file(&tag_file);
+        if let Some(etag) = response.header("ETag").filter(|tag| !tag.starts_with("W/"))
+            && let Ok(saved) = serde_json::to_vec(&ResumeTag {
+                source,
+                target,
+                etag: etag.to_owned(),
+            })
+        {
+            let _ = fs::write(&tag_file, saved);
+        }
+    }
     let mut reader = response.into_reader();
     let mut buffer = vec![0; 1 << 16];
     let mut so_far = start;
@@ -271,7 +353,12 @@ fn fetch_once(
         if size != 0 && so_far >= size {
             break;
         }
-        let n = match reader.read(&mut buffer) {
+        let capacity = if size == 0 {
+            buffer.len()
+        } else {
+            (size - so_far).min(buffer.len() as u64) as usize
+        };
+        let n = match reader.read(&mut buffer[..capacity]) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -293,9 +380,9 @@ fn fetch_once(
     }
     file.sync_all()
         .map_err(|e| Stop::Failed(format!("could not save the download: {e}")))?;
-    if size != 0 && so_far < size {
+    if whole != 0 && so_far < whole {
         return Err(Stop::Broke(format!(
-            "the connection closed at {so_far} of {size} bytes"
+            "the connection closed at {so_far} of {whole} bytes"
         )));
     }
     Ok(())
@@ -307,7 +394,119 @@ mod tests {
 
     #[test]
     fn the_archive_is_named_for_the_version() {
-        assert_eq!(url("26.3"), "https://cdn.gayfeet.lol/horizon/26.3.zip");
+        for base in ["https://example.org/game", "https://example.org/game/"] {
+            assert_eq!(
+                archive_url("26.3", base),
+                "https://example.org/game/26.3.zip"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plain_engine_has_no_implicit_download_service() {
+        assert_eq!(horizon_hooks::engine::game_files_base(), None);
+        let explicit = std::env::var("HORIZON_GAME_FILES_URL")
+            .ok()
+            .filter(|base| !base.is_empty());
+        assert_eq!(url("26.3"), explicit.map(|base| archive_url("26.3", &base)));
+    }
+
+    #[test]
+    fn resume_rejects_wrong_ranges_without_appending_or_completing() {
+        for (name, status, headers, complete, retained) in [
+            (
+                "wrong-start",
+                "206 Partial Content",
+                "Content-Range: bytes 0-1/6\r\n",
+                false,
+                false,
+            ),
+            ("missing-range", "206 Partial Content", "", false, false),
+            (
+                "false-complete",
+                "416 Range Not Satisfiable",
+                "Content-Range: bytes */8\r\n",
+                false,
+                false,
+            ),
+            (
+                "valid",
+                "206 Partial Content",
+                "Content-Range: bytes 4-5/6\r\n",
+                true,
+                true,
+            ),
+            (
+                "more-remains",
+                "206 Partial Content",
+                "Content-Range: bytes 4-5/8\r\n",
+                false,
+                true,
+            ),
+            (
+                "changed-validator",
+                "206 Partial Content",
+                "Content-Range: bytes 4-5/6\r\nETag: \"two\"\r\n",
+                false,
+                false,
+            ),
+            (
+                "wrong-length",
+                "206 Partial Content",
+                "Content-Range: bytes 4-6/7\r\n",
+                false,
+                false,
+            ),
+        ] {
+            let home = home(name);
+            fs::create_dir_all(&home).unwrap();
+            let part = home.join(PARTIAL);
+            fs::write(&part, b"abcd").unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            fs::write(
+                home.join(PARTIAL_TAG),
+                serde_json::to_vec(&ResumeTag {
+                    source: source_hash(&format!("http://{address}/game.zip")),
+                    target: source_hash(&format!("http://{address}/game.zip")),
+                    etag: "\"one\"".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 1024];
+                let n = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..n])
+                        .to_lowercase()
+                        .contains("range: bytes=4-")
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: 2\r\nConnection: close\r\n\r\nef"
+                )
+                .unwrap();
+            });
+            let result = fetch_once(
+                &ureq::AgentBuilder::new().build(),
+                &format!("http://{address}/game.zip"),
+                &part,
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+            );
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), complete, "{name}: incorrect completion");
+            if retained {
+                assert_eq!(fs::read(&part).unwrap(), b"abcdef", "{name}");
+                assert!(home.join(PARTIAL_TAG).exists());
+            } else {
+                assert!(!part.exists(), "{name}: incompatible bytes retained");
+                assert!(!home.join(PARTIAL_TAG).exists());
+            }
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 
     /// One HTTP answer from a local socket: `length` in the header, `body` sent.
@@ -327,17 +526,113 @@ mod tests {
     }
 
     fn prepared() -> Vec<u8> {
+        prepared_with_facts("{}")
+    }
+
+    fn prepared_with_facts(facts: &str) -> Vec<u8> {
         use zip::{CompressionMethod, write::SimpleFileOptions, write::ZipWriter};
         let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         for (name, body) in [
             ("horizon-resources.json", r#"{"schema":7}"#),
-            ("facts.json", "{}"),
+            ("facts.json", facts),
         ] {
             zip.start_file(name, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }
         zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn automatic_setup_never_installs_a_world_or_resource_pack() {
+        use zip::{write::SimpleFileOptions, write::ZipWriter};
+        for (kind, marker) in [("world", "level.dat"), ("pack", "pack.mcmeta")] {
+            let home = home(&format!("wrong-kind-{kind}"));
+            let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zip.start_file(marker, SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"{}").unwrap();
+            let body = zip.finish().unwrap().into_inner();
+            let size = body.len();
+            let result = wait(&Download::start(serve(body, size), home.clone()).unwrap());
+            assert!(
+                result.is_err(),
+                "automatic setup installed {kind}: {result:?}"
+            );
+            for folder in ["saves", "resourcepacks", "resources"] {
+                assert!(
+                    !home.join(folder).exists(),
+                    "automatic setup created {folder}"
+                );
+            }
+            assert!(!home.join(DOWNLOADED).exists());
+            assert!(!home.join(DOWNLOADED_SOURCE).exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_completed_download_is_only_reused_for_its_source() {
+        let body = prepared();
+        let size = body.len();
+        let url = format!("{}?token=fixture-secret", serve(body, size));
+        let home = home("completed-source");
+        let archive = fetch(&url, &home, &AtomicU64::new(0), &AtomicU64::new(0)).unwrap();
+        assert_eq!(local_archive(&url, &home), Some(archive));
+        assert_eq!(
+            fs::read_to_string(home.join(DOWNLOADED_SOURCE)).unwrap(),
+            source_hash(&url)
+        );
+        assert_eq!(
+            local_archive("https://example.org/new-version.zip", &home),
+            None
+        );
+        // The reserved cache filename must not bypass the source check through
+        // the separate path for a versioned archive supplied by the player.
+        assert_eq!(
+            local_archive("https://example.org/horizon-download.zip", &home),
+            None
+        );
+        // The original server has already closed: retrying installation should
+        // consume its matching completed cache without another HTTP request.
+        wait(&Download::start(url, home.clone()).unwrap()).unwrap();
+        assert!(!home.join(DOWNLOADED).exists());
+        assert!(!home.join(DOWNLOADED_SOURCE).exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn switching_sources_after_a_completed_download_installs_the_new_archive() {
+        let home = home("completed-switch");
+        let old = prepared_with_facts(r#"{"source":"old"}"#);
+        fetch(
+            &serve(old.clone(), old.len()),
+            &home,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        let new = prepared_with_facts(r#"{"source":"new"}"#);
+        wait(&Download::start(serve(new.clone(), new.len()), home.clone()).unwrap()).unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+            r#"{"source":"new"}"#
+        );
+        assert!(!home.join(DOWNLOADED_SOURCE).exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_unidentified_cache_is_skipped_but_a_manual_version_archive_is_used() {
+        let home = home("unidentified-cache");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(DOWNLOADED), prepared()).unwrap();
+        let url = "https://example.org/26.3.zip";
+        assert_eq!(local_archive(url, &home), None);
+        let manual = home.join("26.3.zip");
+        fs::write(&manual, prepared()).unwrap();
+        assert_eq!(local_archive(url, &home), Some(manual));
+        fs::remove_dir_all(home).unwrap();
     }
 
     fn home(tag: &str) -> PathBuf {
@@ -417,6 +712,112 @@ mod tests {
             (size / 2) as u64
         );
         let _ = fs::remove_dir_all(home);
+    }
+
+    /// ETags can collide across resources: switching URL starts a whole new download.
+    #[test]
+    fn changing_source_never_resumes_another_urls_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"one\"\r\nConnection: close\r\n\r\nAAAA").unwrap();
+            drop(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            let n = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..n]).to_lowercase();
+            if request.contains("range: bytes=4-") {
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 4-7/8\r\nETag: \"one\"\r\nConnection: close\r\n\r\nBBBB").unwrap();
+            } else {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"one\"\r\nConnection: close\r\n\r\nBBBBBBBB").unwrap();
+            }
+            request
+        });
+        let home = home("source-boundary");
+        fs::create_dir_all(&home).unwrap();
+        let part = home.join(PARTIAL);
+        let agent = ureq::AgentBuilder::new().build();
+        let received = AtomicU64::new(0);
+        let total = AtomicU64::new(0);
+        assert!(matches!(
+            fetch_once(
+                &agent,
+                &format!("http://{address}/a.zip"),
+                &part,
+                &received,
+                &total
+            ),
+            Err(Stop::Broke(_))
+        ));
+        assert!(
+            fetch_once(
+                &agent,
+                &format!("http://{address}/b.zip?access=fixture-secret"),
+                &part,
+                &received,
+                &total
+            )
+            .is_ok()
+        );
+        let request = server.join().unwrap();
+        assert_eq!(fs::read(&part).unwrap(), b"BBBBBBBB");
+        assert!(!request.contains("range:"), "{request}");
+        assert!(
+            !fs::read_to_string(home.join(PARTIAL_TAG))
+                .unwrap()
+                .contains("fixture-secret")
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_changed_redirect_target_cannot_reuse_the_previous_targets_etag() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).unwrap();
+                let response = match step {
+                    0 => {
+                        "HTTP/1.1 302 Found\r\nLocation: /a.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                    1 => {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"one\"\r\nConnection: close\r\n\r\nAAAA"
+                    }
+                    2 => {
+                        "HTTP/1.1 302 Found\r\nLocation: /b.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                    _ => {
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 4-7/8\r\nETag: \"one\"\r\nConnection: close\r\n\r\nBBBB"
+                    }
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let home = home("redirect-boundary");
+        fs::create_dir_all(&home).unwrap();
+        let part = home.join(PARTIAL);
+        let agent = ureq::AgentBuilder::new().build();
+        let url = format!("http://{address}/start");
+        let received = AtomicU64::new(0);
+        let total = AtomicU64::new(0);
+        assert!(matches!(
+            fetch_once(&agent, &url, &part, &received, &total),
+            Err(Stop::Broke(_))
+        ));
+        let result = fetch_once(&agent, &url, &part, &received, &total);
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(Stop::Broke(_))),
+            "changed target must restart"
+        );
+        assert!(!part.exists());
+        assert!(!home.join(PARTIAL_TAG).exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     /// The connection breaks halfway; the next request asks for the rest and gets it.

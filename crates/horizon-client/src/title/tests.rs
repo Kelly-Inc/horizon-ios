@@ -1383,7 +1383,13 @@ fn icon_buttons_show_their_tooltip_while_hovered() {
         let tail = &drawn[plain.len()..];
         let min_x = tail.iter().map(|v| v.pos[0]).fold(f32::MAX, f32::min);
         let min_y = tail.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
-        assert_eq!((min_x, min_y), top_left, "icon button {id}");
+        // Desktop also has the account icon; iOS manages accounts in its launcher.
+        let offset = if cfg!(target_os = "ios") { 0.0 } else { 12.0 };
+        assert_eq!(
+            (min_x, min_y),
+            (top_left.0 - offset, top_left.1),
+            "icon button {id}"
+        );
     }
     // A text button without a tooltip shows none.
     let singleplayer = button_middle(&f.title, 1);
@@ -2625,7 +2631,8 @@ fn the_single_biome_preset_is_customized_into_the_generator() {
         &crate::save::Level::read(&dir).unwrap_or_default(),
         false,
         &dir,
-    );
+    )
+    .unwrap();
     assert_eq!(options.single_biome, "minecraft:jungle");
 }
 
@@ -2922,14 +2929,51 @@ fn realms_roster_scroll_routes_mouse_touch_and_controller_wheels_to_the_same_lis
     crate::widgets::scroll_area([250.0, 60.0, 300.0, 112.0], 0.0, 97.0);
     crate::widgets::end_frame(u64::MAX);
     f.title.stick_scroll(-1.0, (0.0, 0.0), size);
+    let Mode::Realms(screen) = &f.title.mode else {
+        unreachable!()
+    };
+    let crate::realms::SubScreen::Configure { players_scroll, .. } = &screen.subscreen else {
+        unreachable!()
+    };
+    assert_eq!(
+        players_scroll.amount, 54.0,
+        "all three scroll sources must contribute an 18px step"
+    );
+    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let mut batch = HudBatch::new([800, 240]);
+    f.title.draw(&atlas, &mut batch, (0.0, 0.0), true);
     let buttons = f.title.buttons(size.0, size.1);
-    let remove = buttons.iter().find(|b| b.id == 101).unwrap();
+    let remove = buttons.iter().find(|b| b.id == 105).unwrap();
     f.title
         .click(remove.x + remove.w / 2.0, remove.y + 10.0, size);
     assert!(
-        matches!(&f.title.mode, Mode::Realms(screen) if matches!(&screen.subscreen, crate::realms::SubScreen::Popup(crate::realms::Popup::Uninvite { player, .. }) if player.name == "Player003")),
+        matches!(&f.title.mode, Mode::Realms(screen) if matches!(&screen.subscreen, crate::realms::SubScreen::Popup(crate::realms::Popup::Uninvite { player, .. }) if player.name == "Player001")),
         "the mouse, step and hidden-pointer stick must all reach the same list: {:?}",
         f.title.mode,
+    );
+}
+
+#[test]
+fn realms_roster_clipped_button_does_not_click_below_the_list() {
+    let mut f = Fixture::new();
+    f.title.mode = Mode::Realms(crate::realms::players_fixture(100));
+    let size = (800.0, 240.0);
+    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let mut batch = HudBatch::new([800, 240]);
+    f.title.draw(&atlas, &mut batch, (0.0, 0.0), true);
+    let buttons = f.title.buttons(size.0, size.1);
+    let remove = buttons.iter().find(|b| b.id == 111).unwrap();
+    let rect = f.title.button_rect(remove);
+    assert_eq!(rect[3], 12.0);
+    let x = remove.x + remove.w / 2.0;
+    let y = remove.y;
+    f.title.click(x, y + 15.0, size);
+    assert!(
+        matches!(&f.title.mode, Mode::Realms(screen) if matches!(screen.subscreen, crate::realms::SubScreen::Configure { .. }))
+    );
+    f.title.click(x, y + 5.0, size);
+    assert!(
+        matches!(&f.title.mode, Mode::Realms(screen) if matches!(&screen.subscreen, crate::realms::SubScreen::Popup(crate::realms::Popup::Uninvite { player, .. }) if player.name == "Player003"))
     );
 }
 
@@ -2938,9 +2982,12 @@ fn a_realms_click_targets_the_painted_uuid_when_title_rechecks_hitboxes() {
     let mut f = Fixture::new();
     f.title.mode = Mode::Realms(crate::realms::players_fixture(100));
     let size = (800.0, 240.0);
-    f.title.scroll_worlds(-50.0, (400.0, 61.0), size);
+    f.title.scroll_worlds(-100.0, (400.0, 61.0), size);
+    let atlas = crate::hud::HudAtlas::build(Path::new("/nonexistent/horizon-test-assets")).unwrap();
+    let mut batch = HudBatch::new([800, 240]);
+    f.title.draw(&atlas, &mut batch, (0.0, 0.0), true);
     let buttons = f.title.buttons(size.0, size.1);
-    let remove = buttons.iter().find(|b| b.id == 101).unwrap();
+    let remove = buttons.iter().find(|b| b.id == 105).unwrap();
     let Mode::Realms(screen) = &mut f.title.mode else {
         unreachable!()
     };
@@ -3203,4 +3250,45 @@ fn cancelling_a_realms_new_world_returns_to_the_realm() {
         crate::realms::SubScreen::Configure { .. }
     ));
     let _ = fs::remove_dir_all(&f.root);
+}
+#[test]
+fn default_pack_preparation_failure_does_not_open_a_vanilla_create_screen() {
+    let mut f = Fixture::new();
+    f.title
+        .new_world_with_options(Err("profile pack I/O fixture".into()));
+    assert!(matches!(&f.title.mode, Mode::Error {message, return_to, ..}
+        if message == "profile pack I/O fixture" && matches!(**return_to, Mode::Main)));
+    assert_eq!(f.title.create_action(), Action::None);
+    f.title.escape();
+    assert!(matches!(f.title.mode, Mode::Main));
+}
+
+#[test]
+fn a_failed_pack_seed_restores_the_realms_parent_and_clears_the_upload_destination() {
+    let mut f = Fixture::new();
+    f.title.realms_create = Some(crate::realms::CreateWorldRequest {
+        server: crate::realms::client::RealmServer::default(),
+        slot: 1,
+        kind: crate::realms::ResetKind::Empty,
+        creation: None,
+    });
+    f.title
+        .new_world_with_options(Err("profile pack I/O fixture".into()));
+    assert!(f.title.realms_create.is_none());
+    assert!(
+        matches!(&f.title.mode, Mode::Error {return_to, ..} if matches!(**return_to, Mode::Realms(_)))
+    );
+    f.title.escape();
+    assert!(matches!(f.title.mode, Mode::Realms(_)));
+    f.title.mode = Mode::Create {
+        name: "Local".into(),
+        seed: String::new(),
+        creative: false,
+        focus: 0,
+        options: WorldOptions::default(),
+    };
+    assert!(
+        matches!(f.title.create_or_upload(), Action::Create { .. }),
+        "the next local create must remain local"
+    );
 }

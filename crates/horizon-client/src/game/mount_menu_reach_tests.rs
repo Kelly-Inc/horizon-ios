@@ -21,7 +21,7 @@ const DONKEY: u32 = 7;
 fn game_with_open_donkey(gap: f64) -> Game<'static> {
     let mut game = super::super::native_machines::tests::server_game();
     game.player =
-        Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 64.0, 8.5)).expect("a player"));
+        Some(PlayerMotion::new(&game.motion, Vec3::new(8.5, 64.0, 8.5)).expect("a player"));
     let kind = game
         .res
         .mob_types()

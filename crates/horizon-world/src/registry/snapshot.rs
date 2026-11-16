@@ -157,6 +157,9 @@ pub(crate) fn restore(snapshot: Snapshot) -> io::Result<(BlockRegistry, Vec<(boo
     let mut id_map = HashMap::with_capacity(ids.len());
     for (key, id) in ids {
         mark(id)?;
+        if super::state_key(&states[id as usize]) != key {
+            return Err(invalid("cached registry lookup hash disagrees with state"));
+        }
         if id_map.insert(key, id).is_some() {
             return Err(invalid("cached registry ids duplicate a key"));
         }
@@ -164,10 +167,12 @@ pub(crate) fn restore(snapshot: Snapshot) -> io::Result<(BlockRegistry, Vec<(boo
     let mut collided_map = BTreeMap::new();
     for (wire, id) in collided {
         mark(id)?;
-        if collided_map
-            .insert(state_of(wire)?, BlockStateId(id))
-            .is_some()
-        {
+        let state = state_of(wire)?;
+        let key = super::state_key(&state);
+        if state != states[id as usize] || !id_map.contains_key(&key) {
+            return Err(invalid("cached registry collision disagrees with state"));
+        }
+        if collided_map.insert(state, BlockStateId(id)).is_some() {
             return Err(invalid("cached registry collided states duplicate"));
         }
     }
@@ -241,6 +246,23 @@ mod tests {
         );
         let key = a.properties.keys().next().unwrap();
         assert!(std::ptr::eq(key, b.properties.keys().next().unwrap()));
+    }
+
+    #[test]
+    fn restore_rejects_lookup_entries_that_disagree_with_state_identity() {
+        let (registry, flags) = small();
+        let mut snapshot = capture(&registry, &flags);
+        snapshot.ids[0].0 ^= 1;
+        assert!(restore(snapshot).is_err(), "incorrect lookup hash accepted");
+        let mut snapshot = capture(&registry, &flags);
+        let first = snapshot.ids[0].1;
+        let second = snapshot.ids[1].1;
+        snapshot.ids[0].1 = second;
+        snapshot.ids[1].1 = first;
+        assert!(
+            restore(snapshot).is_err(),
+            "swapped lookup identities accepted"
+        );
     }
 
     #[test]

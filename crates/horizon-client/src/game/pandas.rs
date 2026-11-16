@@ -236,7 +236,7 @@ mod pickup_tests {
     fn a_panda_that_takes_a_thrown_item_credits_the_thrower() {
         let mut game = server_game();
         game.options.dedicated = None;
-        game.player = Some(PlayerMotion::new(game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
+        game.player = Some(PlayerMotion::new(&game.motion, Vec3::new(4.5, 100.0, 4.5)).unwrap());
         game.level.player_uuid = Some(THROWER);
         game.level.health = 20.0;
         game.creative = false;

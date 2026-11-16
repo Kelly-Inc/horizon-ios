@@ -251,7 +251,13 @@ final class LauncherLayoutTests: XCTestCase {
         let app = launch(signedIn: false, gameFilesURL: url + "?fail=1")
         let failure = app.staticTexts.matching(NSPredicate(format: "label CONTAINS '503'")).firstMatch
         XCTAssertTrue(failure.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.buttons["launcher-play-button"].isEnabled)
+        let setup = app.buttons["launcher-play-button"]
+        XCTAssertEqual(setup.label, "Game files needed")
+        XCTAssertTrue(setup.isEnabled)
+        setup.tap()
+        XCTAssertTrue(app.navigationBars["Game files needed"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.alerts["Launcher UI preview"].exists, "Missing files must not launch the game")
+        app.buttons["Done"].tap()
         XCTAssertTrue(app.buttons["launcher-download-game-files"].isEnabled)
         app.buttons["Use a download link instead"].tap()
         XCTAssertTrue(app.staticTexts["Link"].firstMatch.waitForExistence(timeout: 5))
@@ -264,7 +270,13 @@ final class LauncherLayoutTests: XCTestCase {
         let app = launch(signedIn: false, gameFilesURL: url + "?oversized=1")
         let failure = app.staticTexts.matching(NSPredicate(format: "label CONTAINS '2 GiB'")).firstMatch
         XCTAssertTrue(failure.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.buttons["launcher-play-button"].isEnabled)
+        let setup = app.buttons["launcher-play-button"]
+        XCTAssertEqual(setup.label, "Game files needed")
+        XCTAssertTrue(setup.isEnabled)
+        setup.tap()
+        XCTAssertTrue(app.navigationBars["Game files needed"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.alerts["Launcher UI preview"].exists, "Missing files must not launch the game")
+        app.buttons["Done"].tap()
         XCTAssertTrue(app.buttons["launcher-download-game-files"].isEnabled)
     }
 

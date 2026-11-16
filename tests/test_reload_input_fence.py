@@ -25,29 +25,39 @@ def program():
     methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/presentation.rs').read_text(), 'presentation_stale')
     for name in ['pad_reload_sample','finish_reload_input_disarm','pad_cancel_inputs','pad_button']:
         methods += '\n' + method(pad,name)
-    return STUBS + '\nmod gamepad {\n' + buttons + '\npub '+radial+'\n'+length+'\n}\n' + f'#[path="{ROOT / "crates/horizon-client/src/touch.rs"}"]mod touch;\n' + '\nimpl Game {\n'+methods+'\n}\n'+CASES
+    radial_state = (ROOT / 'crates/horizon-client-input/src/radial.rs').read_text().split('#[cfg(test)]\nmod tests')[0]
+    radial_hooks = (ROOT / 'crates/horizon-client/src/game/pad/radial_play.rs').read_text()
+    methods += '\n' + method(radial_hooks, 'pad_radial_button_up')
+    return 'mod radial {\n' + radial_state + '\n}\n' + STUBS.replace('#![allow(dead_code,unused_imports)]', '') + '\nmod gamepad {\n' + buttons + '\npub const RADIAL:&str="pad.radial";pub const HOTBAR_PREVIOUS:&str="pad.hotbar_previous";pub const HOTBAR_NEXT:&str="pad.hotbar_next";#[derive(Clone,Copy,Debug,PartialEq)]pub struct Pulse{pub strong:f32,pub weak:f32,pub millis:u16}\npub '+radial+'\n'+length+'\n}\n' + f'#[path="{ROOT / "crates/horizon-client/src/touch.rs"}"]mod touch;\n' + '\nimpl Game {\n'+methods+'\n}\n'+CASES
 
 STUBS = r'''
 #![allow(dead_code,unused_imports)]
 use gamepad::{Button,PadState,Edges};
+use std::time::Instant;
 type Result<T> = std::result::Result<T,String>;
 #[derive(PartialEq)]enum Screen{Playing,EmoteWheel}
 trait EventLoopCtl {} struct Loop; impl EventLoopCtl for Loop {}
 #[macro_export] macro_rules! warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 mod log {pub(crate) use crate::warn;}
 #[derive(Default)]struct Menu{armed:Option<()>,osk:Option<()>,trigger:Option<()>}
-struct Pad{reload_pending:bool,edges:Edges,state:PadState,menu:Menu,blocked_sticks:[bool;2],late_releases:Vec<Button>,actions:[Vec<&'static str>;16],held_drop:Option<()>,drop_stack:bool,in_use:bool}
-impl Default for Pad {fn default()->Self{Self{reload_pending:false,edges:Edges::default(),state:PadState::default(),menu:Menu::default(),blocked_sticks:[false;2],late_releases:vec![],actions:std::array::from_fn(|_|vec![]),held_drop:None,drop_stack:false,in_use:false}}}
-#[derive(Default)]struct Touch{menu:Option<()>,fingers:touch::Touches,late:Vec<()>,holding:Option<()>}
+struct Pad{radial:radial::RadialMenu,radial_settle:radial::DpadSettle,peaks:[[f32;2];2],reload_pending:bool,edges:Edges,state:PadState,menu:Menu,blocked_sticks:[bool;2],late_releases:Vec<Button>,actions:[Vec<&'static str>;16],held_drop:Option<()>,drop_stack:bool,in_use:bool}
+impl Default for Pad {fn default()->Self{Self{radial:radial::RadialMenu::default(),radial_settle:radial::DpadSettle::default(),peaks:[[0.;2];2],reload_pending:false,edges:Edges::default(),state:PadState::default(),menu:Menu::default(),blocked_sticks:[false;2],late_releases:vec![],actions:std::array::from_fn(|_|vec![]),held_drop:None,drop_stack:false,in_use:false}}}
+#[derive(Default)]struct Touch{toggle_keys:Vec<i32>,menu:Option<()>,fingers:touch::Touches,late:Vec<()>,holding:Option<()>}
 #[derive(Default)]struct Keys{touch:bool} enum Source{Touch}
 impl Keys{fn release_source(&mut self,_:Source){self.touch=false;}}
 struct Controller{move_deadzone:f32,look_deadzone:f32,trigger_threshold:f32}
-impl Controller{fn actions_of(&self,_:Button)->Vec<&'static str>{vec!["key.jump"]}}
+impl Controller{fn binding(&self,_:&str)->Option<Button>{None} fn actions_of(&self,_:Button)->Vec<&'static str>{vec!["key.jump"]}}
 struct Settings{controller:Controller}
 struct Renderer{current:bool} impl Renderer{fn presentation_current(&self)->bool{self.current}}
 struct Game{renderer:Option<Renderer>,screen:Screen,captured:bool,focused:bool,menu_calls:usize,pad:Pad,touch:Touch,keys:Keys,pack_reload:Option<()>,transaction:bool,settings:Settings,releases:Vec<Button>,actions:Vec<(&'static str,bool)>,ime:bool,emote:bool}
 impl Game{
  fn new()->Self{Self{renderer:None,screen:Screen::Playing,captured:false,focused:true,menu_calls:0,pad:Pad::default(),touch:Touch::default(),keys:Keys::default(),pack_reload:None,transaction:false,settings:Settings{controller:Controller{move_deadzone:0.2,look_deadzone:0.2,trigger_threshold:0.5}},releases:vec![],actions:vec![],ime:true,emote:true}}
+ // Radial actions must never receive a blocked reload press. Releases use
+ // the production opener-up helper; cancellation uses the actual state machine.
+ fn pad_radial_captures(&self)->bool{self.pad.radial.is_open()}
+ fn pad_radial_button(&mut self,_:Button)->Result<bool>{panic!("reload leaked into radial action")}
+ fn pad_radial_settling(&self,_:Button)->bool{panic!("reload leaked into radial settling")}
+ fn pad_radial_can_open(&self)->bool{panic!("reload allowed radial open")}
  fn pad_focused(&self)->bool{true}
  fn pad_in_menu(&self)->bool{true}
  fn capture(&mut self,on:bool){self.captured=on;}
@@ -74,10 +84,10 @@ CASES = r'''
  assert_eq!(g.menu_calls,0);assert_eq!(g.actions,vec![("key.use",false)]);g.actions.clear();
  let mut state=PadState::default();state.set(Button::South,true);state.left=[0.,1.];state.right=[1.,0.];state.triggers=[1.,0.];
  g.pad.menu.armed=Some(());g.pad.menu.osk=Some(());g.pad.actions[0].push("key.jump");g.pad.late_releases.push(Button::South);g.pad.held_drop=Some(());
- g.touch.menu=Some(());g.touch.late.push(());g.touch.holding=Some(());g.keys.touch=true;
+ g.pad.radial.open(0,[0.;2],radial::Tilt::for_deadzone(0.2),Instant::now());g.touch.toggle_keys.push(1);g.touch.menu=Some(());g.touch.late.push(());g.touch.holding=Some(());g.keys.touch=true;
  let r=touch::layout(1000.,600.).into_iter().find(|(c,_)|*c==touch::Control::Forward).unwrap().1;
  g.touch.fingers.start(1,(r[0]+r[2]/2.,r[1]+r[3]/2.),0.,&touch::layout(1000.,600.));
- assert!(g.pad_reload_sample(&Loop,state));assert!(!g.pad.reload_pending);
+ assert!(g.pad_reload_sample(&Loop,state));assert!(!g.pad.reload_pending);assert!(!g.pad.radial.is_open());assert!(g.touch.toggle_keys.is_empty());
  assert!(g.pad.blocked_sticks.into_iter().all(|v|v));assert!(g.pad.late_releases.is_empty());assert!(g.pad.held_drop.is_none());
  assert_eq!(g.actions,vec![("key.jump",false)]);assert!(!g.ime);assert!(!g.emote);assert!(!g.keys.touch);assert!(g.touch.holding.is_none());assert!(g.touch.late.is_empty());assert!(!g.touch.fingers.held(touch::Control::Forward));
  assert!(g.touch.fingers.frame(20.).is_empty());assert!(g.touch.fingers.end(1).is_empty());

@@ -54,25 +54,29 @@ impl Loading {
         // downloaded and still don't load would otherwise be downloaded again and again.
         let url = horizon_client::import::download::url(horizon_core::VANILLA_VERSION);
         let mut error = None;
-        let download = if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            log::warn!(
-                "Horizon: the downloaded game files did not load ({reason}); not downloading again"
-            );
-            error = Some(format!(
-                "The game files downloaded but did not load: {reason}"
-            ));
-            None
-        } else {
-            match horizon_client::import::download::Download::start(url.clone(), home.clone()) {
-                Ok(download) => {
-                    log::info!("Horizon: no game files ({reason}); downloading {url}");
-                    Some(download)
-                }
-                Err(error) => {
-                    log::warn!("Horizon: could not start downloading the game files: {error}");
-                    None
+        let download = if let Some(url) = url {
+            if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "Horizon: the downloaded game files did not load ({reason}); not downloading again"
+                );
+                error = Some(format!(
+                    "The game files downloaded but did not load: {reason}"
+                ));
+                None
+            } else {
+                match horizon_client::import::download::Download::start(url.clone(), home.clone()) {
+                    Ok(download) => {
+                        log::info!("Horizon: no game files ({reason}); downloading {url}");
+                        Some(download)
+                    }
+                    Err(error) => {
+                        log::warn!("Horizon: could not start downloading the game files: {error}");
+                        None
+                    }
                 }
             }
+        } else {
+            None
         };
         let session = if download.is_some() {
             // On a phone the download shows in SwiftUI over this screen; it asks `download-state`.
@@ -217,7 +221,9 @@ impl Loading {
         if import.download.is_some() {
             return Ok(());
         }
-        let url = horizon_client::import::download::url(horizon_core::VANILLA_VERSION);
+        let Some(url) = horizon_client::import::download::url(horizon_core::VANILLA_VERSION) else {
+            return Ok(());
+        };
         import.download = Some(horizon_client::import::download::Download::start(
             url,
             import.home.clone(),

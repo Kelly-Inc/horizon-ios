@@ -1940,24 +1940,26 @@ mod tests {
     /// A remote world (`o.remote`) has no port box to hover.
     #[test]
     fn the_port_box_explains_itself_on_hover() {
+        let valid = Text::translate("lanServer.port", &[]).plain();
+        let invalid = Text::translate(
+            "lanServer.port.invalid",
+            &[Text::literal("1024"), Text::literal("65535")],
+        )
+        .plain();
         let mut port = EditBox::new(158.0, 100.0, 40.0, 20.0);
         let tip = |port: &EditBox| {
             WorldOptions::port_tooltip(port, (159.0, 101.0), false).map(|t| t.plain())
         };
-        assert_eq!(tip(&port).as_deref(), Some("lanServer.port"));
+        assert_eq!(tip(&port).as_deref(), Some(valid.as_str()));
         // Empty takes the suggestion, a number in range is fine.
-        assert_eq!(tip(&port).as_deref(), Some("lanServer.port"));
+        assert_eq!(tip(&port).as_deref(), Some(valid.as_str()));
         for bad in ["0", "80", "70000", "abc", "-1"] {
             port.set_value(bad);
-            assert_eq!(
-                tip(&port).as_deref(),
-                Some("lanServer.port.invalid"),
-                "{bad}"
-            );
+            assert_eq!(tip(&port).as_deref(), Some(invalid.as_str()), "{bad}");
         }
         for good in ["1024", "25565", "65535"] {
             port.set_value(good);
-            assert_eq!(tip(&port).as_deref(), Some("lanServer.port"), "{good}");
+            assert_eq!(tip(&port).as_deref(), Some(valid.as_str()), "{good}");
         }
         assert!(WorldOptions::port_tooltip(&port, (157.0, 101.0), false).is_none());
         assert!(WorldOptions::port_tooltip(&port, (159.0, 121.0), false).is_none());

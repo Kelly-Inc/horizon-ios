@@ -4058,7 +4058,7 @@ mod cart_cost_bench {
         game.settings.simulation_distance = 6;
         game.settings.render_distance = 12;
         game.player = Some(
-            horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 80.0, 12.5))
+            horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::new(8.5, 80.0, 12.5))
                 .unwrap(),
         );
         for cx in -3..=3 {

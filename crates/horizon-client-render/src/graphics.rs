@@ -2,7 +2,7 @@
 //! `horizon-graphics.txt` next to `options.txt` so that file stays exactly
 //! vanilla's. Every default reproduces vanilla's rendering; only choices the
 //! player makes here depart from it.
-use std::{fs, path::Path};
+use std::{fs, io, path::Path};
 
 fn legacy_shader_choice(text: &str) -> Option<String> {
     let mut enabled = true;
@@ -1311,7 +1311,20 @@ impl Graphics {
         text
     }
     pub fn save(&self, dir: &Path) {
-        let _ = fs::write(dir.join(FILE), self.serialize());
+        if let Err(error) = self.save_checked(dir) {
+            log::warn!("Could not save graphics settings: {error}");
+        }
+    }
+    fn save_checked(&self, dir: &Path) -> io::Result<()> {
+        crate::config_file::write_atomic(&dir.join(FILE), self.serialize().as_bytes())
+    }
+    /// Persist the selection before installing it into the running settings.
+    pub fn select_shader_pack(&mut self, dir: &Path, name: String) -> io::Result<()> {
+        let mut updated = self.clone();
+        updated.shader_pack = name;
+        updated.save_checked(dir)?;
+        *self = updated;
+        Ok(())
     }
     /// Paper white, in nits: the player's, or on Auto the desktop's SDR white as the
     /// system `reported` it for the renderer's display, else 203 (BT.2408's reference white).
@@ -1499,6 +1512,33 @@ mod tests {
             assert_eq!(g.hdr_setup(Some(wayland)), HdrSetup::Changed);
             assert_eq!(g.hdr_setup(None), HdrSetup::Unknown);
         }
+    }
+
+    #[test]
+    fn failed_shader_save_keeps_the_running_and_persisted_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graphics = Graphics::default();
+        graphics
+            .select_shader_pack(dir.path(), "old.zip".into())
+            .unwrap();
+        let file = dir.path().join(FILE);
+        let original = fs::read(&file).unwrap();
+        let permissions = fs::metadata(&file).unwrap().permissions();
+        let mut read_only = permissions.clone();
+        read_only.set_readonly(true);
+        fs::set_permissions(&file, read_only).unwrap();
+        let refused = graphics.select_shader_pack(dir.path(), "new.zip".into());
+        fs::set_permissions(&file, permissions).unwrap();
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(graphics.shader_pack, "old.zip");
+        assert_eq!(fs::read(&file).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        graphics
+            .select_shader_pack(dir.path(), "new.zip".into())
+            .unwrap();
+        assert_eq!(graphics.shader_pack, "new.zip");
+        assert_eq!(Graphics::load(dir.path()).shader_pack, "new.zip");
     }
 
     #[test]

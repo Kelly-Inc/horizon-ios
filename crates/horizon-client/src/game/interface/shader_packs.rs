@@ -260,8 +260,10 @@ pub(super) fn command(
         if !name.is_empty() && !packs.iter().any(|pack| pack.file == name) {
             return Err(format!("no shader pack {name} in shaderpacks/").into());
         }
-        settings.horizon.shader_pack = name;
-        settings.horizon.save(&root);
+        settings
+            .horizon
+            .select_shader_pack(&root, name)
+            .map_err(|error| format!("could not save the shader selection: {error}"))?;
     }
     settings.shader_packs = packs;
     let selected =

@@ -36,6 +36,7 @@ pub mod client_resources;
 pub mod clouds;
 pub mod collisions;
 pub mod command_block;
+mod config_file;
 pub mod connected;
 pub mod containers;
 pub mod controller_ui;

@@ -112,10 +112,22 @@ final class MicrosoftAccount: ObservableObject {
             accounts.removeAll { $0.uuid == account.uuid }
             if profile?.uuid == account.uuid { selection = UUID(); profile = nil }
             try saveCatalog()
-            if profile == nil { try await handOver() }
-        } catch { state = .failed(error.localizedDescription) }
+        } catch {
+            state = .failed(error.localizedDescription)
+            return
+        }
+        if profile == nil { try? await handOver() }
     }
-    func signOut() async { select(nil); do { try await handOver() } catch { state = .failed(error.localizedDescription) } }
+
+    func signOut() async {
+        select(nil)
+        try? await handOver()
+    }
+
+    private func checkHandoff(_ epoch: UUID) throws {
+        try Task.checkCancellation()
+        guard selection == epoch, signing == nil else { throw CancellationError() }
+    }
 
     /// Every launch awaits the same account refresh. Cached identity alone is
     /// never proof that a usable online session exists.
@@ -129,13 +141,11 @@ final class MicrosoftAccount: ObservableObject {
             let credentials: (Profile, AccountSecrets)?
             if let chosen { credentials = try await self.credentials(for: chosen) }
             else { credentials = nil }
-            try Task.checkCancellation()
-            guard selection == epoch else { throw CancellationError() }
+            try checkHandoff(epoch)
             let previous = transfer
             let task = Task { @MainActor in
                 _ = try? await previous?.value
-                try Task.checkCancellation()
-                guard self.selection == epoch else { throw CancellationError() }
+                try self.checkHandoff(epoch)
                 let command: String
                 if let (account, secrets) = credentials {
                     guard secrets.expires > self.now(), !secrets.token.isEmpty else {
@@ -146,10 +156,8 @@ final class MicrosoftAccount: ObservableObject {
                     ])
                     command = "launcher-session " + String(decoding: data, as: UTF8.self)
                 } else { command = "launcher-session off" }
-                try Task.checkCancellation()
                 let answer = await self.bridge(command)
-                try Task.checkCancellation()
-                guard self.selection == epoch else { throw CancellationError() }
+                try self.checkHandoff(epoch)
                 guard answer["ok"] as? Bool == true, answer.error == nil else {
                     throw AccountError("The game could not accept your account. Try Play again.")
                 }
@@ -161,12 +169,11 @@ final class MicrosoftAccount: ObservableObject {
             } onCancel: {
                 task.cancel()
             }
-            try Task.checkCancellation()
-            guard selection == epoch else { throw CancellationError() }
+            try checkHandoff(epoch)
             state = .idle
         } catch {
-            if Task.isCancelled { throw CancellationError() }
-            if selection == epoch, !(error is CancellationError) { state = .failed(error.localizedDescription) }
+            try checkHandoff(epoch)
+            if !(error is CancellationError) { state = .failed(error.localizedDescription) }
             throw error
         }
     }

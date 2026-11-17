@@ -232,12 +232,94 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(account.profile, bob)
         XCTAssertTrue(bridgeCommands.allSatisfy { $0.contains("fixture-bob-access") })
     }
+    func testFailedRefreshIsCancelledIfThePlayerChangedAccounts() async throws {
+        try seed()
+        network(tokenError: true)
+        let account = model()
+        let requested = expectation(description: "old account refresh requested")
+        let release = DispatchSemaphore(value: 0)
+        let response = AuthURLProtocol.response
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/token") {
+                requested.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return response(request)
+        }
+        let pending = Task { try await account.handOver() }
+        await fulfillment(of: [requested], timeout: 2)
+        account.select(bob)
+        release.signal()
+        do {
+            try await pending.value
+            XCTFail("The old handoff should be cancelled")
+        } catch is CancellationError {}
+        XCTAssertEqual(account.profile, bob)
+        XCTAssertEqual(account.state, .idle)
+        XCTAssertTrue(bridgeCommands.isEmpty)
+    }
+
     func testRemoveSelectedAccountIsExplicitOfflineAndKeepsOthers() async throws {
         try seed(expired: false); let account = model()
         await account.remove(alice)
         XCTAssertNil(account.profile); XCTAssertNil(vault.values[alice.uuid])
         XCTAssertNotNil(vault.values[bob.uuid]); XCTAssertEqual(account.accounts, [bob])
         XCTAssertEqual(bridgeCommands, ["launcher-session off"])
+    }
+
+    func testLateOfflineReplyDoesNotReportAnErrorOnTheNewSelection() async throws {
+        for remove in [false, true] {
+            try seed(expired: false)
+            let requested = expectation(description: "offline session requested")
+            var reply: CheckedContinuation<[String: Any], Never>?
+            let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session,
+                                           clock: { self.instant }, client: "fixture-client") { command in
+                XCTAssertEqual(command, "launcher-session off")
+                return await withCheckedContinuation {
+                    reply = $0
+                    requested.fulfill()
+                }
+            }
+            let pending = Task {
+                if remove { await account.remove(alice) }
+                else { await account.signOut() }
+            }
+            await fulfillment(of: [requested], timeout: 2)
+            account.select(bob)
+            reply?.resume(returning: ["error": "Old offline request failed"])
+            await pending.value
+            XCTAssertEqual(account.profile, bob)
+            XCTAssertEqual(account.state, .idle)
+        }
+    }
+
+    func testOldOfflineHandoffCannotClearAnActiveSignIn() async throws {
+        try seed(expired: false)
+        let requested = expectation(description: "offline session requested")
+        let deviceRequested = expectation(description: "sign-in requested a code")
+        let releaseDevice = DispatchSemaphore(value: 0)
+        defer { releaseDevice.signal() }
+        AuthURLProtocol.response = { _ in
+            deviceRequested.fulfill()
+            _ = releaseDevice.wait(timeout: .now() + 5)
+            return (503, [:])
+        }
+        var reply: CheckedContinuation<[String: Any], Never>?
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session,
+                                       clock: { self.instant }, client: "fixture-client") { _ in
+            await withCheckedContinuation {
+                reply = $0
+                requested.fulfill()
+            }
+        }
+        let pending = Task { await account.signOut() }
+        await fulfillment(of: [requested], timeout: 2)
+        account.signIn()
+        await fulfillment(of: [deviceRequested], timeout: 2)
+        reply?.resume(returning: ["ok": true])
+        await pending.value
+        XCTAssertEqual(account.state, .working("Asking Microsoft for a code…"))
+        account.cancel()
     }
 
     func testFailedRemovalDoesNotDiscardAnInFlightTokenRotation() async throws {

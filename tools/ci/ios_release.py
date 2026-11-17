@@ -8,6 +8,7 @@ import shutil
 import stat
 import struct
 import tempfile
+import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -121,9 +122,28 @@ def bundle_executable(bundle, info, binaries, file_type, label):
     return binary[1]
 
 
+def audit_payload_layout(paths, app):
+    # Installers may unpack on case-insensitive or normalization-insensitive volumes.
+    # Check implicit directories too: Assets/a and assets/b need not be ZIP entries
+    # for both spellings of Assets to collide.
+    normalized = {}
+    payload = PurePosixPath("Payload")
+    for path in paths:
+        if path != payload and path != app and app not in path.parents:
+            raise ValueError("Unexpected entry outside the IPA application bundle")
+        for component in (path, *path.parents):
+            if not component.parts:
+                continue
+            key = unicodedata.normalize("NFD", component.as_posix().casefold())
+            if normalized.setdefault(key, component) != component:
+                raise ValueError("IPA paths collide under case or Unicode normalization")
+            if component != path and paths.get(component) is False:
+                raise ValueError("An IPA file is also used as a directory")
+
+
 def audit(ipa, expected_commit=None, expected_version=None):
     with zipfile.ZipFile(ipa) as archive:
-        paths = set()
+        paths = {}
         binaries = {}
         infos = []
         framework_paths = set()
@@ -138,7 +158,7 @@ def audit(ipa, expected_commit=None, expected_version=None):
                 raise ValueError("Unexpected IPA path")
             if path in paths:
                 raise ValueError("Duplicate IPA entries")
-            paths.add(path)
+            paths[path] = entry.is_dir()
             if (name in PRIVATE_NAMES or path.suffix.lower() in PRIVATE_SUFFIXES
                     or name.startswith(".env")
                     or parts & {"_codesignature", "xcuserdata", "saves", "logs"}):
@@ -154,11 +174,11 @@ def audit(ipa, expected_commit=None, expected_version=None):
                 binary = unsigned_macho(stream)
                 if binary is not None:
                     binaries[path] = binary
-            if len(path.parts) == 3 and path.parts[1].endswith(".app") and name == "info.plist":
+            if len(path.parts) == 3 and path.parts[1].endswith(".app") and path.name == "Info.plist":
                 if entry.file_size > 1 << 20:
                     raise ValueError("Oversized app Info.plist")
                 infos.append((path.parent, plistlib.loads(archive.read(entry))))
-            if name == "info.plist" and path.parent.suffix == ".framework":
+            if path.name == "Info.plist" and path.parent.suffix == ".framework":
                 if entry.file_size > 1 << 20:
                     raise ValueError("Oversized framework Info.plist")
                 frameworks[path.parent] = plistlib.loads(archive.read(entry))
@@ -167,6 +187,7 @@ def audit(ipa, expected_commit=None, expected_version=None):
         if len(infos) != 1:
             raise ValueError("Expected exactly one application")
         app, info = infos[0]
+        audit_payload_layout(paths, app)
         # Manual device bundles may omit Xcode's platform metadata. The load
         # commands above prove the real target of every executable independently;
         # an explicit contradictory plist value still refuses the package.

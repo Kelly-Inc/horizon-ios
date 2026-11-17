@@ -208,6 +208,33 @@ class IOSReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unexpected IPA path"):
                 release.audit(ipa, SHA)
 
+    def test_payload_has_one_app_and_no_colliding_files_or_implicit_directories(self):
+        bundle = "Payload/Horizon.app"
+        cases = [
+            ({"Payload/Other.app/stray.txt": b"extra"}, "outside the IPA application"),
+            ({"Payload/stray.txt": b"extra"}, "outside the IPA application"),
+            ({"Payload": b"not a directory"}, "also used as a directory"),
+            ({f"{bundle}/INFO.PLIST": b"duplicate"}, "paths collide"),
+            ({f"{bundle}/Assets/one": b"a", f"{bundle}/assets/two": b"b"}, "paths collide"),
+            ({f"{bundle}/Café/one": b"a", f"{bundle}/Cafe\u0301/two": b"b"}, "paths collide"),
+            ({f"{bundle}/Assets": b"file", f"{bundle}/Assets/one": b"a"}, "also used as a directory"),
+        ]
+        for entries, error in cases:
+            with self.subTest(entries=entries), tempfile.TemporaryDirectory() as directory:
+                ipa = Path(directory) / "layout.ipa"
+                self.archive(ipa, entries)
+                with self.assertRaisesRegex(ValueError, error):
+                    release.audit(ipa, SHA)
+
+    def test_payload_accepts_explicit_directories_and_distinct_bundle_resources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "layout.ipa"
+            self.archive(ipa, {"Payload/": b"", "Payload/Horizon.app/": b"",
+                               "Payload/Horizon.app/Assets/": b"",
+                               "Payload/Horizon.app/Assets/One": b"one",
+                               "Payload/Horizon.app/Assets/Two": b"two"})
+            self.assertEqual(release.audit(ipa, SHA), ("0.1.0", "42.2"))
+
     def test_real_metadata_names_and_checksum_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

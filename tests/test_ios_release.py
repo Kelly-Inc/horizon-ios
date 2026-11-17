@@ -426,21 +426,28 @@ if args[0]=="api":
             print(json.dumps({"tag_name":{"older":"ios-build-99.1", "local-newer":"v0.1.62", "local-older":"v0.0.1", "local-equal":"v0.1.0"}.get(scenario,"ios-build-41.1")}))
     else: print(os.environ["TAG_SHA"])
 elif args[:2]==["release","view"]:
-    if scenario in ["new", "upload-failed", "wrong-tag"]: sys.exit(1)
-    names=["game.ipa", "game.ipa.sha256"] if scenario!="incomplete" else []
-    if scenario=="legacy": names=["Horizon-iOS-0.1.0-build42.2-unsigned.ipa", "Horizon-iOS-0.1.0-build42.2-unsigned.ipa.sha256", "other.txt", "Horizon-iOS-0.1.0-build41.1-unsigned.ipa"]
+    uploaded = Path("fixture-uploaded").exists()
+    if not uploaded and scenario in ["new", "upload-failed", "wrong-tag", "upload-missing"]: sys.exit(1)
+    names = ["game.ipa", "game.ipa.sha256"] if uploaded or scenario != "incomplete" else []
+    if uploaded and scenario == "upload-missing":
+        names.remove("game.ipa.sha256")
+    if scenario in ("legacy", "upload-mismatch") and not uploaded: names=["Horizon-iOS-0.1.0-build42.2-unsigned.ipa", "Horizon-iOS-0.1.0-build42.2-unsigned.ipa.sha256", "other.txt", "Horizon-iOS-0.1.0-build41.1-unsigned.ipa"]
     assets = []
     for name in names:
-        if name == "game.ipa.sha256" and scenario in ("starter", "partial-mismatch"):
+        if name == "game.ipa.sha256" and not uploaded and scenario in ("starter", "partial-mismatch"):
             assets.append({"name": name, "state": "starter", "size": 0})
             continue
         content = Path(name).read_bytes() if Path(name).exists() else b"other"
-        if name == "game.ipa" and scenario == "partial-mismatch":
+        if name == "game.ipa" and scenario in ("partial-mismatch", "published-mismatch"):
             content = b"another build"
+        if name == "game.ipa.sha256" and uploaded and scenario == "upload-mismatch":
+            content = b"another checksum"
         assets.append({"name": name, "state": "uploaded", "size": len(content),
                        "digest": "sha256:" + hashlib.sha256(content).hexdigest()})
     print(json.dumps({"isDraft":scenario=="draft", "targetCommitish":os.environ["GITHUB_SHA"], "assets":assets}))
-elif args[:2]==["release","upload"] and scenario=="upload-failed": sys.exit(1)
+elif args[:2]==["release","upload"]:
+    if scenario == "upload-failed": sys.exit(1)
+    Path("fixture-uploaded").touch()
 ''')
             mock.chmod(0o755)
             (root / "game.ipa").write_bytes(b"fixture app")
@@ -459,7 +466,7 @@ elif args[:2]==["release","upload"] and scenario=="upload-failed": sys.exit(1)
         result, calls = self.run_flow("new")
         self.assertEqual(result.returncode, 0, result.stderr)
         actions = [c[1] for c in calls if c[0] == "release"]
-        self.assertEqual(actions, ["view", "create", "upload", "edit"])
+        self.assertEqual(actions, ["view", "create", "upload", "view", "edit"])
         create = next(c for c in calls if c[:2] == ["release", "create"])
         self.assertIn("--draft", create)
         result, calls = self.run_flow("upload-failed")
@@ -478,6 +485,23 @@ elif args[:2]==["release","upload"] and scenario=="upload-failed": sys.exit(1)
         self.assertIn("--prerelease=false", edit)
         self.assertIn("--latest=true", edit)
         self.assertIn("Horizon iOS 0.1.0 — build 42.2", edit)
+
+    def test_mismatched_published_assets_are_left_untouched(self):
+        result, calls = self.run_flow("published-mismatch")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match this build", result.stderr)
+        self.assertEqual([call[1] for call in calls if call[0] == "release"], ["view"])
+
+    def test_unverified_uploads_cannot_publish_or_retire_downloads(self):
+        for scenario in ("upload-missing", "upload-mismatch"):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_flow(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                actions = [call[1] for call in calls if call[0] == "release"]
+                self.assertIn("upload", actions)
+                self.assertEqual(actions[-1], "view")
+                self.assertNotIn("delete-asset", actions)
+                self.assertNotIn("edit", actions)
 
     def test_wrong_tag_fails_closed(self):
         for scenario in ["wrong-tag"]:

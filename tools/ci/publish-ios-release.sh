@@ -51,38 +51,43 @@ fi
 } > release-notes.md
 uploads=("$IPA" "$CHECKSUM")
 : > obsolete-assets.txt
+release_asset_plan() {
+  python3 - "$1" "$IPA" "$CHECKSUM" <<'PYUPLOAD'
+import hashlib, json, sys
+from pathlib import Path
+
+mode = sys.argv[1]
+files = [Path(value) for value in sys.argv[2:]]
+release = json.load(open("release-state.json"))
+ready = {
+    asset["name"]: asset for asset in release["assets"]
+    if asset.get("state") == "uploaded" and asset.get("size", 0) > 0
+}
+if mode == "plan" and release["isDraft"]:
+    print(*(str(path) for path in files), sep="\n")
+    raise SystemExit(0)
+
+for path in files:
+    uploaded = ready.get(path.name)
+    if uploaded is None:
+        if mode == "verify":
+            raise SystemExit(f"GitHub did not confirm the upload of {path.name}")
+        print(path)
+        continue
+    with path.open("rb") as stream:
+        expected = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
+    if uploaded.get("digest") != expected:
+        raise SystemExit(f"Published asset {path.name} does not match this build")
+PYUPLOAD
+}
+
 if gh release view "$tag" --json isDraft,targetCommitish,assets > release-state.json; then
   target=$(python3 -c 'import json; print(json.load(open("release-state.json"))["targetCommitish"])')
   if [[ "$target" != "$GITHUB_SHA" ]]; then
     echo '::error::Release tag points to a different commit; refusing to modify it.'
     exit 1
   fi
-  python3 - "$IPA" "$CHECKSUM" <<'PYUPLOAD' > release-upload-plan.txt
-import hashlib, json, sys
-from pathlib import Path
-
-release = json.load(open("release-state.json"))
-files = [Path(value) for value in sys.argv[1:]]
-assets = {asset["name"]: asset for asset in release["assets"]}
-ready = {
-    name: asset for name, asset in assets.items()
-    if asset.get("state") == "uploaded" and asset.get("size", 0) > 0
-}
-if release["isDraft"]:
-    print(*(str(path) for path in files), sep="\n")
-else:
-    missing = [path for path in files if path.name not in ready]
-    if missing:
-        # A partially published release keeps its good asset. Check that the
-        # local pair matches it before using one of the local files to repair it.
-        for path in files:
-            if path.name in ready:
-                with path.open("rb") as stream:
-                    expected = "sha256:" + hashlib.file_digest(stream, "sha256").hexdigest()
-                if ready[path.name].get("digest") != expected:
-                    raise SystemExit("The remaining published asset does not match this build")
-        print(*(str(path) for path in missing), sep="\n")
-PYUPLOAD
+  release_asset_plan plan > release-upload-plan.txt
   uploads=()
   while IFS= read -r asset; do
     [[ -z "$asset" ]] || uploads+=("$asset")
@@ -104,6 +109,9 @@ else
 fi
 if ((${#uploads[@]})); then
   gh release upload "$tag" "${uploads[@]}" --clobber
+  # Verify the server-side bytes before retiring older downloads or publishing.
+  gh release view "$tag" --json isDraft,assets > release-state.json
+  release_asset_plan verify
 fi
 while IFS= read -r obsolete; do
   [[ -z "$obsolete" ]] || gh release delete-asset "$tag" "$obsolete" --yes

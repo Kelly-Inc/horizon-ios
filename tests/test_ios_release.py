@@ -252,29 +252,49 @@ class PublishFlowTests(unittest.TestCase):
             root = Path(directory)
             mock = root / "gh"
             mock.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import hashlib, json, os, sys
+from pathlib import Path
 args=sys.argv[1:]
 with open(os.environ["CALL_LOG"], "a") as f: f.write(json.dumps(args)+"\\n")
 scenario=os.environ["SCENARIO"]
 if args[0]=="api":
     if "matching-refs" in args[1]:
         if scenario=="wrong-tag": print("refs/tags/ios-build-42.2")
-    elif args[1].endswith("/releases/latest"): print({"older":"ios-build-99.1", "local-newer":"v0.1.62", "local-older":"v0.0.1", "local-equal":"v0.1.0"}.get(scenario,"ios-build-41.1"))
+    elif args[1].endswith("/releases/latest"):
+        if scenario == "latest-network-error": sys.exit(1)
+        status = {"no-latest": "404 Not Found", "latest-server-error": "503 Service Unavailable"}.get(scenario, "200 OK")
+        sys.stdout.write(f"HTTP/2.0 {status}\\nContent-Type: application/json\\r\\n\\r\\n")
+        if not status.startswith("200"): sys.exit(1)
+        if scenario != "latest-invalid":
+            print(json.dumps({"tag_name":{"older":"ios-build-99.1", "local-newer":"v0.1.62", "local-older":"v0.0.1", "local-equal":"v0.1.0"}.get(scenario,"ios-build-41.1")}))
     else: print(os.environ["TAG_SHA"])
 elif args[:2]==["release","view"]:
     if scenario in ["new", "upload-failed", "wrong-tag"]: sys.exit(1)
     names=["game.ipa", "game.ipa.sha256"] if scenario!="incomplete" else []
     if scenario=="legacy": names=["Horizon-iOS-0.1.0-build42.2-unsigned.ipa", "Horizon-iOS-0.1.0-build42.2-unsigned.ipa.sha256", "other.txt", "Horizon-iOS-0.1.0-build41.1-unsigned.ipa"]
-    print(json.dumps({"isDraft":scenario=="draft", "targetCommitish":os.environ["GITHUB_SHA"], "assets":[{"name":n} for n in names]}))
+    assets = []
+    for name in names:
+        if name == "game.ipa.sha256" and scenario in ("starter", "partial-mismatch"):
+            assets.append({"name": name, "state": "starter", "size": 0})
+            continue
+        content = Path(name).read_bytes() if Path(name).exists() else b"other"
+        if name == "game.ipa" and scenario == "partial-mismatch":
+            content = b"another build"
+        assets.append({"name": name, "state": "uploaded", "size": len(content),
+                       "digest": "sha256:" + hashlib.sha256(content).hexdigest()})
+    print(json.dumps({"isDraft":scenario=="draft", "targetCommitish":os.environ["GITHUB_SHA"], "assets":assets}))
 elif args[:2]==["release","upload"] and scenario=="upload-failed": sys.exit(1)
 ''')
             mock.chmod(0o755)
+            (root / "game.ipa").write_bytes(b"fixture app")
+            (root / "game.ipa.sha256").write_text("fixture checksum\n")
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
                        GH_REPO="example/repository", GITHUB_SHA=SHA, IPA="game.ipa",
                        CHECKSUM="game.ipa.sha256", VERSION="0.1.0", BUILD="42.2",
                        SCENARIO=scenario, TAG_SHA=tag_sha, CALL_LOG=str(root / "calls"))
             result = subprocess.run(["bash", str(ROOT / "tools/ci/publish-ios-release.sh")],
                                     cwd=root, env=env, capture_output=True, text=True)
+            self.assertTrue((root / "calls").exists(), result.stderr)
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
             return result, calls
 
@@ -324,6 +344,27 @@ elif args[:2]==["release","upload"] and scenario=="upload-failed": sys.exit(1)
         self.assertEqual(result.returncode, 0, result.stderr)
         edit = next(c for c in calls if c[:2] == ["release", "edit"])
         self.assertIn("--latest=false", edit)
+
+    def test_latest_lookup_errors_prevent_release_mutations(self):
+        for scenario in ("latest-network-error", "latest-server-error", "latest-invalid"):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_flow(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(call[0] == "release" for call in calls))
+        result, calls = self.run_flow("no-latest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        edit = next(c for c in calls if c[:2] == ["release", "edit"])
+        self.assertIn("--latest=true", edit)
+
+    def test_repair_replaces_the_starter_asset_without_overwriting_a_verified_ipa(self):
+        result, calls = self.run_flow("starter")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        upload = next(c for c in calls if c[:2] == ["release", "upload"])
+        self.assertEqual(upload[3:], ["game.ipa.sha256", "--clobber"])
+        result, calls = self.run_flow("partial-mismatch")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match this build", result.stderr)
+        self.assertFalse(any(c[:2] in [["release", "upload"], ["release", "edit"]] for c in calls))
 
     def test_local_versioned_release_is_not_replaced_by_an_older_ci_build(self):
         for scenario, latest in [("local-newer", "false"), ("local-older", "true"), ("local-equal", "false")]:

@@ -205,7 +205,12 @@ final class PackStore: ObservableObject {
             let directory = folder(kind)
             let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
             installed[kind] = names
-                .filter { !$0.hasPrefix(".") && ($0.lowercased().hasSuffix(".zip") || Self.isFolder(directory.appendingPathComponent($0))) }
+                .filter { name in
+                    guard !name.hasPrefix(".") else { return false }
+                    return name.lowercased().hasSuffix(".zip")
+                        || (kind == .shader && name.hasSuffix(".hshader"))
+                        || Self.isFolder(directory.appendingPathComponent(name))
+                }
                 .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         }
     }
@@ -252,6 +257,7 @@ final class PackChoices: ObservableObject {
 
     typealias Request = @MainActor (String) async -> [String: Any]
     private let request: Request
+    private var shaderKeys: [String: String] = [:]
     private var locked = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
     @Published private(set) var issue: String?
@@ -291,6 +297,13 @@ final class PackChoices: ObservableObject {
         guard let selected = shaders["selected"], selected is NSNull || selected is String else {
             return "The selected shader pack could not be read. Try again."
         }
+        var keys: [String: String] = [:]
+        for pack in shaders["packs"] as? [[String: Any]] ?? [] {
+            if let name = pack["name"] as? String, let key = pack["key"] as? String {
+                keys[name] = key
+            }
+        }
+        shaderKeys = keys
         shaderPack = selected as? String
         shaderNotes = []
         shaderStatus = nil
@@ -319,7 +332,9 @@ final class PackChoices: ObservableObject {
     }
 
     func isOn(_ name: String, kind: PackKind) -> Bool {
-        kind == .resource ? resourcePacks.contains("file/\(name)") : shaderPack == name
+        if kind == .resource { return resourcePacks.contains("file/\(name)") }
+        guard let shaderPack else { return false }
+        return shaderPack == name || shaderPack == shaderKeys[name]
     }
 
     /// Each mutation reads the latest confirmed state while holding the queue lock. A second toggle
@@ -349,7 +364,8 @@ final class PackChoices: ObservableObject {
                   let list = String(data: data, encoding: .utf8) else { return "That pack name can't be saved." }
             answer = await request("options-set resourcePacks \(list)")
         case .shader:
-            guard let data = try? JSONSerialization.data(withJSONObject: ["name": name, "enabled": on]),
+            let key = shaderKeys[name] ?? name
+            guard let data = try? JSONSerialization.data(withJSONObject: ["name": key, "enabled": on]),
                   let selection = String(data: data, encoding: .utf8) else { return "That shader name can't be saved." }
             answer = await request("shader-pack-set \(selection)")
         }

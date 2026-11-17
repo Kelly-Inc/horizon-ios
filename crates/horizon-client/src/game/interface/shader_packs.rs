@@ -263,10 +263,19 @@ pub(super) fn command(
     let root = std::env::current_dir()?;
     let packs = horizon_client::shader_pack_list::scan(&root.join("shaderpacks"));
     let arg = line.trim_start().strip_prefix(verb).unwrap_or("").trim();
-    let replacement = selection::change(verb, arg, &settings.horizon.shader_pack)?;
+    let find_pack = |name: &str| {
+        packs
+            .iter()
+            .find(|pack| pack.key == name)
+            .or_else(|| packs.iter().find(|pack| pack.file == name))
+    };
+    let canonical =
+        |name: &str| find_pack(name).map_or_else(|| name.to_owned(), |pack| pack.key.clone());
+    let current = canonical(&settings.horizon.shader_pack);
+    let replacement = selection::change(verb, arg, &current, canonical)?;
     let changed = replacement.is_some();
     if let Some(name) = replacement {
-        if !name.is_empty() && !packs.iter().any(|pack| pack.file == name) {
+        if !name.is_empty() && find_pack(&name).is_none() {
             return Err(format!("no shader pack {name} in shaderpacks/").into());
         }
         settings
@@ -275,24 +284,30 @@ pub(super) fn command(
             .map_err(|error| format!("could not save the shader selection: {error}"))?;
         LAST_DISABLED.with_borrow_mut(Option::take);
     }
-    settings.shader_packs = packs;
-    let selected =
-        (!settings.horizon.shader_pack.is_empty()).then_some(settings.horizon.shader_pack.as_str());
+    let picked = &settings.horizon.shader_pack;
+    let selected_pack = find_pack(picked);
+    let selected = (!picked.is_empty())
+        .then(|| selected_pack.map_or(picked.as_str(), |pack| pack.key.as_str()));
     let report = REPORT.with_borrow(|report| {
         report
             .as_ref()
-            .filter(|r| r["pack"].as_str() == selected)
+            .filter(|r| {
+                let name = r["pack"].as_str();
+                name == selected
+                    || selected_pack.is_some_and(|pack| name == Some(pack.file.as_str()))
+            })
             .cloned()
     });
     let last_disabled = selected
         .is_none()
         .then(|| LAST_DISABLED.with_borrow(Clone::clone))
         .flatten();
-    let list: Vec<Value> = settings
-        .shader_packs
+    let list: Vec<Value> = packs
         .iter()
-        .map(|pack| json!({"name": pack.file, "title":pack.title, "problem":null}))
+        .map(|pack| json!({"name": pack.file, "key": pack.key, "title":pack.title, "problem":null}))
         .collect();
+    let selected = selected.map(str::to_owned);
+    settings.shader_packs = packs;
     Ok(Some((
         json!({"packs":list,"selected":selected,"runtime":report,"last_disabled":last_disabled}),
         changed,

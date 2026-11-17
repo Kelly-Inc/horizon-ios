@@ -703,6 +703,58 @@ final class PackMutationTests: XCTestCase {
         XCTAssertEqual(choices.shaderNotes, ["Current note"])
     }
 
+    func testNativeShaderFileUsesTheManifestIdentityForTogglesAndRemoval() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let filename = "Example.hshader"
+        let key = "horizon:example"
+        let store = PackStore(folder: { root.appendingPathComponent($0.rawValue) })
+        for kind in PackKind.allCases {
+            let folder = root.appendingPathComponent(kind.rawValue)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data().write(to: folder.appendingPathComponent(filename))
+        }
+        store.reloadInstalled()
+        XCTAssertEqual(store.installed[.shader], [filename])
+        XCTAssertEqual(store.installed[.resource], [])
+
+        var selected: String? = key
+        var writes: [Bool] = []
+        let choices = PackChoices { command in
+            if command == "options-get resourcePacks" {
+                return ["options": ["resourcePacks": ["value": [String]()]]]
+            }
+            if command == "shader-pack list" {
+                return ["selected": selected.map { $0 as Any } ?? NSNull(),
+                        "packs": [["name": filename, "key": key]]]
+            }
+            let prefix = "shader-pack-set "
+            guard command.hasPrefix(prefix),
+                  let data = (try? JSONSerialization.jsonObject(with: Data(command.dropFirst(prefix.count).utf8))) as? [String: Any],
+                  data["name"] as? String == key, let enabled = data["enabled"] as? Bool else {
+                return ["error": "expected native shader identity"]
+            }
+            writes.append(enabled)
+            selected = enabled ? key : nil
+            return ["ok": true]
+        }
+        await choices.load()
+        XCTAssertTrue(choices.isOn(filename, kind: .shader))
+        let off = await choices.set(filename, kind: .shader, on: false)
+        XCTAssertNil(off)
+        XCTAssertFalse(choices.isOn(filename, kind: .shader))
+        let on = await choices.set(filename, kind: .shader, on: true)
+        XCTAssertNil(on)
+        XCTAssertTrue(choices.isOn(filename, kind: .shader))
+        let removal = await choices.remove(filename, kind: .shader, delete: {
+            XCTAssertNil(selected)
+            return store.remove(filename, kind: .shader)
+        })
+        XCTAssertNil(removal)
+        XCTAssertEqual(writes, [false, true, false])
+        XCTAssertEqual(store.installed[.shader], [])
+    }
+
     func testStaleShaderOffDoesNotDisableTheNewlySelectedPack() async {
         var current = "a.zip"
         var writes: [String] = []

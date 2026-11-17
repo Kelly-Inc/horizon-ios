@@ -21,6 +21,7 @@ enum PackKind: String, CaseIterable, Identifiable {
 /// A project from Modrinth's search.
 struct ModrinthProject: Identifiable, Equatable {
     let id: String
+    let kind: PackKind
     let title: String
     let summary: String
     let author: String
@@ -41,9 +42,18 @@ final class PackStore: ObservableObject {
     @Published private(set) var installed: [PackKind: [String]] = [:]
 
     typealias Fetch = @MainActor (URL) async -> Any?
+    typealias Transfer = @MainActor (URLRequest) async throws -> (URL, URLResponse)
     private let fetch: Fetch
+    private let transfer: Transfer
+    private let folder: (PackKind) -> URL
     private var searchRevision: UInt64 = 0
-    init(fetch: @escaping Fetch = { await PackStore.get($0) }) { self.fetch = fetch }
+    init(fetch: @escaping Fetch = { await PackStore.get($0) },
+         transfer: @escaping Transfer = { try await URLSession.shared.download(for: $0) },
+         folder: @escaping (PackKind) -> URL = { $0.folder }) {
+        self.fetch = fetch
+        self.transfer = transfer
+        self.folder = folder
+    }
 
     private static let api = "https://api.modrinth.com/v2"
 
@@ -72,7 +82,7 @@ final class PackStore: ObservableObject {
         results = hits.compactMap { hit in
             guard let id = hit["project_id"] as? String, let title = hit["title"] as? String else { return nil }
             return ModrinthProject(
-                id: id, title: title, summary: hit["description"] as? String ?? "",
+                id: id, kind: kind, title: title, summary: hit["description"] as? String ?? "",
                 author: hit["author"] as? String ?? "", downloads: hit["downloads"] as? Int ?? 0,
                 icon: (hit["icon_url"] as? String).flatMap(URL.init(string:)),
                 gameVersions: hit["versions"] as? [String] ?? []
@@ -86,8 +96,8 @@ final class PackStore: ObservableObject {
         let note: String?
     }
 
-    /// Download `project`'s file for `version` (the game's Minecraft version) into `kind`'s folder.
-    func install(_ project: ModrinthProject, kind: PackKind, version: String) async -> Result<Installed, PackError> {
+    /// Download `project`'s file for the game's Minecraft version into the project's pack folder.
+    func install(_ project: ModrinthProject, version: String) async -> Result<Installed, PackError> {
         guard downloading[project.id] == nil else { return .failure(PackError("This pack is already downloading.")) }
         downloading[project.id] = 0
         defer { downloading[project.id] = nil }
@@ -108,24 +118,28 @@ final class PackStore: ObservableObject {
         var request = URLRequest(url: link)
         request.setValue(Self.agent, forHTTPHeaderField: "User-Agent")
         do {
-            let (temporary, response) = try await URLSession.shared.download(for: request)
+            let (temporary, response) = try await transfer(request)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            try Task.checkCancellation()
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 return .failure(PackError("Modrinth refused the download of \(project.title)."))
             }
-            try FileManager.default.createDirectory(at: kind.folder, withIntermediateDirectories: true)
-            let destination = kind.folder.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: destination.path) {
-                var isDirectory: ObjCBool = false
-                _ = FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory)
-                guard !isDirectory.boolValue else { return .failure(PackError("A folder already uses this pack filename.")) }
-                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: destination)
+            let directory = folder(project.kind)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let original = directory.appendingPathComponent(name)
+            let stem = original.deletingPathExtension().lastPathComponent
+            var destination = original
+            var suffix = 2
+            while FileManager.default.fileExists(atPath: destination.path) {
+                destination = directory.appendingPathComponent("\(stem) (\(suffix)).zip")
+                suffix += 1
             }
+            // Never silently replace a local pack or a different project's ZIP.
+            try FileManager.default.moveItem(at: temporary, to: destination)
             reloadInstalled()
             let made = (chosen["game_versions"] as? [String])?.last ?? "another version"
             let note = fitting == nil ? "It was made for Minecraft \(made), so it may not look right on \(version)." : nil
-            return .success(Installed(file: name, note: note))
+            return .success(Installed(file: destination.lastPathComponent, note: note))
         } catch {
             return .failure(PackError(error.localizedDescription))
         }
@@ -134,16 +148,17 @@ final class PackStore: ObservableObject {
     /// The zips and folders in each pack folder.
     func reloadInstalled() {
         for kind in PackKind.allCases {
-            let names = (try? FileManager.default.contentsOfDirectory(atPath: kind.folder.path)) ?? []
+            let directory = folder(kind)
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
             installed[kind] = names
-                .filter { !$0.hasPrefix(".") && ($0.lowercased().hasSuffix(".zip") || Self.isFolder(kind.folder.appendingPathComponent($0))) }
+                .filter { !$0.hasPrefix(".") && ($0.lowercased().hasSuffix(".zip") || Self.isFolder(directory.appendingPathComponent($0))) }
                 .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         }
     }
 
     func remove(_ name: String, kind: PackKind) -> String? {
         do {
-            try FileManager.default.removeItem(at: kind.folder.appendingPathComponent(name))
+            try FileManager.default.removeItem(at: folder(kind).appendingPathComponent(name))
             reloadInstalled()
             return nil
         } catch { return error.localizedDescription }
@@ -304,6 +319,7 @@ struct PacksPage: View {
     @State private var notice: String?
 
     var body: some View {
+        let visibleResults = store.results.filter { $0.kind == kind }
         VStack(alignment: .leading, spacing: 16) {
             Picker("Kind", selection: $kind) {
                 ForEach(PackKind.allCases) { Text($0.title).tag($0) }
@@ -334,16 +350,16 @@ struct PacksPage: View {
             if let failed = store.failed {
                 Label(failed, systemImage: "wifi.exclamationmark").font(Theme.sans(12)).foregroundStyle(Theme.warn)
             }
-            if store.searching && store.results.isEmpty {
+            if store.searching && visibleResults.isEmpty {
                 ProgressView().tint(Theme.accentText).frame(maxWidth: .infinity).padding(24)
             }
             VStack(spacing: 0) {
-                ForEach(store.results) { project in
+                ForEach(visibleResults) { project in
                     ProjectRow(project: project, progress: store.downloading[project.id],
                                version: link.version) {
                         Task { await download(project) }
                     }
-                    if project != store.results.last {
+                    if project != visibleResults.last {
                         Divider().overlay(Theme.border).padding(.leading, 70)
                     }
                 }
@@ -367,7 +383,8 @@ struct PacksPage: View {
     }
 
     @ViewBuilder private var installedSection: some View {
-        let names = store.installed[kind] ?? []
+        let rowKind = kind
+        let names = store.installed[rowKind] ?? []
         SectionHeader(title: "Installed")
         if names.isEmpty {
             EmptyNote(icon: kind == .resource ? "square.stack.3d.up" : "sun.max",
@@ -379,12 +396,11 @@ struct PacksPage: View {
                         Text(name).font(Theme.sans(14)).foregroundStyle(Theme.text).lineLimit(2)
                         Spacer(minLength: 8)
                         Toggle("", isOn: Binding(
-                            get: { choices.isOn(name, kind: kind) },
+                            get: { choices.isOn(name, kind: rowKind) },
                             set: { on in
                                 Haptics.tap()
-                                let changedKind = kind
                                 Task {
-                                    if let error = await choices.set(name, kind: changedKind, on: on) {
+                                    if let error = await choices.set(name, kind: rowKind, on: on) {
                                         notice = error
                                     }
                                 }
@@ -398,10 +414,9 @@ struct PacksPage: View {
                     .frame(minHeight: 50)
                     .contextMenu {
                         Button(role: .destructive) {
-                            let deletedKind = kind
                             Task {
-                                if let error = await choices.remove(name, kind: deletedKind, delete: {
-                                    store.remove(name, kind: deletedKind)
+                                if let error = await choices.remove(name, kind: rowKind, delete: {
+                                    store.remove(name, kind: rowKind)
                                 }) { notice = error }
                             }
                         } label: { Label("Delete", systemImage: "trash") }
@@ -421,13 +436,12 @@ struct PacksPage: View {
 
     private func download(_ project: ModrinthProject) async {
         Haptics.tap()
-        let downloadedKind = kind
-        switch await store.install(project, kind: downloadedKind, version: link.version) {
+        switch await store.install(project, version: link.version) {
         case let .success(installed):
             Haptics.done()
             let name = installed.file
             var said: String
-            if link.canList, let error = await choices.set(name, kind: downloadedKind, on: true) {
+            if link.canList, let error = await choices.set(name, kind: project.kind, on: true) {
                 said = "Downloaded \(name), but it couldn't be switched on: \(error)"
             } else {
                 said = link.canList ? "\(name) is downloaded and on." : "\(name) is downloaded. Switch it on in a moment."

@@ -370,14 +370,52 @@ final class LauncherAsyncTests: XCTestCase {
     func testDuplicatePackInstallDoesNotStartAnotherRequest() async {
         var resume: CheckedContinuation<Any?, Never>?
         let store = PackStore(fetch: { _ in await withCheckedContinuation { resume = $0 } })
-        let project = ModrinthProject(id: "test", title: "Test", summary: "", author: "", downloads: 0, icon: nil, gameVersions: [])
-        let first = Task { await store.install(project, kind: .resource, version: "26.3") }
+        let project = ModrinthProject(id: "test", kind: .resource, title: "Test", summary: "", author: "", downloads: 0, icon: nil, gameVersions: [])
+        let first = Task { await store.install(project, version: "26.3") }
         while resume == nil { await Task.yield() }
-        if case .success = await store.install(project, kind: .resource, version: "26.3") { XCTFail("Duplicate install succeeded") }
+        if case .success = await store.install(project, version: "26.3") { XCTFail("Duplicate install succeeded") }
         XCTAssertNotNil(store.downloading[project.id])
         resume?.resume(returning: [])
         _ = await first.value
         XCTAssertNil(store.downloading[project.id])
+    }
+
+    func testPackDownloadKeepsItsSearchKindAndDoesNotReplaceAnExistingFile() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let shaders = root.appendingPathComponent("shader")
+        let resources = root.appendingPathComponent("resource")
+        try FileManager.default.createDirectory(at: shaders, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        let existingShader = shaders.appendingPathComponent("shared.zip")
+        let existingResource = resources.appendingPathComponent("shared.zip")
+        try Data("existing shader".utf8).write(to: existingShader)
+        try Data("existing resource".utf8).write(to: existingResource)
+        let temporary = root.appendingPathComponent("download")
+        let downloaded = Data("new shader fixture".utf8)
+        try downloaded.write(to: temporary)
+        let store = PackStore(fetch: { url in
+            if url.path.hasSuffix("/search") {
+                return ["hits": [["project_id": "fixture", "title": "Fixture"]]]
+            }
+            return [["game_versions": ["26.3"], "files": [
+                ["filename": "shared.zip", "url": "https://example.invalid/shared.zip", "primary": true],
+            ]]]
+        }, transfer: { request in
+            let url = try XCTUnwrap(request.url)
+            return (temporary, try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)))
+        }, folder: { root.appendingPathComponent($0.rawValue) })
+
+        await store.search(.shader, query: "")
+        let shader = try XCTUnwrap(store.results.first)
+        await store.search(.resource, query: "")
+        XCTAssertEqual(store.results.first?.kind, .resource)
+        let installed = try await store.install(shader, version: "26.3").get()
+        XCTAssertEqual(installed.file, "shared (2).zip")
+        XCTAssertEqual(try Data(contentsOf: shaders.appendingPathComponent(installed.file)), downloaded)
+        XCTAssertEqual(try Data(contentsOf: existingShader), Data("existing shader".utf8))
+        XCTAssertEqual(try Data(contentsOf: existingResource), Data("existing resource".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
     }
 
     func testStaleGameFileCompletionDoesNotImportOrReplaceSharedArchive() async throws {

@@ -183,6 +183,9 @@ final class MicrosoftAccount: ObservableObject {
             throw AccountError("Sign in again to restore \(account.name).", reauthenticate: true)
         }
         if !secrets.token.isEmpty, secrets.expires.timeIntervalSince(now()) > 300 { return (account, secrets) }
+        guard !secrets.refresh.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AccountError("Sign in again to restore \(account.name).", reauthenticate: true)
+        }
         guard let client else { throw AccountError("Microsoft sign-in isn't configured in this build.") }
         let task = Task { @MainActor in
             let microsoft = try await self.refresh(client, secrets.refresh)
@@ -275,8 +278,10 @@ final class MicrosoftAccount: ObservableObject {
             )
             switch answer["error"] as? String {
             case nil:
-                guard let access = answer["access_token"] as? String,
-                      let refresh = answer["refresh_token"] as? String
+                guard answer["status"] == nil,
+                      let access = answer["access_token"] as? String, !access.isEmpty,
+                      let refresh = answer["refresh_token"] as? String,
+                      !refresh.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 else { throw AccountError("Microsoft's answer had no token.") }
                 return (access, refresh)
             case "authorization_pending": continue
@@ -308,7 +313,12 @@ final class MicrosoftAccount: ObservableObject {
               let access = answer["access_token"] as? String, !access.isEmpty else {
             throw AccountError("Microsoft returned an incomplete session. Try again.")
         }
-        return (access, answer["refresh_token"] as? String ?? token)
+        // A refresh response may leave the existing credential in place.
+        // Treat an empty field like an omitted one so it cannot erase the saved token.
+        let replacement: String? = (answer["refresh_token"] as? String).flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        }
+        return (access, replacement ?? token)
     }
 
     /// Steps 3 to 7: Xbox Live, XSTS, Minecraft, ownership and the profile; then keep it all.

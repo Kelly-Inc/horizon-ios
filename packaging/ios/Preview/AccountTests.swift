@@ -135,6 +135,68 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(account.profile, alice); XCTAssertEqual(account.accounts.count, 2)
         XCTAssertTrue(bridgeCommands.isEmpty)
     }
+    func testBlankReplacementTokenKeepsThePreviousRefreshCredential() async throws {
+        try seed()
+        network()
+        let response = AuthURLProtocol.response
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/token") {
+                return (200, ["access_token": "fixture-ms-access", "refresh_token": "   "])
+            }
+            return response(request)
+        }
+        let account = model()
+        try await account.handOver()
+        XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-old-refresh")
+        XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-new-access")
+    }
+
+    func testExpiredAccountWithBlankCredentialAsksToSignInWithoutRequestingTokens() async throws {
+        try seed()
+        vault.values[alice.uuid] = AccountSecrets(refresh: "", token: "fixture-old-access",
+                                                expires: instant.addingTimeInterval(-300))
+        network()
+        let account = model()
+        do {
+            try await account.handOver()
+            XCTFail("An expired account with no refresh token cannot play online")
+        } catch {
+            XCTAssertTrue((error as? AccountError)?.reauthenticate == true)
+        }
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertTrue(bridgeCommands.isEmpty)
+        XCTAssertEqual(account.profile, alice)
+    }
+
+    func testInitialSignInDoesNotReplaceCredentialsWhenRefreshTokenIsBlank() async throws {
+        try seed(expired: false)
+        let tokenRequested = expectation(description: "device token requested")
+        let original = vault.values[alice.uuid]
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/devicecode") {
+                return (200, ["device_code": "fixture-device", "user_code": "FIXTURE",
+                              "verification_uri": "https://microsoft.com/link", "expires_in": 900, "interval": 1])
+            }
+            if request.url!.path.hasSuffix("/token") {
+                tokenRequested.fulfill()
+                return (200, ["access_token": "fixture-ms-access", "refresh_token": ""])
+            }
+            XCTFail("An incomplete token response must stop before the Xbox exchange")
+            return (503, [:])
+        }
+        let account = model()
+        account.signIn()
+        defer { account.cancel() }
+        await fulfillment(of: [tokenRequested], timeout: 2)
+        for _ in 0..<100 {
+            if case .failed = account.state { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(account.state, .failed("Microsoft's answer had no token."))
+        XCTAssertEqual(account.profile, alice)
+        XCTAssertEqual(vault.values[alice.uuid], original)
+    }
+
     func testInvalidGrantPreservesAccountAndAsksForReauthentication() async throws {
         try seed(); network(tokenError: true); let account = model()
         do { try await account.handOver(); XCTFail("must block Play") } catch {

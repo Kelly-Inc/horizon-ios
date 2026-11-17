@@ -29,11 +29,23 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             "authorization_present": self.headers.get("Authorization") is not None,
         })
         failed = "fail=1" in self.path
+        partial = "partial=1" in self.path
+        empty = "empty=1" in self.path
+        truncated = "truncated=1" in self.path
         body = b"temporary fixture failure" if failed else b"horizon-download-fixture"
+        if empty:
+            body = b""
         if "delay=1" in self.path:
             time.sleep(0.2)
-        self.send_response(503 if failed else 200)
-        self.send_header("Content-Length", str((2 << 30) + 1 if "oversized=1" in self.path else len(body)))
+        status = 503 if failed else 206 if partial else 204 if empty else 200
+        self.send_response(status)
+        if partial:
+            self.send_header("Content-Range", f"bytes 0-{len(body) - 1}/{len(body) * 2}")
+        if not empty:
+            length = (2 << 30) + 1 if "oversized=1" in self.path else len(body)
+            if truncated:
+                length *= 2
+            self.send_header("Content-Length", str(length))
         self.send_header("Content-Type", "application/zip")
         self.end_headers()
         self.wfile.write(body)

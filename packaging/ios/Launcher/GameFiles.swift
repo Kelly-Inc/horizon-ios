@@ -430,14 +430,22 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
                                 didFinishDownloadingTo location: URL) {
         // The file at `location` is gone once this returns: move it now, on this queue.
         let outcome: Result<URL, Error>
-        let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 200
+        let response = downloadTask.response as? HTTPURLResponse
+        let status = response?.statusCode ?? 0
         if downloadTask.countOfBytesReceived > Self.maximumArchiveBytes || downloadTask.countOfBytesExpectedToReceive > Self.maximumArchiveBytes {
             outcome = .failure(DownloadError("The archive exceeds the 2 GiB game-file limit."))
+        } else if response == nil {
+            outcome = .failure(DownloadError("The download did not receive an HTTP response."))
         } else if !(200..<300).contains(status) {
             let reason = status == 401 || status == 403
                 ? "The download server refused the request (\(status))."
                 : "The server answered \(status) \(HTTPURLResponse.localizedString(forStatusCode: status))."
             outcome = .failure(DownloadError(reason))
+        } else if status == 206 || response?.value(forHTTPHeaderField: "Content-Range") != nil {
+            // This downloader always requests the whole archive.
+            outcome = .failure(DownloadError("The server returned only part of the archive. Retry or use another link."))
+        } else if status == 204 || status == 205 {
+            outcome = .failure(DownloadError("The download server did not send an archive."))
         } else {
             do {
                 let destination = Self.destination

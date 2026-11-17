@@ -449,6 +449,7 @@ final class LauncherAsyncTests: XCTestCase {
         try sentinel.write(to: shared)
         defer { if let previous { try? previous.write(to: shared) } else { try? FileManager.default.removeItem(at: shared) } }
         let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: source) }
         try Data("stale-download".utf8).write(to: source)
         let imported = expectation(description: "Stale completion must not import")
         imported.isInverted = true
@@ -963,6 +964,37 @@ final class AutomaticGameFilesTests: XCTestCase {
         if case .done = model.state {} else { XCTFail("Download did not finish: \(model.state)") }
         XCTAssertEqual(model.link, "https://example.invalid/private.zip")
         XCTAssertEqual(model.token, "private-test-token")
+    }
+
+    func testIncompleteHTTPResponsesDoNotReachTheImporter() async throws {
+        let restore = temporarilyRemoveResourceMarker()
+        defer { restore() }
+        guard let url = ProcessInfo.processInfo.environment["HORIZON_DOWNLOAD_FIXTURE_URL"] else {
+            throw XCTSkip("Requires the loopback download fixture")
+        }
+        for (query, reason) in [
+            ("partial=1", "only part of the archive"),
+            ("empty=1", "did not send an archive"),
+            ("truncated=1", nil),
+        ] {
+            var imports = 0
+            let model = GameFilesDownload(importArchive: { _ in
+                imports += 1
+                return ["ok": true, "kind": "resources"]
+            }, automaticSource: { ["url": url + "?" + query] })
+            defer { model.cancel() }
+            await model.startAutomatic()
+            let deadline = Date().addingTimeInterval(10)
+            while model.busy, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertEqual(imports, 0, query)
+            guard case let .failed(message) = model.state else {
+                XCTFail("Expected a download failure for \(query), got \(model.state)")
+                continue
+            }
+            if let reason { XCTAssertTrue(message.contains(reason), message) }
+        }
     }
 
     func testFilesArrivingDuringTransferDoNotGetReplaced() async throws {

@@ -90,9 +90,14 @@ final class MicrosoftAccount: ObservableObject {
         cancel()
         renewals.removeValue(forKey: account.uuid)?.cancel()
         do {
-            try vault.remove(account.uuid)
-            if legacyProfile?.uuid == account.uuid {
+            let hasLegacyRecord = legacyProfile?.uuid == account.uuid
+            if hasLegacyRecord {
+                // A failed legacy deletion must leave the current credential
+                // in place. Otherwise migration could copy an older token back.
                 try vault.remove("account")
+            }
+            try vault.remove(account.uuid)
+            if hasLegacyRecord {
                 defaults.removeObject(forKey: "microsoftProfile")
                 legacyProfile = nil; migrationPending = false
             }

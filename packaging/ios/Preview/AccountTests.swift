@@ -26,12 +26,16 @@ private final class PreparedGameFilesFixture {
 private final class MemoryAccountVault: AccountVault {
     var values: [String: AccountSecrets] = [:]
     var failWrites = false
+    var refusedRemovals: Set<String> = []
     func read(_ account: String) throws -> AccountSecrets? { values[account] }
     func write(_ secrets: AccountSecrets, for account: String) throws {
         if failWrites { throw AccountError("Fixture storage failure") }
         values[account] = secrets
     }
-    func remove(_ account: String) throws { values.removeValue(forKey: account) }
+    func remove(_ account: String) throws {
+        if refusedRemovals.contains(account) { throw AccountError("Fixture removal failure") }
+        values.removeValue(forKey: account)
+    }
 }
 
 private final class AuthURLProtocol: URLProtocol {
@@ -333,6 +337,34 @@ final class AccountTests: XCTestCase {
         try await account.handOver()
         XCTAssertTrue(vault.values.isEmpty); XCTAssertTrue(account.accounts.isEmpty)
         XCTAssertNil(defaults.data(forKey: "microsoftProfile")); XCTAssertNil(account.profile)
+    }
+
+    func testFailedLegacyRemovalKeepsTheNewerCredentialUntilRemovalCanRetry() async throws {
+        try seed(expired: false)
+        defaults.set(try JSONEncoder().encode(alice), forKey: "microsoftProfile")
+        let current = try XCTUnwrap(vault.values[alice.uuid])
+        vault.values["account"] = AccountSecrets(refresh: "fixture-stale-refresh", token: "fixture-stale-access",
+                                                 expires: instant)
+        vault.refusedRemovals = ["account"]
+        let account = model()
+        await account.remove(alice)
+
+        XCTAssertEqual(account.profile, alice)
+        XCTAssertEqual(vault.values[alice.uuid], current)
+        XCTAssertNotNil(vault.values["account"])
+        XCTAssertTrue(bridgeCommands.isEmpty)
+        XCTAssertEqual(account.state, .failed("Fixture removal failure"))
+
+        vault.refusedRemovals = []
+        let relaunched = model()
+        try await relaunched.handOver()
+        XCTAssertTrue(bridgeCommands.last?.contains(current.token) == true)
+        XCTAssertNil(vault.values["account"])
+        await relaunched.remove(alice)
+        XCTAssertNil(vault.values[alice.uuid])
+        XCTAssertEqual(relaunched.accounts, [bob])
+        XCTAssertNil(relaunched.profile)
+        XCTAssertEqual(bridgeCommands.last, "launcher-session off")
     }
 
     func testSuccessfulSignInRepairsMissingSelectedAccount() async throws {

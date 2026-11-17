@@ -1,29 +1,43 @@
-use std::{hash::Hash, path::Path};
+use std::{collections::HashSet, fs, hash::Hash, path::Path};
 
 pub(super) fn walk(path: &Path, hasher: &mut std::hash::DefaultHasher) -> Option<()> {
-    let meta = std::fs::metadata(path).ok()?;
-    path.hash(hasher);
-    if meta.is_dir() {
-        let mut entries: Vec<_> = std::fs::read_dir(path)
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        entries.sort();
-        for entry in entries {
-            walk(&entry, hasher)?;
-        }
-    } else {
-        meta.len().hash(hasher);
-        meta.modified().ok()?.hash(hasher);
-        // Replacing a ZIP can preserve both size and mtime.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            meta.dev().hash(hasher);
-            meta.ino().hash(hasher);
-            meta.ctime().hash(hasher);
-            meta.ctime_nsec().hash(hasher);
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let mut pending = vec![path.to_owned()];
+    let mut visited = HashSet::new();
+    while let Some(path) = pending.pop() {
+        let meta = fs::metadata(&path).ok()?;
+        path.hash(hasher);
+        if meta.is_dir() {
+            // Follow linked shader directories, but do not walk the same
+            // filesystem directory twice through links or junctions.
+            #[cfg(unix)]
+            let identity = (meta.dev(), meta.ino());
+            #[cfg(not(unix))]
+            let identity = fs::canonicalize(&path).ok()?;
+            identity.hash(hasher);
+            if !visited.insert(identity) {
+                continue;
+            }
+            let mut entries = fs::read_dir(&path)
+                .ok()?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            entries.sort_unstable();
+            pending.extend(entries.into_iter().rev());
+        } else {
+            meta.len().hash(hasher);
+            meta.modified().ok()?.hash(hasher);
+            // Replacing a ZIP can preserve both size and mtime.
+            #[cfg(unix)]
+            {
+                meta.dev().hash(hasher);
+                meta.ino().hash(hasher);
+                meta.ctime().hash(hasher);
+                meta.ctime_nsec().hash(hasher);
+            }
         }
     }
     Some(())
@@ -59,6 +73,30 @@ mod tests {
         fs::rename(replacement, &zip).unwrap();
         assert_eq!(fs::metadata(&zip).unwrap().modified().unwrap(), mtime);
         assert_ne!(stamp(&zip), old);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn linked_shader_directories_are_fingerprinted_without_following_cycles() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("horizon-source-link-{}", std::process::id()));
+        let pack = dir.join("pack");
+        let assets = dir.join("assets");
+        fs::create_dir_all(&pack).unwrap();
+        fs::create_dir(&assets).unwrap();
+        let shader = assets.join("final.fsh");
+        fs::write(&shader, "first source").unwrap();
+        symlink(&assets, pack.join("linked")).unwrap();
+        symlink(&pack, assets.join("cycle")).unwrap();
+        let stamp = || {
+            let mut hash = DefaultHasher::new();
+            walk(&pack, &mut hash).unwrap();
+            hash.finish()
+        };
+        let old = stamp();
+        assert_eq!(stamp(), old);
+        fs::write(&shader, "replacement source").unwrap();
+        assert_ne!(stamp(), old);
         fs::remove_dir_all(dir).unwrap();
     }
 }

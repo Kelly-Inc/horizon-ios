@@ -28,7 +28,6 @@ final class MicrosoftAccount: ObservableObject {
     private var selection = UUID()
     private var renewals: [String: Task<(Profile, AccountSecrets), Error>] = [:]
     private var transfer: Task<Void, Error>?
-    private var migrationPending = false
     private var legacyProfile: Profile?
     private var invalidSelection = false
     var needsAccountSelection: Bool { invalidSelection }
@@ -55,8 +54,9 @@ final class MicrosoftAccount: ObservableObject {
             accounts = [old]; profile = old
         }
         if let data = defaults.data(forKey: "microsoftProfile"),
-           let old = try? JSONDecoder().decode(Profile.self, from: data) {
-            legacyProfile = old; migrationPending = true
+           let old = try? JSONDecoder().decode(Profile.self, from: data),
+           accounts.contains(where: { $0.uuid == old.uuid }) {
+            legacyProfile = old
             do { try migrate() } catch { state = .failed(error.localizedDescription) }
         }
     }
@@ -65,7 +65,7 @@ final class MicrosoftAccount: ObservableObject {
                      forKey: "microsoftAccounts.v2")
     }
     private func migrate() throws {
-        guard migrationPending, let old = legacyProfile else { return }
+        guard let old = legacyProfile, profile?.uuid == old.uuid else { return }
         // Copy successfully before removing either legacy record. A locked
         // Keychain leaves migration retryable and the original credentials intact.
         if try vault.read(old.uuid) == nil {
@@ -75,9 +75,15 @@ final class MicrosoftAccount: ObservableObject {
             try vault.write(secrets, for: old.uuid)
         }
         try saveCatalog()
-        try vault.remove("account")
-        defaults.removeObject(forKey: "microsoftProfile")
-        migrationPending = false; legacyProfile = nil
+        do {
+            try vault.remove("account")
+            defaults.removeObject(forKey: "microsoftProfile")
+            legacyProfile = nil
+        } catch {
+            // The usable credential is already saved. Keep the marker so a
+            // later Play or explicit removal can finish cleaning up.
+            Diagnostics.record("Legacy Microsoft account cleanup will retry.")
+        }
     }
     func cancel() {
         generation = UUID(); signing?.cancel(); signing = nil; state = .idle
@@ -101,7 +107,7 @@ final class MicrosoftAccount: ObservableObject {
             renewals.removeValue(forKey: account.uuid)?.cancel()
             if hasLegacyRecord {
                 defaults.removeObject(forKey: "microsoftProfile")
-                legacyProfile = nil; migrationPending = false
+                legacyProfile = nil
             }
             accounts.removeAll { $0.uuid == account.uuid }
             if profile?.uuid == account.uuid { selection = UUID(); profile = nil }

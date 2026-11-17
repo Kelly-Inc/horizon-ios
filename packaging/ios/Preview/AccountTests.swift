@@ -171,6 +171,47 @@ final class AccountTests: XCTestCase {
         XCTAssertNil(defaults.data(forKey: "microsoftProfile"))
         XCTAssertEqual(model().profile, alice)
     }
+
+    func testUnusableLegacyAccountDoesNotBlockAnotherAccountOrOfflinePlay() async throws {
+        try seed(expired: false)
+        defaults.set(try JSONEncoder().encode(MicrosoftAccount.Catalog(
+            profiles: [alice, bob], selected: bob.uuid)), forKey: "microsoftAccounts.v2")
+        defaults.set(try JSONEncoder().encode(alice), forKey: "microsoftProfile")
+        vault.values[alice.uuid] = nil
+
+        let account = model()
+        XCTAssertEqual(account.state, .idle)
+        try await account.handOver()
+        XCTAssertTrue(bridgeCommands.last?.contains("fixture-bob-access") == true)
+        await account.signOut()
+        XCTAssertEqual(bridgeCommands.last, "launcher-session off")
+        account.select(alice)
+        do {
+            try await account.handOver()
+            XCTFail("the selected legacy account has no credential")
+        } catch {
+            XCTAssertTrue((error as? AccountError)?.reauthenticate == true)
+        }
+        XCTAssertEqual(bridgeCommands.count, 2)
+    }
+
+    func testCurrentCredentialIsUsableWhileLegacyCleanupIsDeferred() async throws {
+        defaults.set(try JSONEncoder().encode(alice), forKey: "microsoftProfile")
+        vault.values["account"] = AccountSecrets(refresh: "fixture-legacy", token: "fixture-usable",
+                                                  expires: instant.addingTimeInterval(7200))
+        vault.refusedRemovals = ["account"]
+        let account = model()
+        try await account.handOver()
+        XCTAssertTrue(bridgeCommands.last?.contains("fixture-usable") == true)
+        XCTAssertNotNil(vault.values[alice.uuid])
+        XCTAssertNotNil(vault.values["account"])
+        XCTAssertNotNil(defaults.data(forKey: "microsoftProfile"))
+
+        vault.refusedRemovals = []
+        try await account.handOver()
+        XCTAssertNil(vault.values["account"])
+        XCTAssertNil(defaults.data(forKey: "microsoftProfile"))
+    }
     func testSwitchDuringRefreshCannotTransferOldSelection() async throws {
         try seed(); network(); let account = model()
         let requested = expectation(description: "refresh started")

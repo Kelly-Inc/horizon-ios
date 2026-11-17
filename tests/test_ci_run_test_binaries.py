@@ -64,7 +64,7 @@ class RunTestBinariesTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "requires a POSIX shell")
     def test_every_binary_runs_and_each_failure_is_listed_at_the_end(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             package = root / "crates/horizon-world"
             package.mkdir(parents=True)
             passing, failing, unstartable = root / "passing", root / "failing", root / "unstartable"
@@ -93,6 +93,7 @@ class RunTestBinariesTests(unittest.TestCase):
 
     def test_report_names_failed_tests_with_or_without_a_time(self):
         output = tempfile.TemporaryFile("w+")
+        self.addCleanup(output.close)
         output.write("test a::fast ... ok <0.012s>\ntest a::bad ... FAILED <0.100s>\ntest a::plain ... FAILED\n"
                      "child output test a::x ... FAILED\n")
         result = {"binary": {"label": "pkg"}, "output": output, "seconds": 1.0, "max_rss_kib": 0}
@@ -128,6 +129,7 @@ class RunTestBinariesTests(unittest.TestCase):
             binary.chmod(0o755)
             result = runner.run_one({"executable": str(binary), "cwd": directory, "env": {}, "libtest": False},
                                     {}, ["-Z", "unstable-options", "--report-time"], timed=True)
+            self.addCleanup(result["output"].close)
             self.assertNotIn("listed", result)
             self.assertEqual(runner.untimed(result), [])
 

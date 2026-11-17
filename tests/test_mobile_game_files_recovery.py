@@ -16,23 +16,18 @@ class GameFilesRecoveryTests(unittest.TestCase):
         link = (ROOT / 'packaging/ios/Launcher/GameLink.swift').read_text()
         files = (ROOT / 'packaging/ios/Launcher/GameFiles.swift').read_text()
         gate = swift_block(link, link.index('    private func beginLaunch('))
+        needs_files = swift_block(link, link.index('    var needsGameFiles:'))
         importer = swift_block(files, files.index('    func importPreparedFile('))
         failure = swift_block(files, files.index('    var automaticFailure:'))
         source = r'''
 import Foundation
-struct Phase: Equatable {
- let value:Int
- static let waiting=Self(value:0), title=Self(value:1), world=Self(value:2), loading=Self(value:3)
-}
-'''
-        # Production uses an associated-value enum; keep its real matching semantics.
-        source = source[:source.index('struct Phase')] + r'''
 enum Phase: Equatable {case waiting,title,world,loading,needsFiles(String?)}
 enum GameFolder {static var hasGameFiles=false}
 final class LaunchAttempt {}
 final class Gate {
  var phase=Phase.waiting;var requestingGameFiles=false
  var launching:String?;var currentLaunch:LaunchAttempt?;var phaseEpoch=UUID()
+ NEEDS_FILES
  GATE
  func launch()->Bool {beginLaunch("Play") != nil}
 }
@@ -62,6 +57,8 @@ enum Diagnostics {static func redact(_ text:String)->String{text}}
    let g=Gate();g.phase=phase;GameFolder.hasGameFiles=false
    precondition(!g.launch());precondition(g.requestingGameFiles);precondition(g.launching == nil)
   }
+  let rejected=Gate();rejected.phase = .needsFiles("Rejected");GameFolder.hasGameFiles=true
+  precondition(!rejected.launch());precondition(rejected.requestingGameFiles)
   for phase in [Phase.waiting,.title,.world,.loading] {
    let g=Gate();g.phase=phase;GameFolder.hasGameFiles=true
    precondition(g.launch());precondition(!g.requestingGameFiles)
@@ -94,7 +91,7 @@ enum Diagnostics {static func redact(_ text:String)->String{text}}
  }
 }
 '''
-        source = source.replace('GATE', gate).replace('IMPORTER', importer).replace('FAILURE', failure)
+        source = source.replace('NEEDS_FILES', needs_files).replace('GATE', gate).replace('IMPORTER', importer).replace('FAILURE', failure)
         with tempfile.TemporaryDirectory(prefix='horizon-recovery-') as directory:
             probe = Path(directory) / 'probe.swift'
             binary = Path(directory) / 'probe'

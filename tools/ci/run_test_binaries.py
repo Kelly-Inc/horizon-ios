@@ -166,7 +166,9 @@ def run_one(binary: dict, extra_env: dict, test_args: list[str], timed: bool = F
     _, wait_status, usage = os.wait4(process.pid, 0)
     process.returncode = code = os.waitstatus_to_exitcode(wait_status)
     status = "ok" if code == 0 else f"killed by signal {-code}" if code < 0 else f"exit {code}"
-    result.update(status=status, seconds=time.monotonic() - started, max_rss_kib=usage.ru_maxrss)
+    # Darwin reports bytes; Linux reports KiB.
+    peak_rss_kib = usage.ru_maxrss // 1024 if sys.platform == "darwin" else usage.ru_maxrss
+    result.update(status=status, seconds=time.monotonic() - started, max_rss_kib=peak_rss_kib)
     if log:
         result["log"] = read_log(Path(log).read_text(errors="replace"))
         os.unlink(log)

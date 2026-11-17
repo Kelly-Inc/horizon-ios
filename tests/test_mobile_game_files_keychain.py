@@ -23,9 +23,13 @@ def swift_block(source, start):
 
 def program(source=None):
     source = source or (ROOT / "packaging/ios/Launcher/GameFiles.swift").read_text()
+    origin = swift_block(source, source.index("struct GameFilesOrigin"))
+    credential = swift_block(source, source.index("struct GameFilesCredential"))
     vault = swift_block(source, source.index("private enum Keychain"))
     start = swift_block(source, source.index("    func start()"))
-    return PREAMBLE + vault + "\nfinal class StartProbe {\n" + START_STUBS + swift_block(source, source.index("    nonisolated static func errorFacts(")) + "\n" + start + "\n}\n" + CASES
+    error_facts = swift_block(source, source.index("    nonisolated static func errorFacts("))
+    return "\n".join((PREAMBLE, origin, credential, vault, "final class StartProbe {",
+                      START_STUBS, error_facts, start, "}", CASES))
 
 
 PREAMBLE = r'''
@@ -96,29 +100,36 @@ func trace(_ event:String) {diagnosticEvents.append(event)}
  func begin(url:URL,token:String?){requests.append((url,token))}
 '''
 CASES = r'''
+let fixtureOrigin = GameFilesOrigin(URL(string: "https://fixture.invalid/archive.zip"))!
+func credential(_ token: String) -> GameFilesCredential {
+ GameFilesCredential(origin: fixtureOrigin, token: token)
+}
 var failures=0
 func expect(_ value:Bool,_ message:String){if !value{failures+=1;print("FAIL: \(message)")}}
 func expectFailure(_ action:() throws -> Void,_ message:String){do{try action();expect(false,message)}catch{}}
 func check(_ name:String,_ action:() throws -> Void){SecurityFixture.reset();do{try action()}catch{expect(false,"\(name): unexpected error \(error)")}}
 check("failed replacement"){
+ expect(Keychain.read(for: fixtureOrigin) == nil,"legacy token has no proven origin")
  SecurityFixture.update=errSecInteractionNotAllowed
- expectFailure({try Keychain.write("replacement")},"failed replacement must throw")
+ expectFailure({try Keychain.write(credential("replacement"))},"failed replacement must throw")
  expect(SecurityFixture.data == Data("old-working-token".utf8),"failed replacement must preserve prior credential")
  expect(SecurityFixture.calls == ["update"],"permission failure must not delete or add")
 }
 check("successful replacement"){
- try Keychain.write("replacement")
- expect(SecurityFixture.data == Data("replacement".utf8),"replacement persisted")
+ try Keychain.write(credential("replacement"))
+ expect(Keychain.read(for: fixtureOrigin) == "replacement","replacement persisted")
  expect(SecurityFixture.calls == ["update"],"existing item updates atomically")
+ let otherOrigin = GameFilesOrigin(URL(string: "https://other.invalid/archive.zip"))
+ expect(Keychain.read(for: otherOrigin) == nil,"credential is restricted to its original host")
 }
 check("new credential"){
- SecurityFixture.data=nil;try Keychain.write("new")
- expect(SecurityFixture.data == Data("new".utf8),"new credential added")
+ SecurityFixture.data=nil;try Keychain.write(credential("new"))
+ expect(Keychain.read(for: fixtureOrigin) == "new","new credential added")
  expect(SecurityFixture.calls == ["update","add"],"add only after missing item")
 }
 check("failed add"){
  SecurityFixture.data=nil;SecurityFixture.add=errSecInteractionNotAllowed
- expectFailure({try Keychain.write("new")},"add failure must throw")
+ expectFailure({try Keychain.write(credential("new"))},"add failure must throw")
  expect(SecurityFixture.data == nil,"failed add leaves no credential")
 }
 check("failed clear"){
@@ -141,7 +152,7 @@ check("successful save starts download"){
  let model=StartProbe();model.start()
  expect(model.requests.count == 1,"saved credential starts one download")
  expect(model.requests.first?.1 == "replacement-token","download uses trimmed token")
- expect(SecurityFixture.data == Data("replacement-token".utf8),"saved token matches request")
+ expect(Keychain.read(for: fixtureOrigin) == "replacement-token","saved token matches request")
  expect(UserDefaults.standard.values["gameFilesLink"] == "https://fixture.invalid/archive.zip","saved link matches request")
 }
 if failures > 0 {exit(1)}

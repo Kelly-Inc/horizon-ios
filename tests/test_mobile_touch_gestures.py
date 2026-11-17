@@ -77,6 +77,9 @@ impl Game{
  fn touch_grab(&mut self){}
  fn touch_queue_cursor_button(&mut self,b:MouseButton,down:bool){self.note();self.events.push(Event::Menu(b,down));}
  fn touch_scroll(&mut self,_:&dyn EventLoopCtl,x:f32,y:f32){self.events.push(Event::Scroll(x,y));}
+ // The cursor adapter is exercised separately in test_mobile_virtual_cursor.
+ fn touch_cursor_reset(&mut self){self.touch.cursor_screen=None;}
+ fn touch_cursor_flush(&mut self,_:&dyn EventLoopCtl){}
  fn toggle_system_keyboard(&mut self){self.events.push(Event::Keyboard);}
  fn sample(&mut self,kind:u8,phase:u8,slot:i8,age:f64){horizon_ios_launcher::QUEUE.lock().unwrap().push(horizon_ios_launcher::Gesture{kind,phase,slot,point:(0.5,-0.25),age,context:0,modifiers:0,touch:0});self.touch_native_frame(&Loop);}
  fn tap(&mut self,point:(f64,f64),context:u64,modifiers:u32,touch:u64){horizon_ios_launcher::QUEUE.lock().unwrap().push(horizon_ios_launcher::Gesture{kind:1,phase:3,slot:-1,point,age:0.,context,modifiers,touch});self.touch_native_frame(&Loop);}
@@ -114,7 +117,7 @@ fn main(){
  g.touch_native_input(&Loop,Physical::CustomKey(81,false));assert_eq!(g.events.last(),Some(&Key(KeyCode::KeyQ,false)));
  // Native queue overflow/cancellation releases each hold once.
  let mut g=Game{playing:true,..Game::default()};
- g.sample(2,1,-1,0.);g.sample(0,4,-1,0.);assert_eq!(g.events,[Button(Left,true),Button(Left,false)]);
+ g.sample(2,1,-1,0.);g.touch.cursor_screen=Some(g.key);g.sample(0,4,-1,0.);assert!(g.touch.cursor_screen.is_none());assert_eq!(g.events,[Button(Left,true),Button(Left,false)]);
  // A menu tap carries the modifiers UIKit reported for it, and they do not outlive its delivery.
  let mut g=Game::default();g.tap((0.,0.),0,1|4,0);assert_eq!(g.events,[Menu(Left,true)]);assert_eq!(g.seen[0].0,5);assert_eq!(g.modifiers.0,0);assert!(g.touch.cursor_delivery.is_none());
  // A tap made against a recorded context is delivered with that context: a cursor dragged by the

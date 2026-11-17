@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 
-use super::{Installed, MAX_PACKED, Pack, sanitize};
+use super::{Installed, MAX_PACKED, Pack, park_failed_archive, sanitize, unique, with_home_access};
 
 /// The most a sender may put in the request line and headers.
 const MAX_HEADER: usize = 16 * 1024;
@@ -373,7 +373,6 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
             .trim_end_matches(".zip"),
     );
     let part = line.home.join(".import").join(format!("{name}.zip.part"));
-    let archive = line.home.join(format!("{name}.zip"));
     // Everything that could refuse this has been refused, so the body is wanted: say so.
     if request.expect == "100-continue" {
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
@@ -388,16 +387,23 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
     }
     // Land it where the cable route lands it, and let one path unpack it: a phone that dies between
     // these two lines still leaves an archive in `Documents` for the next launch to install.
-    let installed = fs::rename(&part, &archive)
-        .and_then(|()| {
-            Pack::open(&archive)
-                .map_err(|error| io::Error::other(error.to_string()))?
-                .install(&line.home)
-                .map_err(|error| io::Error::other(error.to_string()))
-        })
-        .inspect(|installed| {
-            let _ = line.sender.send(News::Installed(installed.clone()));
-        });
+    let mut landed = None;
+    let installed = with_home_access(&line.home, || {
+        let mut archive = line.home.join(format!("{name}.zip"));
+        if super::download::reserved_archive(&archive) {
+            archive = line.home.join(format!("Upload {name}.zip"));
+        }
+        let archive = unique(&archive);
+        fs::rename(&part, &archive)?;
+        Ok(archive)
+    })
+    .and_then(|archive| {
+        landed = Some(archive.clone());
+        Pack::open(&archive)?.install(&line.home)
+    })
+    .inspect(|installed| {
+        let _ = line.sender.send(News::Installed(installed.clone()));
+    });
     match installed {
         Ok(installed) => respond(
             stream,
@@ -410,7 +416,16 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
         ),
         Err(error) => {
             // Park it the way the startup scan does, so the same failure is not retried every launch.
-            let _ = fs::rename(&archive, archive.with_extension("zip.failed"));
+            if let Some(archive) = landed {
+                if let Err(park_error) = park_failed_archive(&line.home, &archive) {
+                    log::warn!(
+                        "Horizon: could not park failed upload {}: {park_error}",
+                        archive.display()
+                    );
+                }
+            } else {
+                let _ = fs::remove_file(&part);
+            }
             let message = format!("the phone could not use that archive: {error}");
             let _ = line.sender.send(News::Refused {
                 error: message.clone(),
@@ -742,6 +757,9 @@ mod tests {
         zip.write_all(b"jpeg").unwrap();
         zip.finish().unwrap();
         let body = fs::read(home.join("photos.zip")).unwrap();
+        // A cable import and an older failed upload may already have these names.
+        fs::write(home.join("photos.zip"), b"existing archive").unwrap();
+        fs::write(home.join("photos (2).zip.failed"), b"earlier failed upload").unwrap();
         let reply = ask(
             session.port(),
             format!(
@@ -753,8 +771,19 @@ mod tests {
             &body,
         );
         assert!(reply.starts_with(&header(422)), "{reply}");
-        assert!(!home.join("photos.zip").exists());
-        assert!(home.join("photos.zip.failed").is_file());
+        assert_eq!(
+            fs::read(home.join("photos.zip")).unwrap(),
+            b"existing archive"
+        );
+        assert!(!home.join("photos (2).zip").exists());
+        assert_eq!(
+            fs::read(home.join("photos (2).zip.failed")).unwrap(),
+            b"earlier failed upload"
+        );
+        assert_eq!(
+            fs::read(home.join("photos (2).zip (2).failed")).unwrap(),
+            body
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

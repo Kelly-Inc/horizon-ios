@@ -645,7 +645,8 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
 
 /// `path`, or `path (2)` if it is taken, then `path (3)` and so on.
 fn unique(path: &Path) -> PathBuf {
-    if !path.exists() {
+    let taken = |path: &Path| path.exists() || path.is_symlink();
+    if !taken(path) {
         return path.to_owned();
     }
     let stem = path
@@ -660,11 +661,19 @@ fn unique(path: &Path) -> PathBuf {
             None => format!("{stem} ({index})"),
         };
         let candidate = path.with_file_name(name);
-        if !candidate.exists() {
+        if !taken(&candidate) {
             return candidate;
         }
         index += 1;
     }
+}
+
+fn park_failed_archive(home: &Path, archive: &Path) -> Result<PathBuf> {
+    with_home_access(home, || {
+        let parked = unique(&archive.with_extension("zip.failed"));
+        fs::rename(archive, &parked)?;
+        Ok(parked)
+    })
 }
 
 /// Rename, with a copy when the two ends are on different volumes: a pack pulled off a USB stick is
@@ -911,15 +920,17 @@ pub fn scan(home: &Path) -> Vec<Installed> {
                 );
                 installed.push(placed);
             }
-            Err(error) => {
-                let parked = path.with_extension("zip.failed");
-                log::error!(
+            Err(error) => match park_failed_archive(home, &path) {
+                Ok(parked) => log::error!(
                     "Horizon: {} would not import: {error}; leaving it as {}",
                     path.display(),
-                    parked.file_name().unwrap_or_default().to_string_lossy()
-                );
-                let _ = fs::rename(&path, &parked);
-            }
+                    parked.display()
+                ),
+                Err(park_error) => log::error!(
+                    "Horizon: {} would not import: {error}; could not park it: {park_error}",
+                    path.display()
+                ),
+            },
         }
     }
     installed
@@ -2079,10 +2090,17 @@ mod tests {
         assert!(error.contains("escapes"), "{error}");
         assert!(!home.join("resources").exists());
         assert!(!home.join("outside.txt").exists());
+        let first_failure = home.join("horizon.zip.failed");
+        fs::write(&first_failure, b"earlier archive").unwrap();
+        let original = fs::read(&archive).unwrap();
         // The next launch must not fail in the same place all over again, so it is put aside.
         assert!(scan(&home).is_empty());
         assert!(!archive.exists());
-        assert!(home.join("horizon.zip.failed").is_file());
+        assert_eq!(fs::read(first_failure).unwrap(), b"earlier archive");
+        assert_eq!(
+            fs::read(home.join("horizon.zip (2).failed")).unwrap(),
+            original
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

@@ -146,17 +146,26 @@ final class MicrosoftAccount: ObservableObject {
                     ])
                     command = "launcher-session " + String(decoding: data, as: UTF8.self)
                 } else { command = "launcher-session off" }
+                try Task.checkCancellation()
                 let answer = await self.bridge(command)
+                try Task.checkCancellation()
                 guard self.selection == epoch else { throw CancellationError() }
                 guard answer["ok"] as? Bool == true, answer.error == nil else {
                     throw AccountError("The game could not accept your account. Try Play again.")
                 }
             }
             transfer = task
-            try await task.value
+            defer { if transfer == task { transfer = nil } }
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            try Task.checkCancellation()
             guard selection == epoch else { throw CancellationError() }
             state = .idle
         } catch {
+            if Task.isCancelled { throw CancellationError() }
             if selection == epoch, !(error is CancellationError) { state = .failed(error.localizedDescription) }
             throw error
         }

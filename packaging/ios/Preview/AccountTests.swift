@@ -344,17 +344,43 @@ final class AccountTests: XCTestCase {
     }
     func testCancelLaunchWhilePreparingDoesNotUncover() async throws {
         let game = GameLink(); var uncovered = false
+        var preparationCancelled = false
         let started = expectation(description: "preparing")
         var continuation: CheckedContinuation<Void, Never>?
         game.prepareSession = {
             started.fulfill()
             await withCheckedContinuation { continuation = $0 }
+            preparationCancelled = Task.isCancelled
         }
         game.uncover = { uncovered = true }
         let play = Task { await game.play() }
         await fulfillment(of: [started], timeout: 3)
         game.cancelLaunch(); continuation?.resume(); await play.value
+        XCTAssertTrue(preparationCancelled)
         XCTAssertFalse(uncovered); XCTAssertEqual(game.phase, .unknown)
+    }
+
+    func testCancelDuringAccountHandoffDoesNotReportALateBridgeFailure() async throws {
+        try seed(expired: false)
+        let submitted = expectation(description: "account handoff submitted")
+        var reply: CheckedContinuation<[String: Any], Never>?
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session,
+                                       clock: { self.instant }, client: "fixture-client") { _ in
+            await withCheckedContinuation {
+                reply = $0
+                submitted.fulfill()
+            }
+        }
+        let handoff = Task { try await account.handOver() }
+        await fulfillment(of: [submitted], timeout: 3)
+        handoff.cancel()
+        reply?.resume(returning: ["error": "late bridge failure"])
+        do {
+            try await handoff.value
+            XCTFail("the cancelled handoff should throw")
+        } catch is CancellationError {
+            XCTAssertEqual(account.state, .idle)
+        }
     }
 
     func testSuccessfulAddPersistsSeparateCredentialAndCanSwitchBack() async throws {

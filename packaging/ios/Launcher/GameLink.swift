@@ -114,6 +114,7 @@ final class GameLink: ObservableObject {
         var cancelled = false
         var presented = false
         var failure: String?
+        var preparation: Task<Void, Error>?
         var cleanup: Task<Void, Never>?
     }
     private var currentLaunch: LaunchAttempt?
@@ -254,7 +255,19 @@ final class GameLink: ObservableObject {
     }
 
     private func start(_ attempt: LaunchAttempt) async throws {
-        try await prepareSession()
+        try check(attempt)
+        let prepare = prepareSession
+        let preparation = Task { @MainActor in
+            try Task.checkCancellation()
+            try await prepare()
+        }
+        attempt.preparation = preparation
+        defer { attempt.preparation = nil }
+        try await withTaskCancellationHandler {
+            try await preparation.value
+        } onCancel: {
+            preparation.cancel()
+        }
         try check(attempt)
         // The cached phase can predate Quit/reset. Ask the backend on every
         // intent, and assign ownership before it is allowed to start loading.
@@ -322,6 +335,7 @@ final class GameLink: ObservableObject {
         attempt.cancelled = true
         if queued?.id == attempt.id { queued = nil }
         guard attempt.submitted else {
+            attempt.preparation?.cancel()
             currentLaunch = nil
             phaseEpoch = UUID()
             launching = nil

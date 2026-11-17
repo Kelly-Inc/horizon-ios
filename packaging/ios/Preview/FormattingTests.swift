@@ -394,6 +394,32 @@ final class PackMutationTests: XCTestCase {
 
 @MainActor
 final class AutomaticGameFilesTests: XCTestCase {
+    func testCustomDownloadRejectsBearerTokenOverHTTP() {
+        let model = GameFilesDownload(diagnostic: { _ in })
+        model.link = "http://127.0.0.1:1/files.zip"
+        model.token = "private-test-token"
+        model.start()
+        XCTAssertEqual(model.state, .failed("Use an HTTPS link to download with an access token."))
+        XCTAssertFalse(model.busy)
+    }
+
+    func testRedirectOnlyKeepsAuthorizationOnTheSameHTTPSOrigin() {
+        let previous = URL(string: "https://files.example.invalid/archive")!
+        for (url, keepsAuthorization) in [
+            ("https://files.example.invalid:443/redirect", true),
+            ("https://files.example.invalid:444/redirect", false),
+            ("https://cdn.example.invalid/redirect", false),
+            ("http://files.example.invalid/redirect", false),
+        ] {
+            var redirect = URLRequest(url: URL(string: url)!)
+            redirect.setValue("Bearer fixture", forHTTPHeaderField: "Authorization")
+            let safe = GameFilesDownload.redirectRequest(redirect, from: previous)
+            XCTAssertEqual(safe.value(forHTTPHeaderField: "Authorization"),
+                           keepsAuthorization ? "Bearer fixture" : nil, url)
+            XCTAssertEqual(safe.url, redirect.url)
+        }
+    }
+
     func testDownloadErrorFactsKeepCodesButNeverIncludeCredentials() {
         let underlying = NSError(domain:NSPOSIXErrorDomain,code:61,userInfo:[NSLocalizedDescriptionKey:"private-password"])
         let error = NSError(domain:NSURLErrorDomain,code:NSURLErrorCannotConnectToHost,userInfo:[

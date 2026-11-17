@@ -116,6 +116,11 @@ final class GameFilesDownload: NSObject, ObservableObject {
             return
         }
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard token.isEmpty || scheme == "https" else {
+            trace("custom_source_rejected insecure_credential")
+            state = .failed("Use an HTTPS link to download with an access token.")
+            return
+        }
         do {
             try Keychain.write(token.isEmpty ? nil : token)
         } catch {
@@ -304,6 +309,26 @@ final class GameFilesDownload: NSObject, ObservableObject {
 }
 
 extension GameFilesDownload: URLSessionDownloadDelegate {
+    /// Keep the authorization header on the same HTTPS origin only.
+    nonisolated static func redirectRequest(_ request: URLRequest, from source: URL?) -> URLRequest {
+        var request = request
+        if let source, let host = source.host, let destination = request.url,
+           source.scheme?.lowercased() == "https", destination.scheme?.lowercased() == "https",
+           host.lowercased() == destination.host?.lowercased(),
+           (source.port ?? 443) == (destination.port ?? 443) {
+            return request
+        }
+        request.setValue(nil, forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask,
+                                willPerformHTTPRedirection response: HTTPURLResponse,
+                                newRequest request: URLRequest,
+                                completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(Self.redirectRequest(request, from: response.url))
+    }
+
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
         let id = session.sessionDescription ?? "unknown"
         func ms(_ start: Date?, _ end: Date?) -> Int {

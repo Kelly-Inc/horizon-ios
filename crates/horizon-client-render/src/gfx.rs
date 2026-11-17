@@ -1746,6 +1746,7 @@ pub struct Renderer {
     pack_generation: u64,
     shader_context: u64,
     shader_report: Option<(i32, Vec<String>, Vec<String>)>,
+    shader_activation_at_frame_boundary: bool,
     /// The post passes of one of Horizon's own shader packs; never beside `pack_post`'s.
     native: Option<Box<native_pack::NativePack>>,
     /// What it does in the renderer's place, kept from its install on (`replace_native`).
@@ -4682,6 +4683,7 @@ impl Renderer {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             shader_report: None,
+            shader_activation_at_frame_boundary: false,
             native: None,
             executor: None,
             pass_timing: false,
@@ -6398,6 +6400,7 @@ impl Renderer {
         self.pack_generation = self.pack_generation.wrapping_add(1);
         self.pack_compiler.cancel_queued();
         self.shader_report = None;
+        self.shader_activation_at_frame_boundary = false;
         self.replace_native(None);
         if let Some(post) = pack.as_ref().filter(|post| !post.complete) {
             let mut notes = post.notes.clone();
@@ -6484,6 +6487,19 @@ impl Renderer {
         });
         Ok(Some((Vec::new(),vec!["Compiling shader pipelines in the background. Normal rendering remains active until ready.".into()])))
     }
+    /// Queue a classic pack whose owner must accept the result before preparing a frame.
+    /// The owner calls `take_shader_report` to activate it alongside its CPU-side state.
+    pub fn set_shader_pack_at_frame_boundary(
+        &mut self,
+        dimension: i32,
+        post: horizon_shaders::Post,
+        block_ids: &[i32],
+    ) -> std::result::Result<Option<(Vec<String>, Vec<String>)>, pack_post::Refused> {
+        let result = self.set_shader_pack(dimension, Some(post), block_ids);
+        self.shader_activation_at_frame_boundary = result.is_ok();
+        result
+    }
+
     pub fn shader_context_key(&self) -> (u64, u64) {
         (self.shader_context, self.pack_generation)
     }
@@ -6495,7 +6511,9 @@ impl Renderer {
                 .as_ref()
                 .is_some_and(|state| state.0 == finished.dimension)
         {
+            self.shader_activation_at_frame_boundary = false;
             if finished.post.is_none() {
+                finished.programs.clear();
                 self.pack_material_atlases = None;
                 self.pack_atlas = None;
             }
@@ -6579,6 +6597,7 @@ impl Renderer {
         self.pack_generation = self.pack_generation.wrapping_add(1);
         self.pack_compiler.cancel_queued();
         self.shader_report = None;
+        self.shader_activation_at_frame_boundary = false;
         self.pack_post = None;
         self.pack_atlas = None;
         self.pack_material_atlases = None;
@@ -7078,7 +7097,9 @@ impl Renderer {
         if self.device_lost() {
             return Err("the graphics device was lost".into());
         }
-        self.poll_shader_compilation();
+        if !self.shader_activation_at_frame_boundary {
+            self.poll_shader_compilation();
+        }
         if let Some(request) = self.capture.take() {
             let result = self.write_capture(&request, frame);
             self.capture_result = Some(result.map_err(|e| e.to_string()));

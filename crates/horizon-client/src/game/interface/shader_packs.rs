@@ -406,6 +406,12 @@ pub(super) struct PackIds {
     pub(super) separate_ao: bool,
 }
 
+pub(super) struct PendingClassicPack {
+    path: std::path::PathBuf,
+    stamp: Option<u64>,
+    ids: PackIds,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct LoadKey {
     path: std::path::PathBuf,
@@ -632,20 +638,21 @@ impl Game<'_> {
             {
                 renderer.drop_shader_packs();
                 self.pack_ids = None;
-                self.native_shaders.classic_source = None;
+                self.native_shaders.pending_classic = None;
             }
             if let Some((dimension, programs, notes)) = renderer.take_shader_report() {
-                if let Some((path, stamp)) = &self.native_shaders.classic_source
-                    && path == &selected_path
-                    && *stamp == fingerprint(path)
+                if let Some(pending) = self.native_shaders.pending_classic.take()
+                    && pending.path == selected_path
+                    && pending.stamp == fingerprint(&pending.path)
                 {
-                    remember(path, *stamp, !programs.is_empty());
-                    if programs.is_empty() {
-                        self.pack_ids = None;
+                    let active = !programs.is_empty();
+                    remember(&pending.path, pending.stamp, active);
+                    self.pack_ids = active.then_some(pending.ids);
+                    if !active {
                         failed = Some((
                             selected.clone(),
-                            path.clone(),
-                            *stamp,
+                            pending.path,
+                            pending.stamp,
                             dimension,
                             notes.clone(),
                         ));
@@ -654,7 +661,7 @@ impl Game<'_> {
                 } else {
                     renderer.drop_shader_packs();
                     self.pack_ids = None;
-                    self.native_shaders.classic_source = None;
+                    self.native_shaders.pending_classic = None;
                 }
             }
             PENDING_LOAD.with_borrow_mut(|pending| {
@@ -787,7 +794,7 @@ impl Game<'_> {
             // dimension loaded without an active shader.
             if renderer.shader_pack_dimension() == Some(dimension) {
                 renderer.drop_shader_packs();
-                self.native_shaders.classic_source = None;
+                self.native_shaders.pending_classic = None;
                 self.pack_ids = None;
             }
             // Lava uses the solid terrain program. Supply its sprite layers before
@@ -833,16 +840,23 @@ impl Game<'_> {
                             &parsed.ids,
                         );
                         renderer.set_separate_ao(parsed.entity_ids.separate_ao);
-                        self.pack_ids = parsed.post.complete.then_some(parsed.entity_ids);
-                        self.native_shaders.classic_source = Some((path.clone(), stamp));
-                        match renderer.set_shader_pack(dimension, Some(parsed.post), &table) {
-                            Ok(Some((programs, notes))) => {
-                                if !programs.is_empty() {
-                                    remember(&path, stamp, true);
+                        self.pack_ids = None;
+                        self.native_shaders.pending_classic = None;
+                        match renderer.set_shader_pack_at_frame_boundary(
+                            dimension,
+                            parsed.post,
+                            &table,
+                        ) {
+                            Ok(report) => {
+                                self.native_shaders.pending_classic = Some(PendingClassicPack {
+                                    path: path.clone(),
+                                    stamp,
+                                    ids: parsed.entity_ids,
+                                });
+                                if let Some((programs, notes)) = report {
+                                    record_report(&name, dimension, &programs, &notes);
                                 }
-                                record_report(&name, dimension, &programs, &notes)
                             }
-                            Ok(None) => {}
                             Err(refused) => {
                                 let mut notes = refused.notes;
                                 notes.push(refused.reason.clone());
@@ -861,7 +875,7 @@ impl Game<'_> {
                     }
                     Err(_) if fingerprint(&path) != stamp => {
                         self.pack_ids = None;
-                        self.native_shaders.classic_source = None;
+                        self.native_shaders.pending_classic = None;
                         renderer.drop_shader_packs();
                     }
                     Err(error) => {
@@ -877,7 +891,7 @@ impl Game<'_> {
                             )
                         } else {
                             self.pack_ids = None;
-                            self.native_shaders.classic_source = None;
+                            self.native_shaders.pending_classic = None;
                             let _ = renderer.set_shader_pack(dimension, None, &[]);
                             true
                         };
@@ -1027,8 +1041,14 @@ impl Game<'_> {
             .pack_ids
             .as_ref()
             .is_some_and(|ids| ids.blocks.has_block_tags())
+            || self
+                .native_shaders
+                .pending_classic
+                .as_ref()
+                .is_some_and(|pack| pack.ids.blocks.has_block_tags())
         {
             self.pack_ids = None;
+            self.native_shaders.pending_classic = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
             }
@@ -1053,6 +1073,7 @@ impl Game<'_> {
         write_shader_options(&options);
         OPTIONS_REVISION.with(|revision| revision.set(revision.get().wrapping_add(1)));
         self.pack_ids = None;
+        self.native_shaders.pending_classic = None;
         if let Some(renderer) = &mut self.renderer {
             renderer.drop_shader_packs();
         }
@@ -1072,7 +1093,7 @@ impl Game<'_> {
     ) -> bool {
         if fingerprint(path) != stamp {
             self.pack_ids = None;
-            self.native_shaders.classic_source = None;
+            self.native_shaders.pending_classic = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
             }

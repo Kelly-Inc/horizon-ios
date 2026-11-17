@@ -18,7 +18,10 @@ use horizon_client::gfx::native_entity::{EntityKind, EntityRuns};
 use horizon_client::text::Text;
 use horizon_shader_api::{Manifest, Pack, Primaries, check};
 
-use super::{Game, shader_packs::PickedPack};
+use super::{
+    Game,
+    shader_packs::{PendingClassicPack, PickedPack},
+};
 
 const LOOK_EVERY: Duration = Duration::from_millis(500);
 const RED: u32 = 0xFF5555;
@@ -63,8 +66,8 @@ fn refused(path: &Path, stamp: Option<u64>) -> bool {
 pub(super) struct NativeShaders {
     /// The resolved pack path, of either kind (`game/interface/shader_packs.rs`); empty: none.
     pub picked: String,
-    /// The classic shader bytes handed to the current renderer generation.
-    pub classic_source: Option<(PathBuf, Option<u64>)>,
+    /// The classic pack awaiting GPU compilation for the current renderer.
+    pub pending_classic: Option<PendingClassicPack>,
     classic_refusal_checked_at: Option<Instant>,
     /// The pack's files when it was last read (`fingerprint`).
     stamp: Option<u64>,
@@ -130,7 +133,7 @@ impl NativeShaders {
 
     pub fn select(&mut self, name: &str) {
         self.picked = name.to_owned();
-        self.classic_source = None;
+        self.pending_classic = None;
         self.classic_refusal_checked_at = None;
         self.stamp = None;
         self.looked = None;

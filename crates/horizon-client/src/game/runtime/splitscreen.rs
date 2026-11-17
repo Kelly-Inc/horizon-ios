@@ -193,14 +193,14 @@ pub(super) fn update<'a>(host: &mut Game<'a>, guest: &mut Option<Box<Game<'a>>>)
         }
     }
     if let Some(g) = guest {
-        // Playing: the bottom half, once the first player's game has split the display (its frame after the
-        // start), and the buttons on the phone. A screen open: the phone, which shows it.
-        let menu = !g.touch_playing();
-        let half = horizon_airplay::second_screen().filter(|_| !menu);
+        // The phone shows the guest's menus and also takes over gameplay if the
+        // lower AirPlay surface is unavailable.
+        let half = horizon_airplay::second_screen().filter(|_| g.touch_playing());
         super::airplay::sync(g.renderer.as_mut(), g.window.as_ref(), &mut g.airplay, half);
-        horizon_airplay::phone_shows_game(menu);
-        let buttons = if menu { Vec::new() } else { g.phone_buttons() };
-        horizon_airplay::phone_controls(Some(&buttons));
+        let on_display = g.on_airplay();
+        horizon_airplay::phone_shows_game(!on_display);
+        let buttons = on_display.then(|| g.phone_buttons());
+        horizon_airplay::phone_controls(buttons.as_deref());
     }
 }
 

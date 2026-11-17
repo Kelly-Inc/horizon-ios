@@ -520,6 +520,23 @@ final class TouchControlsTests: XCTestCase {
         }
     }
 
+    func testCustomDragClampsTheStoredCentreUsingTheActualButtonSize() {
+        let canvas = CGSize(width: 600, height: 300)
+        var button = CustomTouchButton()
+        button.size = TouchSize(width: 0.4, height: 0.25)
+        button.opacity = 0.3
+        let moved = button.moved(by: CGSize(width: 1_000, height: -1_000), in: canvas)
+        XCTAssertEqual(moved.rect(in: canvas).maxX, canvas.width, accuracy: 0.001)
+        XCTAssertEqual(moved.rect(in: canvas).minY, 0, accuracy: 0.001)
+        XCTAssertEqual(moved.centre.x, 0.9, accuracy: 0.001)
+        XCTAssertEqual(moved.centre.y, 0.125, accuracy: 0.001)
+        XCTAssertEqual(moved.effectiveOpacity, 0.3)
+        let back = moved.moved(by: CGSize(width: -30, height: 10), in: canvas)
+        XCTAssertEqual(back.rect(in: canvas).maxX, canvas.width - 30, accuracy: 0.001)
+        XCTAssertEqual(back.rect(in: canvas).minY, 10, accuracy: 0.001)
+        XCTAssertEqual(back.moved(by: CGSize(width: CGFloat.nan, height: 0), in: canvas), back)
+    }
+
 }
 
 private final class FixedGestureHold: UILongPressGestureRecognizer {

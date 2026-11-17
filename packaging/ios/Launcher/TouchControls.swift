@@ -356,7 +356,6 @@ private struct TouchLayoutEditor: View {
     @State private var selected: TouchButton?
     @State private var confirmReset = false
     @State private var editingCustom: UUID?
-    @State private var customDrag: CGPoint?
     let finish: (TouchConfiguration?) -> Void
     init(initial: TouchConfiguration, finish: @escaping (TouchConfiguration?) -> Void) {
         _draft = State(initialValue: initial); self.finish = finish
@@ -420,16 +419,9 @@ private struct TouchLayoutEditor: View {
                     }
 
                 ForEach($draft.customButtons) { $custom in
-                    let rect = custom.rect(in:gui)
-                    Text(custom.name).foregroundStyle(.white)
-                        .frame(width:rect.width*scale,height:rect.height*scale)
-                        .background(.white.opacity(0.2),in:RoundedRectangle(cornerRadius:6))
-                        .position(x:rect.midX*scale,y:rect.midY*scale)
-                        .onTapGesture {editingCustom=custom.id}
-                        .gesture(DragGesture(minimumDistance:1).onChanged { value in
-                            let start=customDrag ?? CGPoint(x:rect.midX,y:rect.midY);customDrag=start
-                            custom.centre=TouchCentre(x:min(1,max(0,(start.x+value.translation.width/scale)/gui.width)),y:min(1,max(0,(start.y+value.translation.height/scale)/gui.height)))
-                        }.onEnded{_ in customDrag=nil})
+                    TouchLayoutCustomControl(button: $custom, canvas: gui, scale: scale) {
+                        editingCustom = custom.id
+                    }
                         .contextMenu {
                             Button("Edit bindings"){editingCustom=custom.id}
                             Button("Duplicate"){var copy=custom;copy.id=UUID();draft.customButtons.append(copy)}
@@ -489,6 +481,7 @@ private struct TouchLayoutEditor: View {
                 .zIndex(2)
             }
             .frame(width: width, height: height)
+            .coordinateSpace(name: "touch-layout-canvas")
             .onChange(of: geometry.size) { _ in toolbarCentre = nil; toolbarStart = nil }
         }
         .ignoresSafeArea()
@@ -507,10 +500,49 @@ private struct TouchLayoutEditor: View {
                 draft.resetLayout()
                 selected = nil
                 dragStart = nil
-                customDrag = nil
                 pinchScale = 1
             }
         } message: { Text("This resets positions, sizes, and opacity. Custom bindings are kept. Save to keep the changes.") }
+    }
+}
+
+private struct TouchLayoutCustomControl: View {
+    @Binding var button: CustomTouchButton
+    let canvas: CGSize
+    let scale: CGFloat
+    let edit: () -> Void
+    @GestureState private var translation = CGSize.zero
+
+    init(button: Binding<CustomTouchButton>, canvas: CGSize, scale: CGFloat, edit: @escaping () -> Void) {
+        _button = button
+        self.canvas = canvas
+        self.scale = scale
+        self.edit = edit
+    }
+
+    private func moved(_ offset: CGSize) -> CustomTouchButton {
+        button.moved(by: CGSize(width: offset.width / scale, height: offset.height / scale), in: canvas)
+    }
+
+    var body: some View {
+        let rect = moved(translation).rect(in: canvas)
+        let shape = RoundedRectangle(cornerRadius: 6)
+        Text(button.name)
+            .foregroundStyle(.white)
+            .font(.system(size: 17))
+            .lineLimit(1)
+            .minimumScaleFactor(0.4)
+            .frame(width: rect.width * scale, height: rect.height * scale)
+            .background(.black.opacity(0.4), in: shape)
+            .overlay { shape.strokeBorder(.white.opacity(0.6)) }
+            .opacity(button.effectiveOpacity)
+            .contentShape(Rectangle())
+            .position(x: rect.midX * scale, y: rect.midY * scale)
+            .accessibilityIdentifier("touch-layout-custom-\(button.id)")
+            .onTapGesture(perform: edit)
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("touch-layout-canvas"))
+                .updating($translation) { value, offset, _ in offset = value.translation }
+                .onEnded { value in button = moved(value.translation) })
     }
 }
 
@@ -715,7 +747,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
             button.isHidden=hidden
             let rect=definition.rect(in:gui)
             button.frame=CGRect(x:rect.minX*unit,y:rect.minY*unit,width:rect.width*unit,height:rect.height*unit)
-            button.layer.opacity=config.showControls && !hideCustomPaint ? Float(min(1,max(0.1,definition.opacity))) : 0
+            button.layer.opacity = config.showControls && !hideCustomPaint ? Float(definition.effectiveOpacity) : 0
         }
     }
     private func point(_ location: CGPoint) -> CGPoint {

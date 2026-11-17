@@ -81,8 +81,19 @@ final class LauncherLayoutTests: XCTestCase {
         name.typeText(String(repeating:XCUIKeyboardKey.delete.rawValue,count:old.count)+"My action")
         app.buttons["custom-binding-0"].tap();app.buttons["Left mouse"].firstMatch.tap()
         app.buttons["Done"].firstMatch.tap()
+        let custom = app.staticTexts.matching(NSPredicate(format: "label == %@", "My action")).firstMatch
+        XCTAssertTrue(custom.waitForExistence(timeout: 5))
+        let initial = custom.frame
+        let target = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.78, dy: 0.64))
+        custom.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.1, thenDragTo: target)
+        let moved = custom.frame
+        XCTAssertGreaterThan(moved.midX - initial.midX, 40)
         app.buttons["touch-editor-save"].tap()
         XCTAssertTrue(edit.waitForExistence(timeout:5));edit.tap()
+        XCTAssertTrue(custom.waitForExistence(timeout: 5))
+        XCTAssertEqual(custom.frame.midX, moved.midX, accuracy: 5)
+        XCTAssertEqual(custom.frame.midY, moved.midY, accuracy: 5)
         app.buttons["touch-editor-select"].tap();app.buttons["My action"].firstMatch.tap()
         XCTAssertTrue(name.waitForExistence(timeout:5));XCTAssertEqual(name.value as? String,"My action")
         XCTAssertTrue(app.buttons["custom-binding-0"].label.contains("Left mouse"))

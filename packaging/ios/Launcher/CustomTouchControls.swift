@@ -11,6 +11,7 @@ struct CustomTouchButton: Codable, Equatable, Identifiable {
     var inGame = true
     var inMenu = true
     var toggle = false
+    var effectiveOpacity: Double { opacity.isFinite ? min(1, max(0.1, opacity)) : 0.7 }
     func rect(in canvas: CGSize) -> CGRect {
         let unit = min(canvas.width, canvas.height)
         let width = min(canvas.width, unit * (size.valid ? size.width : 0.15))
@@ -18,6 +19,16 @@ struct CustomTouchButton: Codable, Equatable, Identifiable {
         let c = centre.valid ? centre : TouchCentre(x:0.5,y:0.5)
         return CGRect(x:max(0,min(canvas.width-width,c.x*canvas.width-width/2)),
                       y:max(0,min(canvas.height-height,c.y*canvas.height-height/2)),width:width,height:height)
+    }
+    func moved(by offset: CGSize, in canvas: CGSize) -> Self {
+        guard canvas.width.isFinite, canvas.height.isFinite, canvas.width > 0, canvas.height > 0,
+              offset.width.isFinite, offset.height.isFinite else { return self }
+        let rect = rect(in: canvas)
+        let x = max(rect.width / 2, min(canvas.width - rect.width / 2, rect.midX + offset.width))
+        let y = max(rect.height / 2, min(canvas.height - rect.height / 2, rect.midY + offset.height))
+        var result = self
+        result.centre = TouchCentre(x: x / canvas.width, y: y / canvas.height)
+        return result
     }
     var keys: [Int] {
         bindings.prefix(4).reduce(into:[]) { result, code in

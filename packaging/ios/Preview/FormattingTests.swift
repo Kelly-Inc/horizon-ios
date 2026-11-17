@@ -657,6 +657,51 @@ final class LauncherAsyncTests: XCTestCase {
         XCTAssertNil(store.downloading[project.id])
     }
 
+    func testPackInstallPrefersAUsableCompatibleZipAndSkipsAttachments() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let bytes = Data("pack fixture".utf8)
+        let hash = SHA512.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        func file(_ name: String, primary: Bool = false, type: String? = nil,
+                  checksum: String? = nil) -> [String: Any] {
+            var metadata: [String: Any] = [
+                "filename": name, "url": "https://example.invalid/\(name)", "primary": primary,
+                "size": bytes.count, "hashes": ["sha512": checksum ?? hash],
+            ]
+            metadata["file_type"] = type
+            return metadata
+        }
+        let versions: [[String: Any]] = [
+            ["game_versions": ["26.4"], "files": [file("other.zip", primary: true)]],
+            ["game_versions": ["26.3"], "files": [file("unverified.zip", primary: true, checksum: "")]],
+            ["game_versions": ["26.3"], "files": [
+                file("README.txt", primary: true),
+                file("companion.zip", type: "required-resource-pack"),
+                file("pack.zip"),
+            ]],
+        ]
+        let project = ModrinthProject(id: "fixture", kind: .shader, title: "Fixture", summary: "",
+                                      author: "", downloads: 0, icon: nil, gameVersions: [])
+        var requested: [String] = []
+        let store = PackStore(fetch: { _ in versions }, transfer: { request in
+            let url = try XCTUnwrap(request.url)
+            requested.append(url.lastPathComponent)
+            let temporary = root.appendingPathComponent(UUID().uuidString)
+            try bytes.write(to: temporary)
+            return (temporary, try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200,
+                                                            httpVersion: nil, headerFields: nil)))
+        }, folder: { root.appendingPathComponent($0.rawValue) })
+        let compatible = try await store.install(project, version: "26.3").get()
+        XCTAssertEqual(compatible.file, "pack.zip")
+        XCTAssertNil(compatible.note)
+
+        let fallback = try await store.install(project, version: "26.2").get()
+        XCTAssertEqual(fallback.file, "other.zip")
+        XCTAssertTrue(fallback.note?.contains("26.4") == true)
+        XCTAssertEqual(requested, ["pack.zip", "other.zip"])
+    }
+
     func testPackDownloadKeepsItsSearchKindAndDoesNotReplaceAnExistingFile() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

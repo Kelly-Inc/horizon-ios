@@ -72,7 +72,7 @@ private struct PackFileIntegrity: Sendable {
 }
 
 /// Packs from Modrinth (api.modrinth.com, v2): search, then the newest version made for the game's Minecraft
-/// version (else the newest at all, said so), whose primary file goes straight into the pack folder.
+/// version (else the newest available), preferring its primary downloadable ZIP.
 @MainActor
 final class PackStore: ObservableObject {
     @Published private(set) var results: [ModrinthProject] = []
@@ -138,6 +138,51 @@ final class PackStore: ObservableObject {
         let note: String?
     }
 
+    private struct Download {
+        let name: String
+        let url: URL
+        let integrity: PackFileIntegrity
+        let note: String?
+    }
+
+    private static func chooseDownload(_ versions: [[String: Any]], project: ModrinthProject,
+                                       version: String) -> Result<Download, PackError> {
+        let releases = versions.map { release in
+            (files: release["files"] as? [[String: Any]] ?? [],
+             games: release["game_versions"] as? [String] ?? [])
+        }
+        let matching = releases.filter { $0.games.contains(version) }
+        let others = releases.filter { !$0.games.contains(version) }
+        let attachmentTypes = ["required-resource-pack", "optional-resource-pack",
+                               "sources-jar", "dev-jar", "javadoc-jar", "signature"]
+        var missingIntegrity = false
+
+        // Keep Modrinth's release order within each compatibility group.
+        for release in matching + others {
+            let primary = release.files.filter { $0["primary"] as? Bool == true }
+            let secondary = release.files.filter { $0["primary"] as? Bool != true }
+            for file in primary + secondary {
+                guard !attachmentTypes.contains(file["file_type"] as? String ?? ""),
+                      let url = (file["url"] as? String).flatMap(URL.init(string:)),
+                      url.scheme?.lowercased() == "https", url.host != nil,
+                      let name = file["filename"] as? String,
+                      !name.contains("/"), !name.contains("\\"), !name.hasPrefix("."),
+                      name.lowercased().hasSuffix(".zip") else { continue }
+                guard let integrity = PackFileIntegrity(metadata: file) else {
+                    missingIntegrity = true
+                    continue
+                }
+                let made = release.games.last ?? "another version"
+                let note = release.games.contains(version) ? nil
+                    : "It was made for Minecraft \(made), so it may not look right on \(version)."
+                return .success(Download(name: name, url: url, integrity: integrity, note: note))
+            }
+        }
+        return .failure(PackError(missingIntegrity
+            ? "Modrinth did not provide a valid checksum and size for this pack."
+            : "\(project.title) has no file to download."))
+    }
+
     /// Download `project`'s file for the game's Minecraft version into the project's pack folder.
     func install(_ project: ModrinthProject, version: String) async -> Result<Installed, PackError> {
         let cancelled = PackError("The pack download was cancelled.")
@@ -153,23 +198,13 @@ final class PackStore: ObservableObject {
         guard let versions = response as? [[String: Any]] else {
             return .failure(PackError("Could not read the pack's versions from Modrinth. Try again."))
         }
-        // Newest first, as Modrinth lists them: one made for this Minecraft, else the newest of all.
-        let fitting = versions.first { ($0["game_versions"] as? [String] ?? []).contains(version) }
-        guard let chosen = fitting ?? versions.first,
-              let files = chosen["files"] as? [[String: Any]],
-              let file = files.first(where: { $0["primary"] as? Bool == true }) ?? files.first,
-              let link = (file["url"] as? String).flatMap(URL.init(string:)),
-              link.scheme?.lowercased() == "https", link.host != nil,
-              let name = file["filename"] as? String,
-              // A file name from the network names a file here: no folders in it.
-              !name.isEmpty, !name.contains("/"), !name.contains("\\"), !name.hasPrefix("."), name.lowercased().hasSuffix(".zip")
-        else {
-            return .failure(PackError("\(project.title) has no file to download."))
+        let candidate: Download
+        switch Self.chooseDownload(versions, project: project, version: version) {
+        case let .success(download): candidate = download
+        case let .failure(error): return .failure(error)
         }
-        guard let integrity = PackFileIntegrity(metadata: file) else {
-            return .failure(PackError("Modrinth did not provide a valid checksum and size for this pack."))
-        }
-        var request = URLRequest(url: link)
+        let integrity = candidate.integrity
+        var request = URLRequest(url: candidate.url)
         request.setValue(Self.agent, forHTTPHeaderField: "User-Agent")
         do {
             let (temporary, response) = try await transfer(request)
@@ -190,7 +225,7 @@ final class PackStore: ObservableObject {
             }
             let directory = folder(project.kind)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let original = directory.appendingPathComponent(name)
+            let original = directory.appendingPathComponent(candidate.name)
             let stem = original.deletingPathExtension().lastPathComponent
             var destination = original
             var suffix = 2
@@ -201,9 +236,7 @@ final class PackStore: ObservableObject {
             // Never silently replace a local pack or a different project's ZIP.
             try FileManager.default.moveItem(at: temporary, to: destination)
             reloadInstalled()
-            let made = (chosen["game_versions"] as? [String])?.last ?? "another version"
-            let note = fitting == nil ? "It was made for Minecraft \(made), so it may not look right on \(version)." : nil
-            return .success(Installed(file: destination.lastPathComponent, note: note))
+            return .success(Installed(file: destination.lastPathComponent, note: candidate.note))
         } catch {
             return .failure(Task.isCancelled ? cancelled : PackError(error.localizedDescription))
         }

@@ -486,6 +486,43 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertTrue(holds.modifiers.isEmpty)
     }
 
+    @MainActor func testHiddenOrRemovedCustomButtonCannotReactivateAKey() throws {
+        var definition = CustomTouchButton()
+        definition.bindings = [340, 0, 0, 0]
+        definition.toggle = true
+        var config = TouchConfiguration()
+        config.customButtons = [definition]
+        let bridge = TouchGestureBridge(configuration: { config })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll(flags: UInt32 = 0) -> [[Double]] {
+            bridge.poll(screen: 1, flags: flags, width: 600, height: 300, scale: 1, capacity: 64)
+        }
+        _ = poll()
+        let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        XCTAssertTrue(button.accessibilityActivate())
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 1, 340]])
+
+        XCTAssertEqual(poll(flags: 16).map { Array($0.prefix(3)) }, [[7, 3, 340]])
+        XCTAssertTrue(button.isHidden)
+        XCTAssertFalse(button.accessibilityActivate())
+        button.sendActions(for: .touchDown)
+        button.sendActions(for: .touchUpInside)
+        XCTAssertTrue(poll(flags: 16).isEmpty)
+        XCTAssertEqual(bridge.customModifierBits, 0)
+
+        XCTAssertTrue(poll().isEmpty)
+        XCTAssertFalse(button.isHidden)
+        XCTAssertTrue(button.accessibilityActivate())
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 1, 340]])
+        config.customButtons.removeAll()
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 3, 340]])
+        XCTAssertNil(button.superview)
+        XCTAssertFalse(button.accessibilityActivate())
+        XCTAssertTrue(poll().isEmpty)
+        XCTAssertEqual(bridge.customModifierBits, 0)
+    }
+
     @MainActor func testCoveringTheGameClearsLatchedInputBeforeTheSameScreenResumes() throws {
         var definition = CustomTouchButton()
         definition.bindings = [340, 0, 0, 0]

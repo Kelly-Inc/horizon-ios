@@ -110,6 +110,7 @@ final class CustomTouchView: UIButton {
         return super.point(inside:point,with:event)
     }
     @objc private func down(_ sender:UIButton,event:UIEvent?){
+        guard isEnabled, !isHidden else { return }
         touchStarted = true
         if !definition.toggle {buttonHeld=true;send(definition.id,definition.keys,true,event?.modifierFlags ?? [])}
     }
@@ -117,6 +118,7 @@ final class CustomTouchView: UIButton {
         guard touchStarted else { return }
         touchStarted = false
         let flags = event?.modifierFlags ?? []
+        guard isEnabled, !isHidden else { release(flags); return }
         if definition.toggle {
             buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,flags)
         } else {release(flags)}
@@ -127,6 +129,7 @@ final class CustomTouchView: UIButton {
         if !definition.toggle { release(event?.modifierFlags ?? []) }
     }
     override func accessibilityActivate() -> Bool {
+        guard isEnabled, !isHidden else { return false }
         if definition.toggle {buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,[])}
         else {send(definition.id,definition.keys,true,[]);send(definition.id,definition.keys,false,[])}
         activate([])

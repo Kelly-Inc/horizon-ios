@@ -621,7 +621,10 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     func attach(to view: UIView) {
         guard surface !== view else { return }
         if !recognizers.isEmpty { suspend() }
-        for button in customViews.values { button.removeFromSuperview() }
+        for button in customViews.values {
+            button.isEnabled = false
+            button.removeFromSuperview()
+        }
         customViews.removeAll()
         if let surface { for recognizer in recognizers { surface.removeGestureRecognizer(recognizer) } }
         surface = view
@@ -724,11 +727,20 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         guard let surface else{return}
         let config=configuration(), valid=Set(config.customButtons.map(\.id))
         for id in Array(customViews.keys) where !valid.contains(id) {
-            customViews[id]?.release();customViews.removeValue(forKey:id)?.removeFromSuperview()
+            if let button = customViews.removeValue(forKey: id) {
+                button.isEnabled = false
+                button.release()
+                button.removeFromSuperview()
+            }
         }
         let unit=guiScale/Double(surface.window?.screen.scale ?? UIScreen.main.scale)
         for definition in config.customButtons {
-            if let old=customViews[definition.id],old.definition != definition {old.release();old.removeFromSuperview();customViews.removeValue(forKey:definition.id)}
+            if let old = customViews[definition.id], old.definition != definition {
+                old.isEnabled = false
+                old.release()
+                old.removeFromSuperview()
+                customViews.removeValue(forKey: definition.id)
+            }
             if customViews[definition.id] == nil {
                 let button = CustomTouchView(definition, activate: { [weak self] flags in
                     guard let self, self.active, !self.overflowed else { return }

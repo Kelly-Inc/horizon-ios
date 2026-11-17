@@ -127,7 +127,7 @@ class IOSReleaseTests(unittest.TestCase):
             ipa = root / "ipa-artifact/Horizon-game-unsigned.ipa"
             env = dict(os.environ, GITHUB_SHA=SHA, GITHUB_RUN_NUMBER="91", GITHUB_RUN_ATTEMPT="3",
                        GITHUB_OUTPUT=str(root / "outputs"), IPA_ARTIFACT_ID="987654",
-                       IPA_BUILD_ATTEMPT="1", HORIZON_MSA_CLIENT_ID=CLIENT_ID)
+                       IPA_BUILD_ATTEMPT="1", HORIZON_MSA_CLIENT_ID=CLIENT_ID, IPHONEOS_DEPLOYMENT_TARGET="16.0")
             for overrides in ({"IPA_ARTIFACT_ID": ""}, {"IPA_BUILD_ATTEMPT": ""},
                               {"IPA_BUILD_ATTEMPT": "4"}):
                 result = subprocess.run(["bash", "-ec", preflight["run"]],
@@ -140,7 +140,7 @@ class IOSReleaseTests(unittest.TestCase):
                     version, number = release.release_version("91", artifact_attempt)
                     self.archive(ipa, launcher_framework(version, number),
                                  {"CFBundleShortVersionString": version, "CFBundleVersion": number,
-                                  "HorizonMSAClientID": CLIENT_ID})
+                                  "HorizonMSAClientID": CLIENT_ID, "MinimumOSVersion": "16.0"})
                     result = subprocess.run(["bash", "-ec", prepare["run"]], cwd=root,
                                             env=dict(env, IPA_BUILD_ATTEMPT=build_attempt),
                                             capture_output=True, text=True)
@@ -230,6 +230,31 @@ class IOSReleaseTests(unittest.TestCase):
                          info={"MinimumOSVersion": "16.0"})
             with self.assertRaisesRegex(ValueError, "Framework requires a newer iOS"):
                 release.audit(ipa, SHA)
+
+    def test_standalone_libraries_must_support_the_app_minimum_ios(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "standalone-library.ipa"
+            library = "Payload/Horizon.app/Frameworks/libExample.dylib"
+            for minimum in (0x100000, 0x110000):
+                self.archive(ipa, {library: binary(file_type=6, minimum=minimum)},
+                             info={"MinimumOSVersion": "16.0"})
+                if minimum == 0x100000:
+                    self.assertEqual(release.audit(ipa, SHA), ("0.1.0", "42.2"))
+                else:
+                    with self.assertRaisesRegex(ValueError, "libExample.dylib requires a newer iOS"):
+                        release.audit(ipa, SHA)
+
+    def test_shipping_audit_requires_the_configured_minimum_ios_in_the_plist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "deployment-target.ipa"
+            for info in ({}, {"MinimumOSVersion": "17.0"}, {"MinimumOSVersion": "16.0.0"}):
+                self.archive(ipa, info=info)
+                if info.get("MinimumOSVersion") == "16.0.0":
+                    self.assertEqual(release.audit(ipa, SHA, expected_minimum_os=(16, 0, 0)),
+                                     ("0.1.0", "42.2"))
+                else:
+                    with self.assertRaisesRegex(ValueError, "does not match the configured"):
+                        release.audit(ipa, SHA, expected_minimum_os=(16, 0, 0))
 
     def test_rejects_noncanonical_zip_member_paths(self):
         with tempfile.TemporaryDirectory() as directory:

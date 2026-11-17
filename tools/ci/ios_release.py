@@ -101,14 +101,15 @@ def unsigned_macho(stream):
     return file_type, (minimum >> 16, (minimum >> 8) & 0xff, minimum & 0xff)
 
 
-def minimum_os(info):
-    if "MinimumOSVersion" not in info:
-        return None
-    value = info["MinimumOSVersion"]
+def parse_minimum_os(value):
     if not isinstance(value, str) or not VERSION.fullmatch(value):
-        raise ValueError("Invalid bundle MinimumOSVersion")
+        raise ValueError("Invalid iOS minimum version")
     components = tuple(map(int, value.split(".")))
     return components + (0,) * (3 - len(components))
+
+
+def minimum_os(info):
+    return parse_minimum_os(info["MinimumOSVersion"]) if "MinimumOSVersion" in info else None
 
 
 def bundle_executable(bundle, info, binaries, file_type, label):
@@ -142,7 +143,7 @@ def audit_payload_layout(paths, app):
 
 
 def audit(ipa, expected_commit=None, expected_version=None, *,
-          require_launcher=False, expected_client_id=None):
+          require_launcher=False, expected_client_id=None, expected_minimum_os=None):
     with zipfile.ZipFile(ipa) as archive:
         paths = {}
         binaries = {}
@@ -196,6 +197,8 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
         if platforms is not None and platforms != ["iPhoneOS"]:
             raise ValueError("Expected a device IPA, not a simulator app")
         app_minimum = minimum_os(info)
+        if expected_minimum_os is not None and app_minimum != expected_minimum_os:
+            raise ValueError("IPA MinimumOSVersion does not match the configured iOS deployment target")
         required = bundle_executable(app, info, binaries, 2, "app")
         if app_minimum is not None and required > app_minimum:
             raise ValueError("App executable requires a newer iOS version than MinimumOSVersion")
@@ -224,6 +227,10 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
                 raise ValueError("Framework executable requires a newer iOS version than MinimumOSVersion")
             if app_minimum is not None and max(required, framework_minimum or required) > app_minimum:
                 raise ValueError("Framework requires a newer iOS version than the app")
+        if app_minimum is not None:
+            for path, (_, required) in binaries.items():
+                if required > app_minimum:
+                    raise ValueError(f"{path} requires a newer iOS version than the app")
         if expected_commit is not None:
             if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
                 raise ValueError("Invalid source commit")
@@ -235,7 +242,7 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
 
 
 def prepare(ipa, output, expected_commit, expected_version=None, *,
-            require_launcher=False, expected_client_id=None):
+            require_launcher=False, expected_client_id=None, expected_minimum_os=None):
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ios-release-", dir=output) as staging:
         staged_ipa = Path(staging) / "artifact.ipa"
@@ -244,7 +251,7 @@ def prepare(ipa, output, expected_commit, expected_version=None, *,
         # Verify the bytes that will actually be published, even if the input changed during copying.
         version, build = audit(
             staged_ipa, expected_commit, expected_version, require_launcher=require_launcher,
-            expected_client_id=expected_client_id,
+            expected_client_id=expected_client_id, expected_minimum_os=expected_minimum_os,
         )
         with staged_ipa.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -267,11 +274,12 @@ def main():
     parser.add_argument("--run-attempt")
     parser.add_argument("--client-id", help="Microsoft client ID to stamp or verify")
     parser.add_argument("--require-launcher", action="store_true")
+    parser.add_argument("--minimum-ios", type=parse_minimum_os, help="Expected app deployment target")
     parser.add_argument("--expect-commit", required=True)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     if args.stamp_app:
-        if (args.ipa or args.output_dir or args.require_launcher
+        if (args.ipa or args.output_dir or args.require_launcher or args.minimum_ios is not None
                 or not args.run_number or not args.run_attempt):
             parser.error("--stamp-app requires run number and attempt, without an IPA/output directory")
         stamp_app(args.stamp_app, args.run_number, args.run_attempt, args.expect_commit, args.client_id or "")
@@ -280,7 +288,8 @@ def main():
         parser.error("an IPA or --stamp-app is required")
     expected = (release_version(args.run_number, args.run_attempt)
                 if args.run_number or args.run_attempt else None)
-    checks = {"require_launcher": args.require_launcher, "expected_client_id": args.client_id}
+    checks = {"require_launcher": args.require_launcher, "expected_client_id": args.client_id,
+              "expected_minimum_os": args.minimum_ios}
     result = (prepare(args.ipa, args.output_dir, args.expect_commit, expected, **checks) if args.output_dir
               else dict(zip(("version", "build"), audit(args.ipa, args.expect_commit, expected, **checks))))
     for key, value in result.items():

@@ -270,7 +270,9 @@ final class PackChoices: ObservableObject {
     func load() async {
         await acquire()
         defer { release() }
-        issue = await reload()
+        guard !Task.isCancelled else { return }
+        let error = await reload()
+        if !Task.isCancelled { issue = error }
     }
 
     private func readResources() async -> String? {
@@ -286,8 +288,10 @@ final class PackChoices: ObservableObject {
     private func readShaders() async -> String? {
         let shaders = await request("shader-pack list")
         if let error = shaders.error { return error }
-        guard shaders.keys.contains("selected") else { return "The selected shader pack could not be read. Try again." }
-        shaderPack = shaders["selected"] as? String
+        guard let selected = shaders["selected"], selected is NSNull || selected is String else {
+            return "The selected shader pack could not be read. Try again."
+        }
+        shaderPack = selected as? String
         shaderNotes = []
         shaderStatus = nil
         if shaderPack != nil {
@@ -305,6 +309,7 @@ final class PackChoices: ObservableObject {
 
     private func reload() async -> String? {
         let resources = await readResources()
+        guard !Task.isCancelled else { return nil }
         let shaders = await readShaders()
         return resources ?? shaders
     }
@@ -318,16 +323,22 @@ final class PackChoices: ObservableObject {
     func set(_ name: String, kind: PackKind, on: Bool) async -> String? {
         await acquire()
         defer { release() }
+        guard !Task.isCancelled else { return nil }
         let error = await setLocked(name, kind: kind, on: on)
-        issue = error
+        if !Task.isCancelled { issue = error }
         return error
     }
 
     private func setLocked(_ name: String, kind: PackKind, on: Bool) async -> String? {
+        let readError = kind == .resource ? await readResources() : await readShaders()
+        guard !Task.isCancelled else { return nil }
+        if let readError { return readError }
+        // Off is a global engine command for shaders. Never use it to
+        // disable a different shader that became active while this waited.
+        guard isOn(name, kind: kind) != on else { return nil }
         let answer: [String: Any]
         switch kind {
         case .resource:
-            if let error = await readResources() { return error }
             var packs = resourcePacks.filter { $0 != "file/\(name)" }
             if on { packs.append("file/\(name)") }
             guard let data = try? JSONSerialization.data(withJSONObject: packs),
@@ -349,12 +360,15 @@ final class PackChoices: ObservableObject {
     func remove(_ name: String, kind: PackKind, delete: () -> String?) async -> String? {
         await acquire()
         defer { release() }
+        guard !Task.isCancelled else { return nil }
         let readError = kind == .resource ? await readResources() : await readShaders()
+        guard !Task.isCancelled else { return nil }
         if let readError { issue = readError; return readError }
         if isOn(name, kind: kind), let error = await setLocked(name, kind: kind, on: false) {
-            issue = error
+            if !Task.isCancelled { issue = error }
             return error
         }
+        guard !Task.isCancelled else { return nil }
         let error = delete()
         issue = error
         return error

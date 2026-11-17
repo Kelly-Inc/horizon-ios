@@ -465,6 +465,70 @@ final class LauncherAsyncTests: XCTestCase {
 
 @MainActor
 final class PackMutationTests: XCTestCase {
+    func testStaleShaderOffDoesNotDisableTheNewlySelectedPack() async {
+        var current = "a.zip"
+        var writes: [String] = []
+        var ack: CheckedContinuation<Void, Never>?
+        let submitted = expectation(description: "new shader activation submitted")
+        let choices = PackChoices(request: { command in
+            if command == "shader-pack list" { return ["selected": current] }
+            writes.append(command)
+            if command == "shader-pack b.zip" {
+                await withCheckedContinuation {
+                    ack = $0
+                    submitted.fulfill()
+                }
+                current = "b.zip"
+            } else {
+                current = ""
+            }
+            return ["ok": true]
+        })
+        let activate = Task { await choices.set("b.zip", kind: .shader, on: true) }
+        await fulfillment(of: [submitted], timeout: 2)
+        let staleOff = Task { await choices.set("a.zip", kind: .shader, on: false) }
+        ack?.resume()
+        let activationError = await activate.value
+        let staleError = await staleOff.value
+        XCTAssertNil(activationError)
+        XCTAssertNil(staleError)
+        XCTAssertEqual(writes, ["shader-pack b.zip"])
+        XCTAssertEqual(choices.shaderPack, "b.zip")
+    }
+
+    func testCancelledPackRemovalDuringStateReadDoesNotMutateOrDelete() async {
+        var read: CheckedContinuation<[String: Any], Never>?
+        var commands: [String] = []
+        var deleted = false
+        let reading = expectation(description: "selection read suspended")
+        let choices = PackChoices(request: { command in
+            commands.append(command)
+            if commands.count != 1 { return ["selected": NSNull()] }
+            return await withCheckedContinuation {
+                read = $0
+                reading.fulfill()
+            }
+        })
+        let removal = Task { await choices.remove("a.zip", kind: .shader, delete: {
+            deleted = true
+            return nil
+        }) }
+        await fulfillment(of: [reading], timeout: 2)
+        removal.cancel()
+        read?.resume(returning: ["selected": "a.zip"])
+        _ = await removal.value
+        XCTAssertFalse(deleted)
+        XCTAssertEqual(commands, ["shader-pack list"])
+    }
+
+    func testMalformedShaderSelectionDoesNotAuthorizeDeletion() async {
+        var deleted = false
+        let choices = PackChoices(request: { _ in ["selected": false] })
+        let error = await choices.remove("a.zip", kind: .shader, delete: { deleted = true; return nil })
+        XCTAssertNotNil(error)
+        XCTAssertFalse(deleted)
+    }
+
     func testSimultaneousResourceTogglesMergeAfterFirstAcknowledgement() async {
         var packs: [String] = []
         var writes: [[String]] = []

@@ -19,17 +19,18 @@ ROOT = Path(__file__).resolve().parents[1]
 def program(game_source=None):
     game = game_source or '\n'.join((ROOT / path).read_text() for path in [
         'crates/horizon-client/src/game.rs',
-        'crates/horizon-client/src/game/loading_screen.rs',
+        'crates/horizon-client/src/game/runtime/loading_screen.rs',
     ])
-    world = (ROOT / 'crates/horizon-client/src/game/world_loading.rs').read_text()
-    launcher = (ROOT / 'crates/horizon-client/src/game/launcher.rs').read_text()
+    world = (ROOT / 'crates/horizon-client/src/game/world/world_loading/owned_workers.rs').read_text()
+    worker_state = world[world.index('pub(super) enum Preload'):world.index('pub(in crate::game) fn world_data_used')].replace('pub(super) ', '')
+    launcher = (ROOT / 'crates/horizon-client/src/game/runtime/launcher.rs').read_text()
     drain = method(game, 'drain_cancelled_start')
-    resources = (ROOT / 'crates/horizon-client/src/game/resource_loader.rs').read_text()
+    resources = (ROOT / 'crates/horizon-client/src/game/runtime/resource_loader.rs').read_text()
     a = resources.index('pub(super) struct WorldRestLoader {')
     b = resources.index('pub(super) fn write_report', a)
     rest = resources[a:b].rsplit('///', 1)[0]
-    a = resources.index('pub(super) fn retired_rest_loaders')
-    rest += resources[a:]
+    rest += method(resources, 'retired_rest_loaders')
+    rest += resources[resources.index('pub(super) fn poll_retired_rest_loaders'):]
     rest = rest.replace('pub(super) ', '')
     point = game.index('loading.drain_cancelled_start()')
     a = game.rfind('            App::Loading(loading) => {', 0, point)
@@ -43,7 +44,7 @@ def program(game_source=None):
     ack = 'pub(super) ' + method(launcher, 'acknowledge_cancelled_start')
     broker = f'#[path="{ROOT / "crates/horizon-ios-launcher/src/lib.rs"}"]mod horizon_ios_launcher;\n'
     return (STUBS + broker + rest + '\nimpl Loading {\n' + drain + '\n}\n'
-            + '\nmod world_loading {use super::*;\n' + WORLD_STUBS + preload + prepared + '\n}\n'
+            + '\nmod world_loading {use super::*;\n' + worker_state + WORLD_STUBS + preload + prepared + '\n}\n'
             + '\nmod launcher {use super::*;\n' + pending + ack + LAUNCHER_STUBS + '\n}\n'
             + '\nimpl App {fn tick(&mut self,event_loop:&EventLoop){match self {\n' + supervisor + '\n}}}\n' + CASES)
 
@@ -116,10 +117,7 @@ fn reply(label:&str)->horizon_ios_launcher::Request{let label=label.to_owned();h
 '''
 
 WORLD_STUBS = r'''
-enum Preload{Idle,Started{thread:JoinHandle<()>},Used(Option<JoinHandle<()>>)}
-static PRELOAD:Mutex<Preload>=Mutex::new(Preload::Idle);
-static PREPARED_WRITERS:Mutex<Vec<(PathBuf,JoinHandle<()>)>>=Mutex::new(Vec::new());
-pub(super) fn install_preload(worker:JoinHandle<()>){*PRELOAD.lock().unwrap()=Preload::Used(Some(worker));}
+pub(super) fn install_preload(worker:JoinHandle<()>){*PRELOAD.lock().unwrap()=Preload::Used(vec![worker]);}
 pub(super) fn install_prepared(path:PathBuf,worker:JoinHandle<()>){PREPARED_WRITERS.lock().unwrap().push((path,worker));}
 pub(super) fn prepared_finished()->bool{PREPARED_WRITERS.lock().unwrap().iter().all(|(_,w)|w.is_finished())}
 pub(super) fn prepared_empty()->bool{PREPARED_WRITERS.lock().unwrap().is_empty()}

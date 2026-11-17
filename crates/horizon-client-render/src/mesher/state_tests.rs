@@ -179,19 +179,31 @@ fn native_vertex_colour_maths_is_unchanged() {
 /// their own ids, fluids and waterlogging are tagged, and sorting the solid
 /// quads by side keeps each quad's state.
 #[test]
-#[ignore = "requires prepared private Minecraft resources; run explicitly"]
+#[ignore = "daily"]
 fn quads_keep_the_state_of_their_block() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
-    if !root.join("horizon-resources.json").exists() {
-        return;
-    }
+    let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.local/horizon-client/26.3")
+        });
+    assert!(
+        root.join("horizon-resources.json").is_file(),
+        "provide prepared resources in HORIZON_TEST_RESOURCES"
+    );
     let assets = Assets::load(&root).unwrap();
-    let render = assets.reload(&root).unwrap();
+    let render = assets
+        .reload(&crate::resource_source::ResourceRoot::directory(
+            root.clone(),
+        ))
+        .unwrap();
     let facts = BlockFacts::load(&root, assets.registry).unwrap();
     let visibility = crate::models::load_visibility(&root, assets.registry).unwrap();
-    let tables = MeshTables::new(&assets, &render, &facts, visibility).unwrap();
-    let biomes = Biomes::load(&root).unwrap();
+    let tables = MeshTables::new(&assets, &render, &facts, visibility, None).unwrap();
+    let biomes = Biomes::load(&crate::resource_source::ResourceRoot::directory(
+        root.clone(),
+    ))
+    .unwrap();
     let default = |name| assets.registry.default_state(name).unwrap().0;
     let waterlogged = assets
         .registry
@@ -247,6 +259,8 @@ fn quads_keep_the_state_of_their_block() {
         separate_ao: false,
         shader_pack: false,
         translucent_layers: &[],
+        hidden_states: &[],
+        part_tables: Default::default(),
     };
     let mut mesh = mesher.mesh(&region, 8);
     let blocks: Vec<([i32; 3], u32)> = placed.iter().map(|&(_, s, cell, _)| (cell, s)).collect();

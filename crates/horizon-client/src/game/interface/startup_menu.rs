@@ -1654,6 +1654,7 @@ mod tests {
                     title: Some(title),
                     pending: Some(PendingWorldEntry::Local {
                         folder: "test".into(),
+                        from_title: true,
                         name: None,
                         seed: Some(1),
                         creative: true,
@@ -2033,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared vanilla resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn failed_handoff_keeps_options_and_does_not_mark_a_completed_harness() {
         let root =
             PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources"));
@@ -2041,13 +2042,16 @@ mod tests {
         // Real CPU resources and pack state, but no window/GPU. finish fails at
         // its missing menu bundle before any renderer construction is attempted.
         let mut loaded = super::super::load_resources(
-            root.clone(),
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
             None,
             &root,
             &settings,
             Instant::now(),
             false,
-            true,
+            super::super::mods::LoadRole::startup(
+                super::super::execution_role::ExecutionRole::Client,
+            ),
             &Progress::new(),
             &mut |_, _| {},
         )

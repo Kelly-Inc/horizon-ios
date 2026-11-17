@@ -154,6 +154,13 @@ fn a_payload_handler_disconnects_once_and_the_poll_logs_out_once() {
                 Some(1),
                 true,
                 Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir()
+                        .unwrap()
+                        .join("saves")
+                        .join("disconnect_transport"),
+                )
+                .unwrap(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);

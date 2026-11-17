@@ -11,8 +11,8 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def program(source=None):
-    source=source or (ROOT/'crates/horizon-client/src/game/pad/ios.rs').read_text()
-    menu=(ROOT/'crates/horizon-client/src/game/pad_menu.rs').read_text()
+    source=source or (ROOT/'crates/horizon-client/src/game/interface/pad/ios.rs').read_text()
+    menu=(ROOT/'crates/horizon-client/src/game/interface/pad_menu.rs').read_text()
     release=method(menu,'pad_menu_button')
     release=block(release,release.index('        if !down {'))
     code=routing_program().replace('mod horizon_gamecontroller;', 'mod native_bridge;')

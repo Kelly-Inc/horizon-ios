@@ -65,6 +65,13 @@ fn on_guest_stack() {
                     Some(1),
                     true,
                     Some(&options),
+                    horizon_client::save::SessionLock::acquire(
+                        &std::env::current_dir()
+                            .unwrap()
+                            .join("saves")
+                            .join("wasm_typed"),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
                 let deadline = Instant::now() + Duration::from_secs(60);

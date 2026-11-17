@@ -409,6 +409,13 @@ fn integrated_memory_delivers_registered_raw_payload_and_reply() {
                 Some(1),
                 true,
                 Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir()
+                        .unwrap()
+                        .join("saves")
+                        .join("raw_transport"),
+                )
+                .unwrap(),
             )
             .unwrap();
             let ready = drive_until(Instant::now() + WAIT_BUDGET, || {
@@ -432,6 +439,7 @@ fn integrated_memory_delivers_registered_raw_payload_and_reply() {
             let wire_timeline = timeline.clone();
             game.remote.as_ref().unwrap().session.start_recording(
                 WireReceipt {
+                    stopped: std::sync::atomic::AtomicBool::new(false),
                     channel: CHANNEL,
                     expected: expected.clone(),
                     hits: wire_hits.clone(),
@@ -524,6 +532,7 @@ pub(super) fn assert_bare_body(body: &[u8], channel: &str, expected: &[u8]) {
 }
 
 pub(super) struct WireReceipt {
+    pub(super) stopped: std::sync::atomic::AtomicBool,
     pub(super) channel: &'static str,
     pub(super) expected: Arc<Vec<u8>>,
     pub(super) hits: Arc<AtomicUsize>,
@@ -531,7 +540,18 @@ pub(super) struct WireReceipt {
 }
 impl horizon_client::net::PacketRecorder for WireReceipt {
     fn is_active(&self) -> bool {
-        true
+        !self.stopped.load(Ordering::Acquire)
+    }
+    fn request_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+    fn poll_finish(&self) -> Option<std::io::Result<std::path::PathBuf>> {
+        self.stopped
+            .load(Ordering::Acquire)
+            .then(|| Ok(Default::default()))
+    }
+    fn work_handle(&self) -> Option<horizon_client::studio::recorder::WorkHandle> {
+        None
     }
     fn received(
         &self,
@@ -539,7 +559,8 @@ impl horizon_client::net::PacketRecorder for WireReceipt {
         id: i32,
         body: &[u8],
     ) {
-        if matches!(packet, horizon_protocol::packets::play::Clientbound::CustomPayload(p) if p.channel == self.channel)
+        if self.is_active()
+            && matches!(packet, horizon_protocol::packets::play::Clientbound::CustomPayload(p) if p.channel == self.channel)
         {
             assert_eq!(id, horizon_protocol::ids::play::clientbound::CUSTOM_PAYLOAD);
             assert_bare_body(body, self.channel, &self.expected);
@@ -552,7 +573,8 @@ impl horizon_client::net::PacketRecorder for WireReceipt {
     fn record_packet(&self, _: i32, _: &[u8]) {}
     fn status(&self) -> horizon_client::net::RecorderStatus {
         horizon_client::net::RecorderStatus {
-            active: true,
+            active: self.is_active(),
+            finishing: false,
             path: Default::default(),
             elapsed: Duration::ZERO,
             packet_count: self.hits.load(Ordering::SeqCst) as u64,

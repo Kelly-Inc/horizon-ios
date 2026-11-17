@@ -10,8 +10,23 @@ import yaml
 
 
 class ConcurrencyTests(unittest.TestCase):
+    def test_ios_release_publications_share_a_queue_across_commits(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ios.yml").read_text())
+        # Per-SHA build groups cannot protect the read-latest/edit-latest sequence.
+        self.assertEqual(workflow['jobs']['release'].get('concurrency'), {
+            'group': 'horizon-ios-release', 'cancel-in-progress': False, 'queue': 'max',
+        })
+
     def test_checks_replace_pull_requests_but_finish_the_running_main_check(self):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        path = ROOT / ".github/workflows/ci.yml"
+        if not path.is_file():
+            # The mobile fork retains its own build queue rather than desktop verify jobs.
+            workflow = yaml.safe_load((ROOT / ".github/workflows/ios.yml").read_text())
+            self.assertEqual(workflow["concurrency"], {
+                "group": "ios-${{ github.sha }}", "cancel-in-progress": False,
+            })
+            return
+        workflow = yaml.safe_load(path.read_text())
         self.assertEqual(workflow["concurrency"], {
             "group": "checks-${{ github.event.pull_request.number || "
                      "(github.event_name == 'push' && 'main') || github.sha }}",

@@ -16,6 +16,14 @@
     "rationale": "Existing explicit manual runner subprocess in tools/ci/ignored-tests/manual-cargo-horizon-mod.txt: fixture writer subprocess only. Not selected by daily shards."
   },
   {
+    "package": "horizon-assets",
+    "target": "lib",
+    "test": "root_lease::tests::lease_child",
+    "path": "crates/horizon-assets/src/root_lease.rs",
+    "reason": "subprocess",
+    "rationale": "Subprocess-only helper selected with --include-ignored --exact by root_lease::tests::another_process_prevents_collection_until_it_releases. The parent is scheduled daily; this helper must not block an ordinary test run waiting for stdin."
+  },
+  {
     "package": "horizon-client",
     "target": "lib",
     "test": "game::attachment_instruction_bench::attachment_instruction_count",
@@ -166,6 +174,14 @@
     "path": "crates/horizon-client/src/game/interface/entity_model_loading_tests.rs",
     "reason": "opt-in benchmark; requires ENTITY_MODEL_BENCH_DOCUMENT",
     "rationale": "Existing parity-harness step in tools/ci/ignored-tests/parity-harness.txt; ENTITY_MODEL_BENCH_DOCUMENT supplies its independent oracle/private fixture and drives it separately, not as a prepared-resource daily test."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
+    "test": "game::entity_model_loading_tests::equipment_assets_native_fixture",
+    "path": "crates/horizon-client/src/game/interface/entity_model_loading_tests.rs",
+    "reason": "equipment parity driver supplies isolated roots and output",
+    "rationale": "Explicit private input HORIZON_EQUIPMENT_FIXTURE_ROOT, listed in needs-mobile-audit.txt. Also supply HORIZON_EQUIPMENT_FIXTURE_OUTPUT; the parity driver provides base/merged roots and a private output path. Run the one-process needs runner only with those inputs; no adopted workflow supplies them. All test assertions remain active."
   },
   {
     "package": "horizon-client",
@@ -442,6 +458,14 @@
   {
     "package": "horizon-client",
     "target": "lib",
+    "test": "game::startup_cpu_tests::prepared_preflight_reports_denied_manifest_and_directory_access",
+    "path": "crates/horizon-client/src/game/runtime/startup_cpu_tests.rs",
+    "reason": "requires a non-root Unix process to exercise denied filesystem access",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-mobile-audit.txt. Requires Unix filesystem permissions enforced for a non-root test user. Select this exact test with cargo test -p horizon-client --lib game::startup_cpu_tests::prepared_preflight_reports_denied_manifest_and_directory_access -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
     "test": "game::stats::stat_award_tests::wasm_real_break_and_jump_rewrite_awards",
     "path": "crates/horizon-client/src/game/interface/tests/stat_award_tests.rs",
     "reason": "needs HORIZON_TEST_RESOURCES, HORIZON_WASM_FIXTURE and HORIZON_WASM_STD; build with horizon-mod-wasm/listener-fixture",
@@ -584,6 +608,22 @@
     "rationale": "Existing parity-harness step in tools/ci/ignored-tests/parity-harness.txt; tools/test_opened_loot_parity.py supplies its independent oracle/private fixture and drives it separately, not as a prepared-resource daily test."
   },
   {
+    "package": "horizon-client-lib",
+    "target": "lib",
+    "test": "world_links::tests::compare_java_reference_matrix",
+    "path": "crates/horizon-client/src/world_links.rs",
+    "reason": "requires the private Java PathAllowList oracle JSONL",
+    "rationale": "Explicit private input HORIZON_WORLD_LINK_ORACLE, listed in needs-mobile-audit.txt. Private Java PathAllowList JSONL, never committed. Run the one-process needs runner only with those inputs; no adopted workflow supplies them. All test assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "datapack::tests::recreating_a_world_does_not_discard_unreadable_packs",
+    "path": "crates/horizon-client-render/src/datapack.rs",
+    "reason": "requires Unix permissions enforced for a non-root user",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires Unix filesystem permissions enforced for a non-root test user. Select this exact test with cargo test -p horizon-client-render --lib datapack::tests::recreating_a_world_does_not_discard_unreadable_packs -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
     "package": "horizon-client-render",
     "target": "lib",
     "test": "gfx::crumbling_tests::crack_samples_stay_aligned_between_stages",
@@ -610,6 +650,86 @@
   {
     "package": "horizon-client-render",
     "target": "lib",
+    "test": "gfx::pack_post::pack_frame_tests::compute_only_depth_reads_the_current_world_after_blit_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_frame_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_frame_tests::compute_only_depth_reads_the_current_world_after_blit_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_frame_tests::compute_only_shadow_inputs_use_declared_formats_and_allocations_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_frame_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_frame_tests::compute_only_shadow_inputs_use_declared_formats_and_allocations_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_frame_tests::run_executes_setup_begin_and_final_across_resize_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_frame_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_frame_tests::run_executes_setup_begin_and_final_across_resize_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_storage_tests::mismatched_storage_image_dimension_is_rejected_before_first_frame",
+    "path": "crates/horizon-client-render/src/gfx/pack_storage_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_storage_tests::mismatched_storage_image_dimension_is_rejected_before_first_frame -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_storage_tests::storage_volume_compute_is_sampled_and_retains_history_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_storage_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_storage_tests::storage_volume_compute_is_sampled_and_retains_history_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_terrain_tests::colorless_geometry_program_preserves_its_depth_writes",
+    "path": "crates/horizon-client-render/src/gfx/pack_terrain_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_terrain_tests::colorless_geometry_program_preserves_its_depth_writes -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_terrain_tests::exact_shader_terrain_runs_with_four_and_five_vertex_storage_buffers",
+    "path": "crates/horizon-client-render/src/gfx/pack_terrain_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_terrain_tests::exact_shader_terrain_runs_with_four_and_five_vertex_storage_buffers -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_terrain_tests::terrain_attributes_come_from_page_vertices_and_metadata_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_terrain_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_terrain_tests::terrain_attributes_come_from_page_vertices_and_metadata_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::pack_terrain_tests::terrain_lighting_policy_and_corner_ao_reach_gl_color_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_terrain_tests.rs",
+    "reason": "requires a Metal adapter; run explicitly on macOS",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::pack_post::pack_terrain_tests::terrain_lighting_policy_and_corner_ao_reach_gl_color_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::pack_post::tests::real_packs_build_or_report_unsupported_inputs_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/pack_post.rs",
+    "reason": "requires HORIZON_TEST_SHADER_PACKS with private archives",
+    "rationale": "Explicit private input HORIZON_TEST_SHADER_PACKS, listed in needs-mobile-audit.txt. Private shader-pack archives and a working Metal adapter on macOS. Run the one-process needs runner only with those inputs; no adopted workflow supplies them. All test assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
     "test": "gfx::pack_uniforms::initial_history_tests::core_matrix_inputs_render_provider_values",
     "path": "crates/horizon-client-render/src/gfx/pack_uniforms.rs",
     "reason": "requires a host GPU; run with --ignored --nocapture",
@@ -630,6 +750,22 @@
     "path": "crates/horizon-client-render/src/gfx/resident.rs",
     "reason": "benchmark",
     "rationale": "Opt-in measurement, not an ordinary daily correctness check: benchmark. Run by hand on an idle machine with the optimized profile and its explicitly requested inputs; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::terrain_metadata::compact_tests::mixed_layout_addresses_survive_growth_relocation_and_reuse_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/terrain_metadata/compact_tests.rs",
+    "reason": "requires Metal; run explicitly",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::terrain_metadata::compact_tests::mixed_layout_addresses_survive_growth_relocation_and_reuse_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "gfx::terrain_metadata::tests::quad_sources_survive_arena_page_growth_and_release_on_metal",
+    "path": "crates/horizon-client-render/src/gfx/terrain_metadata.rs",
+    "reason": "requires Metal; run explicitly",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib gfx::terrain_metadata::tests::quad_sources_survive_arena_page_growth_and_release_on_metal -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
   },
   {
     "package": "horizon-client-render",
@@ -702,6 +838,22 @@
     "path": "crates/horizon-client-render/src/particles/tick_bench.rs",
     "reason": "a measurement, not a check",
     "rationale": "Opt-in measurement, not an ordinary daily correctness check: a measurement, not a check. Run by hand on an idle machine with the optimized profile and its explicitly requested inputs; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "pvp::gpu_tests::custom_hit_colours_preserve_every_rgba_value",
+    "path": "crates/horizon-client-render/src/pvp_gpu_tests.rs",
+    "reason": "requires a Vulkan/Metal/DX12 adapter",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib pvp::gpu_tests::custom_hit_colours_preserve_every_rgba_value -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
+  },
+  {
+    "package": "horizon-client-render",
+    "target": "lib",
+    "test": "skins::upload_tests::downloaded_wings_survive_cache_and_atlas_eviction_and_render_source_pixels",
+    "path": "crates/horizon-client-render/src/skins/upload_tests.rs",
+    "reason": "requires a working graphics adapter; executes actual upload/draw/readback",
+    "rationale": "Explicit manual runner by-hand in manual-horizon-client-render-mobile-audit.txt. Requires an interactive/available GPU adapter; run explicitly on macOS with Metal. Select this exact test with cargo test -p horizon-client-render --lib skins::upload_tests::downloaded_wings_survive_cache_and_atlas_eviction_and_render_source_pixels -- --ignored --exact --nocapture. No default job is claimed to supply this platform; all assertions remain active."
   },
   {
     "package": "horizon-client-render",
@@ -1118,6 +1270,14 @@
     "path": "crates/horizon-server/src/service.rs",
     "reason": "creates a scheduled task on this computer",
     "rationale": "Existing explicit manual runner by-hand in tools/ci/ignored-tests/manual-horizon-server.txt: creates a scheduled task on this computer (Windows only). Not selected by daily shards."
+  },
+  {
+    "package": "horizon-shaders",
+    "target": "lib",
+    "test": "post::tests::real_pack_terrain_lighting_policy",
+    "path": "crates/horizon-shaders/src/post.rs",
+    "reason": "needs HORIZON_TEST_TERRAIN_PACK, a local pack never committed",
+    "rationale": "Explicit private input HORIZON_TEST_TERRAIN_PACK, listed in needs-mobile-audit.txt. A private shader-pack zip whose known lighting policy is checked. Run the one-process needs runner only with those inputs; no adopted workflow supplies them. All test assertions remain active."
   },
   {
     "package": "horizon-shaders",

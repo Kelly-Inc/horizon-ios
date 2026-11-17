@@ -7,14 +7,14 @@
 // to link, and project.yml's post-compile script overwrites the result with the Rust binary.
 //
 // If you are reading a log that started at this `main`, that copy did not happen and the bundle is a shell with
-// nothing in it. `cargo build --release --target aarch64-apple-ios -p horizon-client --no-default-features` is
-// the command the build phase runs; its output goes to target/aarch64-apple-ios/release/horizon-client.
+// nothing in it. `cargo build --release --target aarch64-apple-ios -p horizon-official --no-default-features --features audio,horizon-extras` is
+// the command the build phase runs; its output goes to target/aarch64-apple-ios/release/horizon-official.
 #import <Foundation/Foundation.h>
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     NSLog(@"Horizon: this bundle holds the placeholder executable, not the game. The Rust binary was not copied \
-over it, so the build phase that copies it did not run or did not find target/aarch64-apple-ios/release/horizon-client.");
+over it, so the build phase that copies it did not run or did not find target/aarch64-apple-ios/release/horizon-official.");
     return 1;
   }
 }

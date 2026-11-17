@@ -25,18 +25,19 @@ def method(source, name):
 
 
 def program(pad_source=None, command_source=None):
-    pad_source = pad_source or (ROOT / 'crates/horizon-client/src/game/pad_menu.rs').read_text()
-    ime = (ROOT / 'crates/horizon-client/src/game/ime.rs').read_text()
+    pad_source = pad_source or (ROOT / 'crates/horizon-client/src/game/interface/pad_menu.rs').read_text()
+    pad_source += '\n' + (ROOT / 'crates/horizon-client/src/game/interface/pad_menu/keys.rs').read_text()
+    ime = (ROOT / 'crates/horizon-client/src/game/interface/ime.rs').read_text()
     names = ['pad_osk_done_lines', 'pad_typing', 'field_focused', 'sync_system_keyboard', 'show_system_keyboard',
              'hide_system_keyboard', 'toggle_system_keyboard', 'system_keyboard_up', 'pad_osk_output', 'key_focus_blocked', 'pad_has_typing_screen', 'pad_enter_keeps_typing']
-    methods = '\n'.join(method(pad_source, n) for n in names)
-    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/play_input.rs').read_text(), 'reload_blocks_input')
+    methods = '\n'.join(method(pad_source, n).replace('super::super::books', 'super::books') for n in names)
+    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/interface/play_input.rs').read_text(), 'reload_blocks_input')
     methods += '\n' + method(pad_source, 'suspend_system_keyboard')
-    capture = (ROOT / 'crates/horizon-client/src/game/pad/capture.rs').read_text()
+    capture = (ROOT / 'crates/horizon-client/src/game/interface/pad/capture.rs').read_text()
     methods += '\n' + method(capture, 'pad_keyboard_captures') + '\n' + method(capture, 'pad_capture')
-    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/presentation.rs').read_text(), 'menu_input_blocked')
-    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/presentation.rs').read_text(), 'presentation_stale')
-    chat = (ROOT / 'crates/horizon-client/src/game/chat.rs').read_text()
+    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/interface/presentation.rs').read_text(), 'menu_input_blocked')
+    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/interface/presentation.rs').read_text(), 'presentation_stale')
+    chat = (ROOT / 'crates/horizon-client/src/game/interface/chat.rs').read_text()
     methods += '\n' + method(chat, 'chat_text_focused') + '\n' + method(chat, 'bed_chat_focus') + '\n' + method(chat, 'bed_chat_choose_at')
     assert methods.count('cfg!(target_os = "ios")') == 2
     methods = methods.replace('cfg!(target_os = "ios")', 'self.ios')
@@ -44,11 +45,12 @@ def program(pad_source=None, command_source=None):
     context = pad_source[context_start:pad_source.index('        let act =', context_start)]
     methods += '\nfn actual_navigation_typing(&mut self)->bool { let slider_edit=false; ' + context + '\nctx.typing }'
     methods += '\n' + method((ROOT / 'crates/horizon-client/src/game.rs').read_text(), 'title_input_active')
-    methods += '\n' + method(ime, 'text_field_focused') + '\n' + method(ime, 'ime_commit')
-    command_source = command_source or (ROOT / 'crates/horizon-client/src/game/command_blocks.rs').read_text()
+    methods += '\n' + method(ime, 'text_field_focused') + '\n' + method(ime, 'ime_commit') + '\n' + method(ime, 'ime_type')
+    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/native_hooks/shared.rs').read_text(), 'screen_text_each')
+    command_source = command_source or (ROOT / 'crates/horizon-client/src/game/administration/command_blocks.rs').read_text()
     methods += '\n' + method(command_source, 'command_block_key')
-    chat_input = (ROOT / 'crates/horizon-client/src/game/chat_input.rs').read_text()
-    control = (ROOT / 'crates/horizon-client/src/game/control.rs').read_text()
+    chat_input = (ROOT / 'crates/horizon-client/src/game/interface/chat_input.rs').read_text()
+    control = (ROOT / 'crates/horizon-client/src/game/runtime/control.rs').read_text()
     title_owner = 'mod control { use super::*; pub(crate) ' + method(control, 'title_owns_text') + ' }\n'
     helper = title_owner + 'mod chat_input { use super::*; pub(crate) ' + method(chat_input, 'text_without_physical_key') + ' }\n'
     uikit = (ROOT / 'third_party/winit/src/platform_impl/ios/hardware_keyboard.rs').read_text()
@@ -120,6 +122,7 @@ impl Game {
  fn dialog_has_text_field(&self)->bool{self.dialog_text} fn recipe_search_focused(&self)->bool{self.recipe}
  fn station_typing(&self)->bool{self.station} fn mod_browser_typing(&self)->bool{false}
  fn world_options_typing(&self)->bool{false} fn mod_browser_text(&mut self,_:Option<&str>,_:bool){}
+ fn screen_char_canceled(&self,_:char)->bool{false}
  fn screen_text_typed(&self,t:&str)->Option<String>{Some(t.into())}
  fn social_type(&mut self,_:&str){} fn debug_options_type(&mut self,_:&str){} fn block_editor_type(&mut self,_:&str){}
  fn command_block_type(&mut self,t:&str){self.command.push_str(t)}

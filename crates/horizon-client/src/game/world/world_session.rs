@@ -365,7 +365,7 @@ mod tests {
         fn set_control_flow(&self, _: winit::event_loop::ControlFlow) {}
     }
     #[test]
-    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn title_world_preparation_failures_are_recoverable_and_keep_creation_inputs() {
         use horizon_client::title::{Mode, Title, WorldOptions};
         for deferred in [false, true] {
@@ -382,7 +382,11 @@ mod tests {
                 ..Default::default()
             };
             let mut game = super::super::native_machines::tests::server_game();
-            let mut title = Title::new(fixture.0.join("saves"), &game.options.resources);
+            let mut title = Title::new(
+                fixture.0.join("saves"),
+                &game.options.resources,
+                &game.gui.splashes,
+            );
             title.mode = Mode::Create {
                 name: "Kept name".into(),
                 seed: "4242".into(),
@@ -445,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn raw_world_requests_keep_error_results_even_when_a_title_exists() {
         for deferred in [false, true] {
             let fixture = Scratch::new();
@@ -456,6 +460,7 @@ mod tests {
             game.title = Some(horizon_client::title::Title::new(
                 fixture.0.join("saves"),
                 &game.options.resources,
+                &game.gui.splashes,
             ));
             let folder = world.to_str().unwrap();
             let result = if deferred {
@@ -581,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn a_pack_copy_failure_aborts_creation_and_keeps_the_staged_packs() {
         let root = std::env::temp_dir().join(format!(
             "horizon-pack-copy-{}-{}",
@@ -638,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn create_world_cannot_change_pack_selection_before_taking_the_world_lock() {
         let root = std::env::temp_dir().join(format!(
             "horizon-create-lock-{}-{}",

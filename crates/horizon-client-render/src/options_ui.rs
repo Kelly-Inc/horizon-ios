@@ -2302,6 +2302,8 @@ impl OptionsUi {
             &self.settings_search
         } else if self.page() == Page::Packs {
             return self.pack_screen.as_ref().and_then(|p| p.search_rect());
+        } else if self.page() == Page::Mods {
+            return self.mods_screen.as_ref().and_then(|p| p.search_rect());
         } else {
             return None;
         };
@@ -4916,6 +4918,48 @@ mod tests {
             assert!(!ui.typing());
             assert_eq!(ui.focused_rect(), None);
         }
+    }
+
+    #[test]
+    fn mobile_mod_search_exposes_its_current_focus_rectangle() {
+        let atlas = atlas();
+        let mut settings = Settings::default();
+        let mut ui = OptionsUi::default();
+        let size = (480.0, 240.0);
+        ui.show(Page::Mods);
+        assert_eq!(ui.focused_rect(), None);
+        // The real ModsScreen search starts at (41, 6) in this layout.
+        ui.click(
+            &mut settings,
+            &atlas,
+            42.0,
+            7.0,
+            size,
+            [480, 240],
+            false,
+            false,
+        );
+        assert!(ui.typing());
+        let first = ui.mods_screen.as_ref().unwrap().search_rect().unwrap();
+        assert_eq!(ui.focused_rect(), Some(first));
+        ui.mods_page(&settings, (640.0, 360.0));
+        let resized = ui.mods_screen.as_ref().unwrap().search_rect().unwrap();
+        assert_ne!(resized[0], first[0]);
+        assert_eq!(ui.focused_rect(), Some(resized));
+        ui.resource_error = Some("resource error".into());
+        assert_eq!(ui.focused_rect(), None);
+        ui.resource_error = None;
+        ui.show(Page::Language);
+        assert_eq!(
+            ui.focused_rect(),
+            Some([
+                ui.language_search.x,
+                ui.language_search.y,
+                ui.language_search.width,
+                ui.language_search.height,
+            ])
+        );
+        assert_ne!(ui.focused_rect(), Some(resized));
     }
 
     #[test]

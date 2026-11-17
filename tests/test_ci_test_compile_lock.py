@@ -45,6 +45,112 @@ class TestCompileLockTests(unittest.TestCase):
                 if pid_file.exists():
                     os.kill(int(pid_file.read_text()), signal.SIGTERM)
 
+    def test_python_fallback_forwards_cargo_jobserver_descriptors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, b"+")
+                env = dict(os.environ, CARGO_MAKEFLAGS=f"-j --jobserver-auth={read_fd},{write_fd}")
+                command = [sys.executable, str(WRAPPER.with_name("test_compile_lock.py")),
+                           str(Path(directory) / "compile.lock"), sys.executable, "-c",
+                           "import os,sys; r,w=map(int,sys.argv[1:]); "
+                           "assert os.read(r,1)==b'+'; os.write(w,b'+'); print('inherited')",
+                           str(read_fd), str(write_fd)]
+                result = subprocess.run(command, env=env, pass_fds=(read_fd, write_fd),
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "inherited\n")
+                self.assertTrue(select.select([read_fd], [], [], 1)[0])
+                self.assertEqual(os.read(read_fd, 1), b"+")
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
+
+    def test_python_fallback_does_not_forward_files_as_a_jobserver(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                tempfile.TemporaryFile() as first, tempfile.TemporaryFile() as second:
+            pair = (first.fileno(), second.fileno())
+            self.check_invalid_jobserver(directory, pair, pair)
+
+    def test_python_fallback_does_not_forward_a_partial_jobserver_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            try:
+                self.check_invalid_jobserver(directory, (read_fd, write_fd), (read_fd,))
+            finally:
+                os.close(read_fd)
+
+    def test_python_fallback_discards_out_of_range_jobserver_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.check_invalid_jobserver(directory, (10 ** 100, 10 ** 100 + 1), ())
+
+    def test_python_fallback_honors_disabled_jobserver_descriptors(self):
+        # GNU jobservers explicitly disable inheritance with negative fd numbers.
+        with tempfile.TemporaryDirectory() as directory:
+            for pair in [(-2, -2), (-1, 42), (42, -1)]:
+                with self.subTest(pair=pair):
+                    self.check_invalid_jobserver(directory, pair, ())
+
+    def test_python_fallback_preserves_named_fifo_advertisements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            flags = "-j --jobserver-auth=fifo:/private/make-pipe --verbose"
+            result = subprocess.run(
+                [sys.executable, str(WRAPPER.with_name("test_compile_lock.py")),
+                 str(Path(directory) / "compile.lock"), sys.executable, "-c",
+                 "import os; print(os.environ['CARGO_MAKEFLAGS'])"],
+                env=dict(os.environ, CARGO_MAKEFLAGS=flags),
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), flags)
+
+    def test_python_fallback_preserves_read_write_fifo_descriptors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobserver"
+            os.mkfifo(path)
+            first = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            second = os.dup(first)
+            try:
+                os.write(second, b"+")
+                flags = f"-j --jobserver-auth={first},{second}"
+                result = subprocess.run(
+                    [sys.executable, str(WRAPPER.with_name("test_compile_lock.py")),
+                     str(Path(directory) / "compile.lock"), sys.executable, "-c",
+                     "import os,sys; r,w=map(int,sys.argv[1:]); "
+                     "assert os.read(r,1)==b'+'; os.write(w,b'+')",
+                     str(first), str(second)],
+                    env=dict(os.environ, CARGO_MAKEFLAGS=flags), pass_fds=(first, second),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(select.select([first], [], [], 1)[0])
+                self.assertEqual(os.read(first, 1), b"+")
+            finally:
+                os.close(first)
+                os.close(second)
+
+    def check_invalid_jobserver(self, directory, advertised, inherited):
+        flags = f"-j --jobserver-auth={advertised[0]},{advertised[1]} --verbose"
+        env = dict(os.environ, CARGO_MAKEFLAGS=flags, MAKEFLAGS=flags)
+        script = """import json,os,sys
+live=[]
+for value in sys.argv[1:]:
+ try:os.fstat(int(value));live.append(int(value))
+ except OSError:pass
+print(json.dumps({'live':live,'cargo':os.environ['CARGO_MAKEFLAGS'],'make':os.environ['MAKEFLAGS']}))
+"""
+        result = subprocess.run(
+            [sys.executable, str(WRAPPER.with_name("test_compile_lock.py")),
+             str(Path(directory) / "compile.lock"), sys.executable, "-c", script,
+             *map(str, inherited)], env=env, pass_fds=inherited,
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output['live'], [], "unrelated or partial descriptors escaped to the compiler")
+        for name in ('cargo', 'make'):
+            self.assertNotIn('--jobserver-', output[name])
+            self.assertIn('--verbose', output[name])
+            self.assertNotIn('-j', output[name].split(), "missing jobserver must not mean unlimited jobs")
+
     def test_response_file_and_equals_form_take_the_lock_without_rewriting_arguments(self):
         import fcntl
 

@@ -4994,10 +4994,11 @@ texture=wide",
             atlas.sprites["horizon/ui-text"].texels((atlas.width, atlas.height)),
             (2048, 1024)
         );
-        // Nothing Mojang's was walked: only synthetic slots and the exact bundled controller
-        // and Horizon mark images. Their names use the resource namespace spelling (`horizon:...`).
+        // Nothing Mojang's was walked: only synthetic slots and the bundled
+        // controller, Horizon mark and generated Mods icon images.
         let bundled: std::collections::HashSet<String> = crate::pad_glyph::images()
             .chain(crate::mark_sprite::image())
+            .chain(std::iter::once(crate::mods_screen::icon_image()))
             .map(|(name, _, _, _)| name)
             .collect();
         let foreign: Vec<&str> = atlas

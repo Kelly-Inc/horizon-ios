@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    screen = (ROOT / 'crates/horizon-client/src/game/import_screen.rs').read_text()
-    launcher = (ROOT / 'crates/horizon-client/src/game/launcher.rs').read_text()
+    screen = (ROOT / 'crates/horizon-client/src/game/interface/import_screen.rs').read_text()
+    launcher = (ROOT / 'crates/horizon-client/src/game/runtime/launcher.rs').read_text()
     imports = (ROOT / 'crates/horizon-client/src/import.rs').read_text()
-    startup = (ROOT / 'crates/horizon-client/src/game/startup_menu.rs').read_text()
+    startup = (ROOT / 'crates/horizon-client/src/game/interface/startup_menu.rs').read_text()
     functions = 'pub ' + method(imports, 'resources_root')
     methods = method(screen, 'load_the_files_that_arrived') + '\n' + method(startup, 'poll_menu_resources')
     if 'fn refresh_import_root(' in screen:
@@ -50,7 +50,7 @@ fn importing_archive()->bool{false}
 struct Request{line:String}impl Request{fn answer(self,_:&str){}}
 struct Json(String);impl std::fmt::Display for Json{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str(&self.0)}}
 macro_rules! json{({"error": $error:expr})=>{Json(format!("error:{}",$error))};({"ok": $ok:expr, "phase": $phase:expr})=>{Json(format!(r#"{{"ok":{},"phase":"{}"}}"#,$ok,$phase))};}
-struct Options{resources:PathBuf}
+struct Options{execution_role:(),resources:PathBuf}
 struct Progress;impl Progress{fn new()->Self{Self}}
 enum LoaderMsg{Ui(usize,PathBuf),Done(std::result::Result<(),String>)}
 fn panic_text(_:&(dyn std::any::Any+Send))->&str{"fixture panic"}
@@ -60,7 +60,7 @@ impl Loading{
  // Browser polling is a boundary endpoint here; its real ownership has separate Rust tests.
  fn drive_menu_mod_browser(&mut self){BROWSER_POLLS.fetch_add(1,std::sync::atomic::Ordering::SeqCst);}
  fn restart_menu_resources(&mut self)->Result<()>{Ok(())}
- fn new(base:PathBuf,selected:PathBuf)->Self{Self{loaded:None,delivered:false,ui_seen:vec![],handle:None,progress:Progress,options:Some(Options{resources:selected}),settings:(),vanilla_root:base,started:Instant::now(),receiver:mpsc::channel().1}}
+ fn new(base:PathBuf,selected:PathBuf)->Self{Self{loaded:None,delivered:false,ui_seen:vec![],handle:None,progress:Progress,options:Some(Options{execution_role:(),resources:selected}),settings:(),vanilla_root:base,started:Instant::now(),receiver:mpsc::channel().1}}
 }
 static CAPTURE:Mutex<Vec<(PathBuf,PathBuf)>>=Mutex::new(Vec::new());
 static READ_BYTES:Mutex<Vec<Vec<u8>>>=Mutex::new(Vec::new());
@@ -68,7 +68,7 @@ static BROWSER_POLLS:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsi
 static FAIL_NEXT_SPAWN:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
 mod startup_menu{
  use super::*;
- pub fn spawn_loader(options:&Options,_:&(),base:&Path,_:Instant,_:&Progress)->Result<(mpsc::Receiver<LoaderMsg>,JoinHandle<()>)>{
+ pub fn spawn_loader(options:&Options,_:&(),_:(),base:&Path,_:Instant,_:&Progress)->Result<(mpsc::Receiver<LoaderMsg>,JoinHandle<()>)>{
   CAPTURE.lock().unwrap().push((options.resources.clone(),base.to_owned()));
   if FAIL_NEXT_SPAWN.swap(false,std::sync::atomic::Ordering::SeqCst){return Err("fixture thread spawn failed".into());}
   // Read actual bytes from the exact root the production method hands over.
@@ -161,7 +161,7 @@ fn main(){
  // reads its captured inputs. Do not refresh a second time and mask the bug.
  std::fs::rename(staged,&final_root).unwrap();
  let options=gap.options.as_ref().unwrap();
- let(receiver,worker)=startup_menu::spawn_loader(options,&gap.settings,&gap.vanilla_root,gap.started,&gap.progress)
+ let(receiver,worker)=startup_menu::spawn_loader(options,&gap.settings,(),&gap.vanilla_root,gap.started,&gap.progress)
   .expect("the publication-gap refresh captured its stale missing resource path");
  worker.join().unwrap();drop(receiver);
  assert_eq!(CAPTURE.lock().unwrap().last().unwrap(),&(final_root.clone(),final_root));

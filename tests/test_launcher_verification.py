@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 class LauncherVerification(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "Linux Bash publishing step")
     def test_verification_uses_the_publishing_repository(self):
-        workflow = (ROOT / ".github/workflows/launcher.yml").read_text()
+        path = ROOT / ".github/workflows/launcher.yml"
+        if not path.is_file():
+            self.assertTrue((ROOT / ".github/workflows/ios.yml").is_file())
+            self.skipTest("The iOS fork does not publish the desktop launcher")
+        workflow = path.read_text()
         step = workflow.split("      - name: The signature, checked as launchers check it\n", 1)[1]
         shell = step.split("        run: |\n", 1)[1]
         # Read only this run block, not following steps or workflow metadata.

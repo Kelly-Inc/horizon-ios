@@ -283,7 +283,13 @@ impl<'a> Harness<'a> {
     fn frame(&self, post: &mut PackPost, render: u32) -> Pixels {
         super::wait_resize(post, self.device, self.queue, [render, render]);
         let world = WorldTargets::new(self.device, render);
-        let hud = crate::hud::HudBatch::new(WINDOW);
+        let hud = crate::hud::HudBatch::new(
+            WINDOW,
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let frame = empty_frame(&hud);
         let inputs = PackInputs::default();
         let mut encoder = self.device.create_command_encoder(&Default::default());

@@ -10,8 +10,8 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def program():
-    trace=(ROOT/'crates/horizon-client/src/game/input_trace.rs').read_text()
-    replay=(ROOT/'crates/horizon-client/src/game/repro.rs').read_text()
+    trace=(ROOT/'crates/horizon-client/src/game/runtime/input_trace.rs').read_text()
+    replay=(ROOT/'crates/horizon-client/src/game/runtime/repro.rs').read_text()
     actual=method(trace,'trace_window_event')
     gate=actual[actual.index('        if origin'):actual.index('        match event')]
     start=trace.index('            WindowEvent::Touch(touch) =>')

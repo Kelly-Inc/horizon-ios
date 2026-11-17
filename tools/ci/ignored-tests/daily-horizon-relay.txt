@@ -9,7 +9,6 @@ horizon-relay hosts_per_address::an_address_holds_only_so_many_hosts test:it dai
 horizon-relay open_per_address::silent_connections_past_an_address_cap_close_at_once test:it daily network
 horizon-relay ping_schedule::guest_joins_do_not_starve_a_hosts_pings test:it daily slow
 horizon-relay proxy_from::a_listed_load_balancer_names_the_client test:it daily network
-horizon-relay proxy_from::anyone_else_is_closed_before_the_first_line test:it daily network
 horizon-relay proxy_from::anyone_else_is_closed_unanswered test:it daily network
 horizon-relay tunnel::a_host_that_never_attaches_is_unreachable test:it daily network
 horizon-relay tunnel::a_short_code_through_a_self_hosted_relay test:it daily network

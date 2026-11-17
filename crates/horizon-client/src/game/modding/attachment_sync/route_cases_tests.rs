@@ -96,6 +96,13 @@ fn a_dedicated_server_sends_only_trackers_in_packet_order() {
                 Some(1),
                 true,
                 Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir()
+                        .unwrap()
+                        .join("saves")
+                        .join("sync_cases"),
+                )
+                .unwrap(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);

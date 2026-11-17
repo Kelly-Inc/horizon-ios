@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
 class LocalPackReloadTests(unittest.TestCase):
     def test_unified_reload_keeps_ui_responsive_and_routes_latest_results(self):
-        source = (ROOT / "crates/horizon-client/src/game/packs.rs").read_text()
+        source = (ROOT / "crates/horizon-client/src/game/world/packs/mod.rs").read_text()
         def production_method(signature, source=source):
             start = source.index(signature)
             opening = source.index("{", start)
@@ -32,7 +32,7 @@ class LocalPackReloadTests(unittest.TestCase):
             "    pub(super) fn drive_pack_reload(",
             "    fn finish_content_reload(",
         ))
-        transaction = (ROOT / "crates/horizon-client/src/game/packs/transaction.rs").read_text()
+        transaction = (ROOT / "crates/horizon-client/src/game/world/packs/transaction.rs").read_text()
         method += "\n" + production_method("    pub(in crate::game) fn content_reload_busy(", transaction)
         fixture = r'''
 extern crate self as log;
@@ -58,7 +58,7 @@ struct ContentTransaction { ready: std::sync::mpsc::Receiver<()> }
  pack_reload: Option<PackReload>, pending_pack_reload: bool,
  rest_loader: Option<()>, pending_entry: Option<()>, integrated_starting: Option<()>,
  applied: Vec<u32>, selection_errors: Vec<String>, server_results: Vec<bool>,
- mods:Mods,mod_callbacks:usize,
+ mod_transaction:Option<ContentTransaction>,mod_callbacks:usize,
 }
 impl Game {
  fn apply_staged_pack(&mut self,StagedPack(value):StagedPack)->Result<(),String> {
@@ -72,9 +72,9 @@ impl Game {
   let result=self.apply_staged_pack(staged);self.finish_content_reload(kind,result);
  }
  fn poll_content_reload(&mut self) {
-  if let Some(transaction)=&self.mods.transaction {
+  if let Some(transaction)=&self.mod_transaction {
    match transaction.ready.try_recv(){
-    Ok(())=>self.mods.transaction=None,
+    Ok(())=>self.mod_transaction=None,
     Err(std::sync::mpsc::TryRecvError::Empty)=>{},
     Err(std::sync::mpsc::TryRecvError::Disconnected)=>panic!("fixture transaction producer disappeared"),
    }
@@ -111,7 +111,7 @@ fn main() {
  // A completed pack result must stay owned until an existing content
  // transaction finishes; repeatedly polling it cannot publish or notify early.
  let(release,ready)=std::sync::mpsc::channel();
- g.mods.transaction=Some(ContentTransaction{ready});
+ g.mod_transaction=Some(ContentTransaction{ready});
  g.complete(ReloadKind::Selection,Ok(9));
  for _ in 0..3 {g.drive_pack_reload();assert!(g.pack_reload.is_some());assert!(g.applied.is_empty());assert_eq!(g.mod_callbacks,0);}
  release.send(()).unwrap();g.drive_pack_reload();

@@ -40,6 +40,7 @@ fn prepared(dir: &Path) -> PathBuf {
 }
 
 #[test]
+#[ignore = "daily"]
 fn the_command_writes_an_archive_the_phone_installs() {
     let dir = home("out");
     let folder = prepared(&dir);
@@ -47,7 +48,14 @@ fn the_command_writes_an_archive_the_phone_installs() {
     let run = Command::new(env!("CARGO_BIN_EXE_horizon-client"))
         .args(["--pack-resources", folder.to_str().unwrap()])
         .args(["--out", out.to_str().unwrap()])
+        .current_dir(&dir)
         .env("HORIZON_HOME", &dir)
+        .env("HORIZON_LAUNCHER_HOME", dir.join("launcher"))
+        .env("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1")
+        .env("HORIZON_LAUNCHER_TRASH", dir.join("trash"))
+        .env("HORIZON_LAUNCHER_CLIPBOARD", dir.join("clipboard"))
+        .env("HORIZON_LAUNCHER_DESKTOP", dir.join("desktop"))
+        .env_remove("HORIZON_SESSION_FILE")
         .env("XDG_DATA_HOME", &dir)
         .env("XDG_CONFIG_HOME", &dir)
         .env("HOME", &dir)
@@ -77,12 +85,20 @@ fn the_command_writes_an_archive_the_phone_installs() {
 }
 
 #[test]
+#[ignore = "daily"]
 fn without_out_the_archive_lands_beside_the_folder_it_came_from() {
     let dir = home("default");
     let folder = prepared(&dir);
     let run = Command::new(env!("CARGO_BIN_EXE_horizon-client"))
         .args(["--pack-resources", folder.to_str().unwrap()])
+        .current_dir(&dir)
         .env("HORIZON_HOME", &dir)
+        .env("HORIZON_LAUNCHER_HOME", dir.join("launcher"))
+        .env("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1")
+        .env("HORIZON_LAUNCHER_TRASH", dir.join("trash"))
+        .env("HORIZON_LAUNCHER_CLIPBOARD", dir.join("clipboard"))
+        .env("HORIZON_LAUNCHER_DESKTOP", dir.join("desktop"))
+        .env_remove("HORIZON_SESSION_FILE")
         .env("XDG_DATA_HOME", &dir)
         .env("XDG_CONFIG_HOME", &dir)
         .env("HOME", &dir)
@@ -101,6 +117,7 @@ fn without_out_the_archive_lands_beside_the_folder_it_came_from() {
 }
 
 #[test]
+#[ignore = "daily"]
 fn a_folder_that_is_not_one_of_the_three_is_refused() {
     let dir = home("refused");
     fs::create_dir_all(dir.join("holiday")).unwrap();
@@ -108,7 +125,14 @@ fn a_folder_that_is_not_one_of_the_three_is_refused() {
     let run = Command::new(env!("CARGO_BIN_EXE_horizon-client"))
         .args(["--pack-resources", dir.join("holiday").to_str().unwrap()])
         .args(["--out", dir.join("out.zip").to_str().unwrap()])
+        .current_dir(&dir)
         .env("HORIZON_HOME", &dir)
+        .env("HORIZON_LAUNCHER_HOME", dir.join("launcher"))
+        .env("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1")
+        .env("HORIZON_LAUNCHER_TRASH", dir.join("trash"))
+        .env("HORIZON_LAUNCHER_CLIPBOARD", dir.join("clipboard"))
+        .env("HORIZON_LAUNCHER_DESKTOP", dir.join("desktop"))
+        .env_remove("HORIZON_SESSION_FILE")
         .env("XDG_DATA_HOME", &dir)
         .env("XDG_CONFIG_HOME", &dir)
         .env("HOME", &dir)

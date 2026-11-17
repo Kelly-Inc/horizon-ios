@@ -52,8 +52,25 @@ fn fixture() -> (Hub, Vec<mpsc::Receiver<Out>>) {
         max_players: 20,
         integrated: false,
         levels: Default::default(),
+        level_seeds: Default::default(),
     };
-    let mut hub = Hub::new(lan, sync, encoder, config);
+    let mut hub = Hub::new(
+        lan,
+        sync,
+        encoder,
+        config,
+        Arc::new(
+            horizon_world::native_load_context::LoadContext::new(
+                horizon_world::native_load_context::DataLoadOrigin::ServerDataLoad,
+                Arc::new(horizon_world::native_load_context::LoadInputs::new(
+                    Default::default(),
+                    Default::default(),
+                )),
+                [],
+            )
+            .captured_loop_context(horizon_world::native_load_context::LoopSide::Server),
+        ),
+    );
     let mut receivers = Vec::new();
     for id in [1, 2] {
         let (sender, receiver) = mpsc::channel();
@@ -75,7 +92,6 @@ fn fixture() -> (Hub, Vec<mpsc::Receiver<Out>>) {
                 latency: Arc::new(std::sync::atomic::AtomicI32::new(0)),
                 address: "127.0.0.1:25565".parse().unwrap(),
                 expected: false,
-                configured: Default::default(),
             },
             id as i32,
             at,
@@ -186,14 +202,16 @@ fn late_held_viewer_gets_full_idle_entity_metadata_equipment_and_item_stack() {
 
     // Held arrivals watch the world even before placement. Being near but
     // lacking the column must force full data, without pairing too early.
-    hub.guests[1].position = [0.5, 64.0, 0.5];
-    hub.guests[1].moved = true;
+    hub.guests
+        .update(1, |guest| guest.position = [0.5, 64.0, 0.5]);
+    hub.guests.update(1, |guest| guest.moved = true);
     assert_eq!(tick(&mut hub, &mut cache, &mut world), [false, false]);
     assert!(!hub.guests[1].tracker.is_tracking(101));
     assert!(!hub.guests[1].tracker.is_tracking(102));
     packets(&receivers[1]);
-    hub.guests[1].sent_chunks.insert((5, 0));
-    hub.guests[1].moved = true;
+    hub.guests
+        .update(1, |guest| guest.sent_chunks.insert((5, 0)));
+    hub.guests.update(1, |guest| guest.moved = true);
     assert_eq!(tick(&mut hub, &mut cache, &mut world), [false, false]);
     let sent = packets(&receivers[1]);
     let added: HashSet<_> = sent

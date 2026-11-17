@@ -15,16 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    game = (ROOT / 'crates/horizon-client/src/game/resource_loader.rs').read_text()
-    menu = (ROOT / 'crates/horizon-client/src/game/startup_menu.rs').read_text()
+    game = (ROOT / 'crates/horizon-client/src/game/runtime/resource_loader.rs').read_text()
+    menu = (ROOT / 'crates/horizon-client/src/game/interface/startup_menu.rs').read_text()
     imports = (ROOT / 'crates/horizon-client/src/import.rs').read_text()
-    resource = (ROOT / 'crates/horizon-client/src/game/resource_load.rs').read_text()
+    resource = (ROOT / 'crates/horizon-client/src/game/runtime/resource_load.rs').read_text()
     a = resource.index('    let rest_loader = if menu {', resource.index('fn load_resources_with_access('))
     b = resource.index('    // The world tables load (above)', a)
     rest = resource[a:b]
     a = game.index('struct WorldRestLoader {')
     b = game.index('pub(super) fn write_report', a)
-    loader = (game[a:b] + game[game.index('pub(super) fn retired_rest_loaders'):]).replace('pub(super) ', '')
+    loader = (game[a:b] + 'pub ' + method(game, 'retired_rest_loaders') + '\n' + game[game.index('pub(super) fn poll_retired_rest_loaders'):]).replace('pub(super) ', '')
     if 'struct HomeGate {' in imports:
         a = imports.rfind('#[derive', 0, imports.index('struct HomeGate {'))
         b = imports.rfind('#[derive', a, imports.index('pub enum Kind'))
@@ -32,10 +32,10 @@ def program():
     else:
         access = 'pub ' + method(imports.replace('with_home_access<T>', 'with_home_access'), 'with_home_access').replace('fn with_home_access(', 'fn with_home_access<T>(', 1)
     startup = 'pub ' + method(menu, 'spawn_loader')
-    mods = (ROOT / 'crates/horizon-client/src/game/mods.rs').read_text()
+    mods = '\n'.join((ROOT / ('crates/horizon-client/src/game/modding/mods/' + name)).read_text() for name in ['mod.rs', 'snapshots.rs'])
     prepare = 'pub ' + method(mods, 'prepare_content')
     prepare += '\n' + 'pub ' + method(mods, 'content_for_loaded_root')
-    wanted = 'pub ' + method((ROOT / 'crates/horizon-client/src/game/mods/catalog.rs').read_text(), 'wanted_ids')
+    wanted = 'pub ' + method((ROOT / 'crates/horizon-client/src/game/modding/mods/catalog.rs').read_text(), 'wanted_ids')
     lease = f'#[path="{ROOT / "crates/horizon-assets/src/root_lease.rs"}"]mod root_lease;\n'
     return STUBS.replace('HOME_ACCESS_FUNCTION', access).replace('PREPARE_CONTENT_FUNCTION', prepare).replace('ROOT_LEASE_MODULE', lease).replace('WANTED_IDS_FUNCTION', wanted) + loader + '\nmod production {use super::*;\n' + startup + '\n}\n' + LOAD_PREFIX + rest + LOAD_SUFFIX + CASES
 
@@ -45,6 +45,8 @@ STUBS = r'''
 extern crate self as horizon_client;
 extern crate self as horizon_assets;
 extern crate self as log;
+extern crate self as horizon_guest_stack;
+fn builder()->std::thread::Builder{std::thread::Builder::new()}
 ROOT_LEASE_MODULE
 #[macro_export]macro_rules! warn{($($t:tt)*)=>{{}}}
 #[macro_export]macro_rules! info{($($t:tt)*)=>{{}}}
@@ -61,12 +63,22 @@ static SNAPSHOT_HELD:AtomicBool=AtomicBool::new(false);
 mod mod_registry{use super::*;pub fn with_content_snapshot<T>(home:&Path,read:impl FnOnce()->T)->Result<T>{assert_eq!(home,import::home());RECOVERY_OBSERVED.store(true,Ordering::SeqCst);SNAPSHOT_HELD.store(true,Ordering::SeqCst);let result=read();SNAPSHOT_HELD.store(false,Ordering::SeqCst);Ok(result)}}
 #[derive(Clone)]struct Mods{enabled:BTreeSet<String>,disabled:BTreeSet<String>}
 #[derive(Clone)]struct Settings{resource_packs:Vec<String>,mods:Mods}
-struct Options{dev_mods:Vec<PathBuf>}
+struct Options{mods:mods::ModsState}
 fn launch_world(_: &Options)->Option<&str>{None}
-mod packs{use super::*;pub fn overlay_content(_:&Path,_:&Vec<String>,_:&[()],content:Arc<mods::PreparedContent>)->Result<Arc<mods::PreparedContent>>{Ok(content)}
+mod packs{use super::*;pub fn overlay_content(_:&Path,_:&Vec<String>,_:&[()],content:&Arc<mods::PreparedContent>)->Result<resource_source::ResourceRoot>{Ok(content.root.clone())}
 pub fn startup_root_leased(root:&Path,_:&Vec<String>,_:&[()])->Result<(PathBuf,root_lease::RootLease)>{Ok((root.to_owned(),root_lease::RootLease::acquire(root)?))}}
+mod pack_finders{pub fn data_packs(_: &super::mods::ModsState)->Vec<()>{vec![]}}
+mod resource_source{use super::*;
+ #[derive(Clone)]pub struct ResourceRoot{path:PathBuf,pub lease:Option<root_lease::RootLease>}
+ impl ResourceRoot{pub fn directory(path:PathBuf)->Self{Self{path,lease:None}}pub fn with_root_lease(mut self,lease:root_lease::RootLease)->Self{self.lease=Some(lease);self}pub fn prepared(&self)->&Path{&self.path}}
+ impl PartialEq<PathBuf> for ResourceRoot{fn eq(&self,r:&PathBuf)->bool{self.path==*r}}
+ impl std::fmt::Debug for ResourceRoot{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{self.path.fmt(f)}}
+}
 mod mods{use super::*;
- pub struct PreparedContent{pub root:PathBuf,pub catalog:Arc<catalog::Catalog>,pub selection:Selection,pub lease:root_lease::RootLease,pub data_changed:bool}
+ #[derive(Clone,Default)]pub struct ModsState{pub dev:Vec<PathBuf>,pub native:(),pub content:Option<Arc<PreparedContent>>,pub active_condition_root:Option<PathBuf>}
+ impl ModsState{pub fn capture_code_switches(&mut self,_:&BTreeSet<String>){}}
+ pub type LoadRole=();
+ pub struct PreparedContent{pub root:resource_source::ResourceRoot,pub catalog:Arc<catalog::Catalog>,pub selection:Selection,pub sources:ModsState,pub data_changed:bool}
  mod catalog{use super::*;
   pub struct Catalog{pub entries:BTreeMap<String,()>,pub invalid:BTreeSet<String>,pub native_ids:BTreeSet<String>}
   impl Catalog{WANTED_IDS_FUNCTION}
@@ -77,11 +89,12 @@ mod mods{use super::*;
   }
   impl Selection{pub fn wanted(enabled:&BTreeSet<String>,catalog:&Catalog)->Self{Self{enabled:enabled.clone(),entries:catalog.entries.clone(),order:vec!["content.mod".into()]}}}
  }
- use catalog::Selection;
+ use catalog::{Selection,Catalog};
+ fn read_catalog(home:&Path,dev:&[PathBuf],_:&(),_:&())->std::result::Result<Arc<Catalog>,String>{catalog::read(home,dev,&BTreeSet::new())}
  pub fn snapshot_has_no_content(content:&PreparedContent)->bool{content.selection.entries.is_empty()&&content.selection.order.is_empty()}
- mod content{use super::*;pub fn build(root:&Path,home:&Path,selection:&Selection,catalog:Arc<catalog::Catalog>,live:bool)->std::result::Result<Arc<PreparedContent>,String>{
-  assert_eq!(home,import::home());assert!(!live);assert!(SNAPSHOT_HELD.load(Ordering::SeqCst),"content read escaped snapshot gate");
-  let requested=Arc::new(PreparedContent{root:root.to_owned(),catalog,selection:selection.clone(),lease:root_lease::RootLease::acquire(root).map_err(|e|e.to_string())?,data_changed:true});
+ mod content{use super::*;pub fn build(root:&Path,selection:&Selection,catalog:Arc<catalog::Catalog>,sources:&ModsState,live:bool)->std::result::Result<Arc<PreparedContent>,String>{
+  assert!(!live);assert!(SNAPSHOT_HELD.load(Ordering::SeqCst),"content read escaped snapshot gate");
+  let requested=Arc::new(PreparedContent{root:resource_source::ResourceRoot::directory(root.to_owned()).with_root_lease(root_lease::RootLease::acquire(root).map_err(|e|e.to_string())?),catalog,selection:selection.clone(),sources:sources.clone(),data_changed:true});
   *REQUESTED.lock().unwrap()=Some(Arc::downgrade(&requested));Ok(requested)
  }}
  PREPARE_CONTENT_FUNCTION
@@ -99,17 +112,19 @@ static TAIL_STARTED:AtomicBool=AtomicBool::new(false);
 static FALLBACK_RESULT:AtomicBool=AtomicBool::new(false);
 static REQUESTED:Mutex<Option<Weak<mods::PreparedContent>>>=Mutex::new(None);
 fn tail_gate()->&'static(Mutex<bool>,Condvar){static GATE:OnceLock<(Mutex<bool>,Condvar)>=OnceLock::new();GATE.get_or_init(||(Mutex::new(false),Condvar::new()))}
-fn load_world_rest(root:&Path,_:&Resources,_:&(),_:&(),_:&(),_:Option<&()>,_:&(),_:(),_:&Progress,_:Instant,_:bool)->Result<String>{
+mod world_rest{use super::*;pub fn load_world_rest(root:&resource_source::ResourceRoot,_:&Resources,_:&(),_:&(),_:&(),_:Option<&()>,_:&(),_:(),_:&Progress,_:Instant,_:bool)->Result<String>{
  TAIL_STARTED.store(true,Ordering::SeqCst);
  let(lock,ready)=tail_gate();let mut release=lock.lock().unwrap();while !*release{release=ready.wait(release).unwrap();}drop(release);
- Ok(fs::read_to_string(root.join("generation"))?)
-}
+ Ok(fs::read_to_string(root.prepared().join("generation"))?)
+}}
 '''
 
 LOAD_PREFIX = r'''
-fn load_resources_with_access(root:PathBuf,_:Option<&str>,vanilla_root:&Path,_:&Settings,started:Instant,menu:bool,headless:bool,progress:&Progress,home_access:Option<import::HomeAccess>,publish:&mut dyn FnMut(UiResources,&Path))->Result<Loaded>{
+fn load_resources_with_access(resolved:resource_source::ResourceRoot,_:Vec<()>,_:Option<&str>,vanilla_root:&Path,_:&Settings,started:Instant,menu:bool,_:mods::LoadRole,progress:&Progress,home_access:Option<import::HomeAccess>,publish:&mut dyn FnMut(UiResources,&Path))->Result<Loaded>{
  assert!(RECOVERY_OBSERVED.load(Ordering::SeqCst),"core read preceded mod transaction recovery");
+ let root=resolved.prepared().to_path_buf();let headless=false;
  let root=if FALLBACK_RESULT.load(Ordering::SeqCst){root.with_file_name("fedcba9876543210")}else{root};
+ let resolved=resource_source::ResourceRoot::directory(root.clone());
  let core=fs::read_to_string(root.join("generation"))?;
  publish(0,&root);
  let resources=Arc::new(Resources{rest:OnceLock::new()});
@@ -123,8 +138,8 @@ LOAD_SUFFIX = r'''
 CASES = r'''
 fn main(){
  let home=import::home();fs::create_dir_all(&home).unwrap();let root=home.join(".horizon-cache/mod-content/0123456789abcdef");fs::create_dir_all(&root).unwrap();fs::write(root.join("generation"),"before").unwrap();
- let settings=Settings{resource_packs:vec![],mods:Mods{enabled:BTreeSet::from(["content.mod".into(),"broken.mod".into(),"native.mod".into(),"future.mod".into()]),disabled:BTreeSet::new()}};let options=Options{dev_mods:vec![]};
- let(rx,parent)=production::spawn_loader(&options,&settings,&root,Instant::now(),&Progress).unwrap();
+ let settings=Settings{resource_packs:vec![],mods:Mods{enabled:BTreeSet::from(["content.mod".into(),"broken.mod".into(),"native.mod".into(),"future.mod".into()]),disabled:BTreeSet::new()}};let options=Options{mods:mods::ModsState::default()};
+ let(rx,parent)=production::spawn_loader(&options,&settings,(),&root,Instant::now(),&Progress).unwrap();
  let mut loaded=loop{match rx.recv_timeout(Duration::from_secs(3)).unwrap(){LoaderMsg::Ui(..)=>{},LoaderMsg::Done(result)=>break result.unwrap()}};
  parent.join().unwrap();
  assert_eq!(loaded.pack.content.as_ref().expect("matching loaded root must retain prepared content").root,loaded.root);
@@ -148,7 +163,7 @@ fn main(){
  // handoff must describe its actual root, without the rejected content selection.
  let fallback_root=root.with_file_name("fedcba9876543210");fs::create_dir_all(&fallback_root).unwrap();fs::write(fallback_root.join("generation"),"fallback").unwrap();
  FALLBACK_RESULT.store(true,Ordering::SeqCst);
- let(rx,parent)=production::spawn_loader(&options,&settings,&root,Instant::now(),&Progress).unwrap();
+ let(rx,parent)=production::spawn_loader(&options,&settings,(),&root,Instant::now(),&Progress).unwrap();
  let mut fallback=loop{match rx.recv_timeout(Duration::from_secs(3)).unwrap(){LoaderMsg::Ui(..)=>{},LoaderMsg::Done(result)=>break result.unwrap()}};
  parent.join().unwrap();assert_ne!(fallback.root,root);
  let snapshot=fallback.pack.content.as_ref().expect("fallback needs a truthful actual-root snapshot");assert_eq!(snapshot.root,fallback_root);assert_eq!(snapshot.root,fallback.root);
@@ -156,7 +171,7 @@ fn main(){
  assert_eq!(snapshot.selection.enabled,BTreeSet::from(["native.mod".into(),"future.mod".into()]));
  assert!(snapshot.catalog.entries.contains_key("content.mod")&&snapshot.catalog.invalid.contains("broken.mod"));
  assert_eq!(REQUESTED.lock().unwrap().as_ref().unwrap().strong_count(),0,"rejected requested snapshot must not be attached to fallback");
- assert!(snapshot.lease.is_active());assert!(root_lease::RootLease::try_exclusive(&fallback_root).unwrap().is_none());
+ assert!(snapshot.root.lease.as_ref().unwrap().is_active());assert!(root_lease::RootLease::try_exclusive(&fallback_root).unwrap().is_none());
  fallback.rest_loader.take().unwrap().finish().unwrap();drop(fallback);
  assert!(root_lease::RootLease::try_exclusive(&fallback_root).unwrap().is_some());
 }

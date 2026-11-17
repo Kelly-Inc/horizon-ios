@@ -3860,7 +3860,7 @@ pub(super) mod tests {
             let mut ordinary = super::super::explosion::ColliderRays {
                 scene: horizon_client::collisions::SceneCollisions {
                     world: &game.world,
-                    binding: game.collision,
+                    binding: &game.collision,
                     subject: None,
                 },
                 context: horizon_world::collision_context::CollisionContext::empty(false),
@@ -4500,8 +4500,8 @@ pub(super) mod tests {
             remote.profile = 42;
             game.player =
                 Some(horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap());
-            game.spawn_entity(15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
-            game.spawn_entity(16, "minecraft:pig", [40.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(16, 16, "minecraft:pig", [40.0, 0.0, 0.0], [0.0; 3]);
             let level = game.level("minecraft:overworld").unwrap();
             let ids = |host: &dyn Host, level: LevelRef, min, max| {
                 level
@@ -4566,7 +4566,7 @@ pub(super) mod tests {
                 .unwrap();
             game.player =
                 Some(horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap());
-            game.spawn_entity(15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
             let add_player = |game: &mut crate::game::Game<'_>, id, uuid, x| {
                 game.handle_packet(C::AddEntity(AddEntity {
                     id,
@@ -4633,7 +4633,7 @@ pub(super) mod tests {
             remote.profile = 42;
             game.player =
                 Some(horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap());
-            game.spawn_entity(15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
             let level = game.level("minecraft:overworld").unwrap();
             let ids = |host: &dyn Host, level: LevelRef, min, max| {
                 level

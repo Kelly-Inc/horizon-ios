@@ -66,6 +66,7 @@ def unsigned_macho(stream):
     if len(commands) != size:
         raise ValueError("Truncated Mach-O load commands")
     offset = 0
+    ios_device = False
     for _ in range(count):
         if offset + 8 > size:
             raise ValueError("Invalid Mach-O command count")
@@ -74,9 +75,26 @@ def unsigned_macho(stream):
             raise ValueError("Invalid Mach-O command size")
         if command == 0x1D:  # LC_CODE_SIGNATURE, including ad-hoc signatures.
             raise ValueError("The IPA contains a signed binary")
+        if command == 0x32:  # LC_BUILD_VERSION: arm64 is shared by devices, simulators and Macs.
+            if length < 24:
+                raise ValueError("Invalid Mach-O build-version command")
+            platform, _, _, tools = struct.unpack_from("<IIII", commands, offset + 8)
+            if 24 + tools * 8 > length:
+                raise ValueError("Truncated Mach-O build-version tools")
+            if platform != 2:  # PLATFORM_IOS, not PLATFORM_IOSSIMULATOR (7).
+                raise ValueError("Expected an iOS device Mach-O platform")
+            ios_device = True
+        elif command == 0x25:  # LC_VERSION_MIN_IPHONEOS, emitted by older device toolchains.
+            if length < 16:
+                raise ValueError("Invalid iOS device minimum-version command")
+            ios_device = True
+        elif command in (0x24, 0x2F, 0x30):  # macOS, tvOS and watchOS legacy minimum versions.
+            raise ValueError("Expected an iOS device Mach-O platform")
         offset += length
     if offset != size:
         raise ValueError("Unexpected Mach-O load-command data")
+    if not ios_device:
+        raise ValueError("Missing iOS device Mach-O build target")
     return file_type
 
 
@@ -120,7 +138,11 @@ def audit(ipa, expected_commit=None):
         if len(infos) != 1:
             raise ValueError("Expected exactly one application")
         app, info = infos[0]
-        if info.get("CFBundleSupportedPlatforms") != ["iPhoneOS"]:
+        # Manual device bundles may omit Xcode's platform metadata. The load
+        # commands above prove the real target of every executable independently;
+        # an explicit contradictory plist value still refuses the package.
+        platforms = info.get("CFBundleSupportedPlatforms")
+        if platforms is not None and platforms != ["iPhoneOS"]:
             raise ValueError("Expected a device IPA, not a simulator app")
         executable = info.get("CFBundleExecutable", "")
         if not isinstance(executable, str) or "/" in executable or binaries.get(str(app / executable)) != 2:

@@ -50,7 +50,6 @@ horizon-client-render mesher::reuse_tests::a_shader_pack_lights_every_nether_fac
 horizon-client-render mesher::reuse_tests::a_shader_pack_lights_the_faces_itself lib daily resources
 horizon-client-render mesher::reuse_tests::a_shader_pack_s_still_water_top_starts_at_its_south_west_corner lib daily resources
 horizon-client-render mesher::reuse_tests::reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload lib daily resources
-horizon-client-render mesher::reuse_tests::separate_ao_passes_ao_in_alpha_without_darkening_rgb lib daily resources
 horizon-client-render mesher::tint_tests::one_biome_shortcut_blends_like_the_full_square lib daily resources
 horizon-client-render options_ui::tests::classic_hover_draws_the_selected_options_wrapped_tooltip lib daily resources
 horizon-client-render options_ui::tests::the_new_video_options_read_as_vanilla_words_them lib daily resources

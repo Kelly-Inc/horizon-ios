@@ -9,9 +9,9 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def program(touch_source=None):
-    source=(ROOT/'crates/horizon-client/src/game/hud_editor.rs').read_text()
-    touch=touch_source or (ROOT/'crates/horizon-client/src/game/touch.rs').read_text()
-    pad=(ROOT/'crates/horizon-client/src/game/pad_menu.rs').read_text()
+    source=(ROOT/'crates/horizon-client/src/game/interface/hud_editor.rs').read_text()
+    touch=touch_source or (ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
+    pad=(ROOT/'crates/horizon-client/src/game/interface/pad_menu.rs').read_text()
     layout=(ROOT/'crates/horizon-client-render/src/pvp_hud.rs').read_text()
     struct=source[source.index('#[derive(Default)]'):source.index('/// The style buttons')].replace('pub(super)', 'pub(crate)')
     helpers='\n'.join(method(source,n) for n in ['buttons','selection_buttons','control_at'])

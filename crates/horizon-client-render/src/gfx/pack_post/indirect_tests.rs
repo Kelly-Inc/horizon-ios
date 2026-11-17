@@ -143,6 +143,36 @@ fn an_unavailable_indirect_buffer_skips_only_its_compute() {
 }
 
 #[test]
+fn a_real_compute_pipeline_refusal_still_disables_the_pack() {
+    let Some(gpu) = Fixture::new() else { return };
+    let too_wide = gpu.device.limits().max_compute_workgroup_size_x + 1;
+    let source = format!("#version 430\nlayout(local_size_x={too_wide}) in;\nvoid main(){{}}\n");
+    let parsed = pack(
+        "",
+        &[("composite.csh", source.as_str())],
+        "#version 430 compatibility\nvoid main(){gl_FragColor=vec4(0,1,0,1);}\n",
+    );
+    assert!(parsed.complete, "front-end preparation: {:?}", parsed.notes);
+    let notes = match gpu.try_build(parsed) {
+        Ok(mut post) => {
+            assert!(!post.complete, "a refused compute pipeline is required");
+            assert!(matches!(
+                post.resize(&gpu.device, &gpu.queue, [8, 8]).unwrap(),
+                super::ResizeState::Failed
+            ));
+            post.notes
+        }
+        Err(refused) => refused.notes,
+    };
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.to_lowercase().contains("workgroup")),
+        "{notes:?}"
+    );
+}
+
+#[test]
 fn changing_indirect_shadow_arguments_bypasses_only_the_indirect_shadow_cache() {
     use crate::hud::HudBatch;
     let Some(gpu) = Fixture::new() else { return };

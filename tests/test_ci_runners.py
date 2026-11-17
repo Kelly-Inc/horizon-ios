@@ -133,9 +133,15 @@ class OwnRunnerTests(unittest.TestCase):
         # 20-job pool is not the only place it may wait). Never the light runners: every light job that a pull request
         # can start carries the fork guard (test_light_runners_take_main_code_only), and ci.yml's two runs-on
         # expressions (the other workflows keep their own guards) no longer test the head repository.
-        ci = dict(jobs((WORKFLOWS / "ci.yml").read_text()))
-        for name in ("verify-static", "verify-test"):
-            self.assertNotIn("head.repo", runs_on(ci[name]), name)
+        path = WORKFLOWS / "ci.yml"
+        if path.is_file():
+            ci = dict(jobs(path.read_text()))
+            for name in ("verify-static", "verify-test"):
+                self.assertNotIn("head.repo", runs_on(ci[name]), name)
+        else:
+            mobile = dict(jobs((WORKFLOWS / "ios.yml").read_text()))
+            self.assertRegex(runs_on(mobile["ipa"]),
+                r"github.event_name == 'pull_request' && 'macos-[^']+' \|\| vars.MAC_RUNNER")
         for where, on, _, block, _, pools in routed():
             if "light" in pools and "pull_request" in on:
                 job_if = next((l for l in block.splitlines() if l.strip().startswith("if:")), "")

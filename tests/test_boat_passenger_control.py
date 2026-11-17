@@ -22,8 +22,8 @@ def method(source, name):
 @unittest.skipUnless(shutil.which('rustc'), 'requires Rust')
 class BoatPassengerControlTests(unittest.TestCase):
     def test_second_rider_never_claims_control_or_the_front_seat(self):
-        remote = (ROOT / 'crates/horizon-client/src/game/remote_vehicles.rs').read_text()
-        seats = (ROOT / 'crates/horizon-client/src/game/boat_passengers.rs').read_text()
+        remote = (ROOT / 'crates/horizon-client/src/game/network/remote_vehicles.rs').read_text()
+        seats = (ROOT / 'crates/horizon-client/src/game/entities/boat_passengers.rs').read_text()
         methods = method(remote, 'remote_vehicle_packets') + method(seats, 'player_boat_seat')
         for name in ['remote_controls_boat', 'remote_passenger_seat']:
             if 'fn ' + name + '(' in remote:
@@ -47,15 +47,17 @@ impl Boat {
  }
 }
 const PLAYER_RIDING_OFFSET:f64=0.6;
-struct Game {riding:Option<u32>,remote:Option<Remote>,boats:Vec<Boat>}
+struct Persist { off_level:std::collections::HashMap<u32,()> }
+struct Game {persist:Persist,riding:Option<u32>,remote:Option<Remote>,boats:Vec<Boat>}
 impl Game {
+ fn boat_passengers(&self,id:u32)->usize{self.boat_players(id)+self.boat_mobs(id).len()}
  fn driven_mount(&self)->Option<()>{None}
  fn boat_players(&self,_:u32)->usize {1}
  fn boat_mobs(&self,id:u32)->Vec<usize>{let r=self.remote.as_ref().unwrap();r.passengers.get(&id).into_iter().flatten().filter(|p|**p!=r.entity_id).map(|p|*p as usize).collect()}
  METHODS
 }
 fn game(me:i32, order:Vec<i32>)->Game {
- Game{riding:Some(7),remote:Some(Remote{entity_id:me,first_passenger:order.first()==Some(&me),passengers:HashMap::from([(7,order)])}),
+ Game{persist:Persist{off_level:Default::default()},riding:Some(7),remote:Some(Remote{entity_id:me,first_passenger:order.first()==Some(&me),passengers:HashMap::from([(7,order)])}),
  boats:vec![Boat{id:7,position:Vec3{x:0.0,y:64.0,z:0.0},yaw:0.0,on_ground:false,paddling:[true,true]}]}
 }
 #[test] fn each_client_uses_the_server_seat_order_and_only_first_drives(){

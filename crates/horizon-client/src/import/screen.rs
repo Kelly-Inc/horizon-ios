@@ -315,7 +315,13 @@ mod tests {
     fn the_screen_draws_with_the_atlas_of_a_game_that_has_no_files() {
         let atlas = HudAtlas::without_pack(Path::new("/horizon-test-no-assets")).unwrap();
         ui_theme::reset_atlas();
-        let mut batch = HudBatch::new([1792, 828]);
+        let mut batch = HudBatch::new(
+            [1792, 828],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let folder = Path::new("/private/var/Containers/0/Documents");
         draw(&mut batch, &atlas, &status(folder, "192.168.1.23"));
         assert!(!batch.vertices.is_empty(), "the screen drew nothing");
@@ -331,7 +337,13 @@ mod tests {
         use crate::import::download::Stage;
         let atlas = HudAtlas::without_pack(Path::new("/horizon-test-no-assets")).unwrap();
         ui_theme::reset_atlas();
-        let mut batch = HudBatch::new([1792, 828]);
+        let mut batch = HudBatch::new(
+            [1792, 828],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let stage = Stage::Downloading {
             received: 300 << 20,
             total: 600 << 20,
@@ -349,8 +361,20 @@ mod tests {
         let atlas = HudAtlas::without_pack(Path::new("/horizon-test-no-assets")).unwrap();
         ui_theme::reset_atlas();
         let folder = Path::new("/Documents");
-        let mut quiet = HudBatch::new([1792, 828]);
-        let mut listening = HudBatch::new([1792, 828]);
+        let mut quiet = HudBatch::new(
+            [1792, 828],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
+        let mut listening = HudBatch::new(
+            [1792, 828],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let host = "10.0.0.5";
         draw(
             &mut quiet,
@@ -370,7 +394,13 @@ mod tests {
     #[test]
     fn long_words_break_where_they_are_reachable() {
         let atlas = HudAtlas::without_pack(Path::new("/horizon-test-no-assets")).unwrap();
-        let mut batch = HudBatch::new([1792, 828]);
+        let mut batch = HudBatch::new(
+            [1792, 828],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let ui = ui_theme::Ui::new(&atlas, &mut batch, (0.0, 0.0));
         let one = wrap(&ui, Face::Regular, 13.0, 40.0, "alpha beta gamma delta");
         assert!(one.len() > 1, "{one:?}");

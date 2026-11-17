@@ -116,6 +116,13 @@ fn a_failing_raw_handler_rolls_back_alone_and_the_next_one_commits() {
                 Some(1),
                 true,
                 Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir()
+                        .unwrap()
+                        .join("saves")
+                        .join("raw_fault"),
+                )
+                .unwrap(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);

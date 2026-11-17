@@ -14,9 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    touch = (ROOT / 'crates/horizon-client/src/game/touch.rs').read_text()
-    pad = (ROOT / 'crates/horizon-client/src/game/pad.rs').read_text()
-    emote = (ROOT / 'crates/horizon-client/src/game/cosmetics/emote_wheel.rs').read_text().replace('self.cosmetics.wheel', 'self.emote_wheel').replace('self.cosmetics.emotes', 'self.emotes').replace('pub(in crate::game)', 'pub(super)')
+    touch = (ROOT / 'crates/horizon-client/src/game/interface/touch.rs').read_text()
+    pad = (ROOT / 'crates/horizon-client/src/game/interface/pad/mod.rs').read_text()
+    emote = (ROOT / 'crates/horizon-client/src/game/interface/cosmetics/emote_wheel.rs').read_text().replace('self.cosmetics.wheel', 'self.emote_wheel').replace('self.cosmetics.emotes', 'self.emotes').replace('pub(in crate::game)', 'pub(super)')
     modules = f'#[path="{ROOT / "crates/horizon-client/src/touch.rs"}"]mod touch;\n'
     return STUBS + modules + '\nimpl Game {\n' + method(touch, 'visible_touch_layout') + '\n' + method(touch, 'touch_event') + '\n' + method(pad, 'pad_yield_input') + '\n' + method(emote, 'cancel_emote_controller') + '\n}\n' + CASES
 

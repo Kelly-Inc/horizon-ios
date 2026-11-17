@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,7 +29,7 @@ class CargoJobsTests(unittest.TestCase):
                 self.assertEqual(cargo_jobs.jobs(*args), expected)
 
     def test_limits_read_the_runner_cgroup(self):
-        machine_cpus = len(os.sched_getaffinity(0))
+        machine_cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
         machine_memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         small = min(machine_memory, 16 * GIB)
         cases = [
@@ -51,6 +52,16 @@ class CargoJobsTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, ROOT / "tools/ci/cargo_jobs.py", "--job-mib", "3072",
                                          "--cgroup", cgroup], capture_output=True, text=True, check=True)
                 self.assertEqual(int(result.stdout), cargo_jobs.jobs(*expected, 3072))
+
+    def test_missing_or_refused_affinity_uses_available_host_cpu_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for failure in (AttributeError("not supported"), OSError("not permitted")):
+                with self.subTest(failure=type(failure).__name__), \
+                        mock.patch.object(os, "sched_getaffinity", create=True, side_effect=failure), \
+                        mock.patch.object(os, "cpu_count", return_value=7):
+                    cpus, memory = cargo_jobs.limits(Path(directory))
+                    self.assertEqual(cpus, 7)
+                    self.assertGreater(memory, 0)
 
     def test_cap_bounds_every_cargo_run_and_test_harness_of_the_job(self):
         with tempfile.TemporaryDirectory() as directory:

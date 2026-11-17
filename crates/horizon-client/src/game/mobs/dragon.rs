@@ -6472,7 +6472,7 @@ mod spawn_egg_processing_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn hand_and_dispenser_eggs_apply_components_data_identity_and_silent_sound() {
         with_fixture(|game| {
             let mut failures = Vec::new();
@@ -6485,7 +6485,7 @@ mod spawn_egg_processing_tests {
                 );
                 for route in ["op-hand", "guest-hand", "dispenser"] {
                     for config in 0..3 {
-                        game.dragon = None;
+                        game.dragon.discard();
                         game.mobs.clear();
                         game.player = None;
                         game.forced_hit = None;
@@ -6609,12 +6609,19 @@ mod spawn_egg_processing_tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn egg_data_keeps_dragon_uuid_part_ids_and_entity_rng_through_silent_voice() {
         with_fixture(|game| {
             for silent in [false, true] {
-                game.dragon = None;
-                let id = game.spawn_dragon_spawned([6.5, 200.0, 6.5]).unwrap();
+                game.dragon.discard();
+                let id = game
+                    .spawn_dragon_spawned(
+                        [6.5, 200.0, 6.5],
+                        SpawnSite::Finalizing(
+                            horizon_client::mobs::spawn_rules::Reason::SpawnItemUse,
+                        ),
+                    )
+                    .unwrap();
                 let uuid = game.uuid_for(id);
                 let counter = game.next_entity;
                 game.dragon.as_mut().unwrap().random = LegacyRandom::new(42);

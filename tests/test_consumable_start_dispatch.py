@@ -28,12 +28,12 @@ def method(source, name):
 @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
 class ConsumableDispatchTests(unittest.TestCase):
     def test_instant_and_timed_completion_use_original_components_in_order(self):
-        consume = (ROOT / "crates/horizon-client/src/game/consume.rs").read_text()
-        game = (ROOT / "crates/horizon-client/src/game/using_item.rs").read_text()
+        consume = (ROOT / "crates/horizon-client/src/game/items/consume.rs").read_text()
+        game = (ROOT / "crates/horizon-client/src/game/items/using_item.rs").read_text()
         tick = method(game, "tick_used_item")
-        completion = tick[tick.rindex("        self.item_on_use_tick(&stack, ticks);"): ]
+        completion = tick[tick.rindex("        let Some(consumable) = self.consumable(&stack) else {"): ]
         completion = completion[:completion.rfind("\n    }")]
-        item_use = (ROOT / "crates/horizon-client/src/game/item_use.rs").read_text()
+        item_use = (ROOT / "crates/horizon-client/src/game/items/item_use.rs").read_text()
         fixture = r'''
 #![allow(dead_code)]
 mod item_use { HELPERS }
@@ -44,7 +44,7 @@ mod item_sync {
 }
 #[derive(Clone)] struct ItemStack { item: &'static str, cooldown: &'static str }
 #[derive(Clone)] struct ItemConsumable { ticks: i32 }
-impl ItemConsumable { fn ticks(&self) -> i32 { self.ticks } }
+impl ItemConsumable { fn ticks(&self) -> i32 { self.ticks } fn should_emit(&self,_:i32)->bool{false} }
 struct ItemInfo { food: Option<()>, can_always_eat: bool, consumable: Option<ItemConsumable> }
 struct Food { food: i32 }
 struct Health { food: Food }
@@ -60,9 +60,10 @@ impl Game {
    held: Some(ItemStack { item: "original", cooldown: "original-group" }), events: vec![] }
  }
  fn consumable(&self,_:&ItemStack)->Option<ItemConsumable>{Some(ItemConsumable{ticks:self.use_duration})}
- fn can_eat(&self,_:&ItemStack,always:bool)->bool{always||self.creative||self.player.as_ref().is_some_and(|p|p.health.food.food<20)}
+ fn can_eat(&self,_:Option<&ItemStack>,always:bool)->bool{always||self.creative||self.player.as_ref().is_some_and(|p|p.health.food.food<20)}
  fn start_using_item(&mut self){if self.using.is_none(){self.using=Some((self.slot,0));}}
- fn item_on_use_tick(&mut self,_:&ItemStack,_:u32){}
+ fn item_on_use_tick(&mut self,_:&ItemStack,_:u32)->bool{true}
+ fn emit_consume(&mut self,_:&ItemConsumable,_:&ItemStack,_:usize){panic!("this fixture isolates completion, not particles");}
  fn finish_drinking(&mut self,_:usize,_:&ItemStack)->bool{false}
  fn stop_spyglass(&mut self){}
  fn use_vibration(&mut self,stack:&ItemStack,event:&'static str){assert_eq!(stack.item,"original");assert_eq!(stack.cooldown,"original-group");assert_eq!(event,"minecraft:item_interact_finish");self.events.push(format!("vibration:{event}"));}

@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def program():
     source = '\n'.join((ROOT / path).read_text() for path in [
         'crates/horizon-client/src/game.rs',
-        'crates/horizon-client/src/game/loading_screen.rs',
-        'crates/horizon-client/src/game/world_update.rs',
+        'crates/horizon-client/src/game/runtime/loading_screen.rs',
+        'crates/horizon-client/src/game/world/world_update.rs',
     ])
     start = source.index('                    let mut stopped = game.audio.shutdown_workers();')
     start = source.rfind('                    horizon_client::mod_content::cancel_root_collectors();', 0, start)
@@ -24,7 +24,7 @@ def program():
     workers = source[a:b].replace('horizon_client::lod::Lod', 'Worker').replace('horizon_client::bluemap::BlueMap', 'Worker')
     workers += '\nimpl FarTerrainWorkers {' + method(source[source.index('impl FarTerrainWorkers {'):], 'shutdown') + '}\n'
     methods = ''.join(method(source, name) for name in ('shutdown_far_terrain', 'poll_retired_far_terrain', 'clear_lod', 'shutdown_skin_workers', 'poll_retired_skin_workers', 'retire_guest_skin_workers', 'poll_recording_workers', 'shutdown_recording_workers', 'retire_recording')).replace("Game<'_>", 'Game').replace('horizon_client::net::Session', 'Session')
-    splitscreen = (ROOT / 'crates/horizon-client/src/game/splitscreen.rs').read_text()
+    splitscreen = (ROOT / 'crates/horizon-client/src/game/runtime/splitscreen.rs').read_text()
     methods += method(splitscreen, 'stop_splitscreen')
     return STUBS + workers + '\nimpl Game {' + methods + '}\nfn poll(game:&mut Game,event_loop:&EventLoop){' + gate + 'READY.store(true,Ordering::SeqCst);}\n' + CASES
 

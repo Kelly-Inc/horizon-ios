@@ -127,7 +127,13 @@ fn a_scaled_pack_without_final_uses_no_unused_final_target() {
     let depth = texture(&device, picture, T::Depth32Float);
     clear(&device, &queue, &colour, &depth, [32, 64, 16, 255], 0.25);
     let mut post = pack(&device, &queue, &adapter, &colour, false);
-    let hud = HudBatch::new(window);
+    let hud = HudBatch::new(
+        window,
+        crate::hud::GuiScale {
+            requested: 0,
+            unicode: false,
+        },
+    );
     let pixels = render(
         &device,
         &queue,

@@ -1137,7 +1137,7 @@ mod tests {
             remote.entity_id = 7;
             remote.profile = 42;
             game.player = Some(PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap());
-            game.spawn_entity(15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
             // A handle this client really shows, so the refusal is the client
             // side's and not a fabricated id that never resolved.
             let entity = game.entity(15).unwrap();
@@ -1311,7 +1311,7 @@ mod tests {
             assert_eq!(local.fluid_heights(host), Some(Vec::new()));
             assert_eq!(local.eye_fluid(host), Some(None));
 
-            game.spawn_entity(15, "minecraft:zombie", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:zombie", [2.0, 0.0, 0.0], [0.0; 3]);
             let zombie = game.entity(15).unwrap();
             // No water or lava in the world: these answers must come from the last
             // client fluid update, without a fresh world query or a server body.
@@ -1356,7 +1356,7 @@ mod tests {
                 assert_eq!(zombie.fluid_heights(host), Some(expected));
                 assert_eq!(zombie.eye_fluid(host), Some(eye.map(str::to_owned)));
             }
-            game.spawn_entity(16, "minecraft:armor_stand", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(16, 16, "minecraft:armor_stand", [2.0, 0.0, 0.0], [0.0; 3]);
             let stand = game.entity(16).unwrap();
             let host = &*game as &dyn mod_api::ClientHost;
             assert_eq!(stand.fluid_heights(host), None);

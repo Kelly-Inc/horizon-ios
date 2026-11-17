@@ -128,6 +128,8 @@ pub mod wither;
 mod invisible_follow_tests;
 mod world;
 pub use world::{TargetInfo, VisualShape, single_player_pos, visual_clip, visual_shape};
+#[cfg(test)]
+pub(crate) use world::{level_random, with_test_world};
 pub mod dragon_contacts;
 pub mod zombie_villager;
 /// A mob's stored active effect with its registry index resolved once at creation.

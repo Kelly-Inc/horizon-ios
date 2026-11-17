@@ -13,7 +13,7 @@ pub(in crate::game) mod tests {
         crate::game::game_tests::tests::server_game(&mut resources)
     }
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn server_fixture_releases_its_owned_resources() {
         let game = server_game();
         let resources = std::sync::Arc::downgrade(&game.res);

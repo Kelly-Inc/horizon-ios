@@ -1,7 +1,9 @@
 """Exercise the real iOS bounded log writer without building the renderer."""
 import pathlib, subprocess, tempfile, unittest
+import shutil
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 class MobileDiagnosticsTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("rustc"), "requires Rust toolchain")
     def test_rotation_and_redaction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

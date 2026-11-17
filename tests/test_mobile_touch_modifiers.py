@@ -13,8 +13,8 @@ class TouchModifierTests(unittest.TestCase):
     def test_menu_and_world_shift_click_modifier_releases_without_latching(self):
         if not shutil.which("rustc"):
             self.skipTest("rustc required")
-        source = (ROOT / "crates/horizon-client/src/game/touch.rs").read_text()
-        inventory = (ROOT / "crates/horizon-client/src/game/inventory_input.rs").read_text()
+        source = (ROOT / "crates/horizon-client/src/game/interface/touch.rs").read_text()
+        inventory = (ROOT / "crates/horizon-client/src/game/interface/inventory_input.rs").read_text()
         methods = (method(source, "touch_shift_held") + method(inventory, "has_shift_down")).replace('target_os = "ios"', 'feature = "ios-fixture"')
         program = r'''
 #![allow(dead_code)]

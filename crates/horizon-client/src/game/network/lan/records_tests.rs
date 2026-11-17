@@ -3,7 +3,7 @@ use crate::game::execution_role::ExecutionRole;
 use horizon_client::lan::{Joined, PlayerSender, guest::Guest};
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn empty_advancement_tree_does_not_skip_normal_or_durable_statistics() {
     let root = std::path::PathBuf::from(
         std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
@@ -59,7 +59,13 @@ fn empty_advancement_tree_does_not_skip_normal_or_durable_statistics() {
             levels: game.level_shapes,
             level_seeds: game.levels.runtime.seeds(),
         };
-        let mut host = LanHost::fixture(Hub::new(network, sync, encoder, config));
+        let mut host = LanHost::fixture(Hub::new(
+            network,
+            sync,
+            encoder,
+            config,
+            game.loop_context.clone(),
+        ));
         let (sender, _receiver) = std::sync::mpsc::channel();
         let mut guest = Guest::new(
             Joined {

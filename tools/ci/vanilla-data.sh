@@ -49,14 +49,20 @@ fi
 # against the digest of its files written when its preparation finished, and the job gets a private copy.
 # Each file's digest, then one digest of the list; .manifest* themselves are left out.
 file_digests() {
-  (cd "$1" && find . -type f ! -name '.manifest*' -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
+  local hasher=(sha256sum)
+  if command -v shasum >/dev/null; then hasher=(shasum -a 256); fi
+  (cd "$1" && find . -type f ! -name '.manifest*' -print0 | LC_ALL=C sort -z | xargs -0 -r "${hasher[@]}")
 }
 digest() { file_digests "$1" | sha256 | cut -c1-16; }
 # The job's own copy (reflinks where the file system has them): what tests write stays out of the kept tree.
 use_private_copy() {
   local work="$shared/job"
   rm -rf "$work"
-  cp -a --reflink=auto "$prepared" "$work"
+  if [ "$(uname)" = Darwin ]; then
+    cp -a "$prepared" "$work"
+  else
+    cp -a --reflink=auto "$prepared" "$work"
+  fi
   for name in minecraft tools; do ln -sfn "$source/$name" ".local/$name"; done
   while read -r name; do ln -sfn "$work/$name" ".local/$name"; done < "$work/.entries"
   echo "prepared key $key: private copy for this job ($(find "$work" -type f | wc -l) files)"

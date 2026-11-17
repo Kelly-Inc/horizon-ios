@@ -2413,7 +2413,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn crosshair_state_reports_boat_and_cart_targets_before_blocks() {
         use super::super::{
             boats::Boat,

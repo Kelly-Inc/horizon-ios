@@ -15,23 +15,73 @@ spec.loader.exec_module(release)
 SHA = "a" * 40
 
 
-def binary(signed=False):
-    commands = struct.pack("<IIII", 0x1D, 16, 48, 8) if signed else b""
-    return struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, 2,
-                       int(signed), len(commands), 0, 0) + commands
+def binary(signed=False, platform=2, legacy=False, file_type=2):
+    if platform is None:
+        commands = b""
+    elif legacy:
+        commands = struct.pack("<IIII", 0x25, 16, 0x100000, 0x1B0000)
+    else:
+        commands = struct.pack("<IIIIII", 0x32, 24, platform, 0x100000, 0x1B0000, 0)
+    count = int(platform is not None)
+    if signed:
+        commands += struct.pack("<IIII", 0x1D, 16, 48, 8)
+        count += 1
+    return struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, file_type,
+                       count, len(commands), 0, 0) + commands
 
 
 class IOSReleaseTests(unittest.TestCase):
-    def archive(self, path, extra=None, info=None, executable=None):
+    def archive(self, path, extra=None, info=None, executable=None, omit_platform=False):
         metadata = {"CFBundleExecutable": "Horizon", "CFBundleShortVersionString": "0.1.0",
                     "CFBundleVersion": "42.2", "HorizonBuildCommit": SHA,
                     "CFBundleSupportedPlatforms": ["iPhoneOS"]}
         metadata.update(info or {})
+        if omit_platform:
+            metadata.pop("CFBundleSupportedPlatforms", None)
         with zipfile.ZipFile(path, "w") as z:
             z.writestr("Payload/Horizon.app/Info.plist", plistlib.dumps(metadata))
             z.writestr("Payload/Horizon.app/Horizon", binary() if executable is None else executable)
             for name, data in (extra or {}).items():
                 z.writestr(name, data)
+
+    def test_device_metadata_cannot_disguise_a_non_device_macho(self):
+        for platform in (1, 3, 4, 6, 7, 11):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as directory:
+                ipa = Path(directory) / "wrong-platform.ipa"
+                self.archive(ipa, executable=binary(platform=platform))
+                with self.assertRaisesRegex(ValueError, "iOS device"):
+                    release.audit(ipa, SHA)
+
+    def test_nested_framework_must_also_target_ios_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "wrong-framework.ipa"
+            self.archive(ipa, {"Payload/Horizon.app/Frameworks/Kit.framework/Kit":
+                               binary(platform=7, file_type=6)})
+            with self.assertRaisesRegex(ValueError, "iOS device"):
+                release.audit(ipa, SHA)
+
+    def test_missing_platform_and_truncated_build_tools_are_rejected(self):
+        with self.assertRaises(ValueError):
+            release.unsigned_macho(io.BytesIO(binary(platform=None)))
+        malformed = bytearray(binary())
+        struct.pack_into("<I", malformed, 52, 1)  # declares one missing build_tool_version
+        with self.assertRaises(ValueError):
+            release.unsigned_macho(io.BytesIO(malformed))
+
+    def test_legacy_ios_device_minimum_version_command_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "legacy-device.ipa"
+            self.archive(ipa, executable=binary(legacy=True))
+            self.assertEqual(release.audit(ipa, SHA), ("0.1.0", "42.2"))
+
+    def test_legacy_metadata_can_omit_platform_but_the_binary_cannot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "manual-device.ipa"
+            self.archive(ipa, omit_platform=True)
+            self.assertEqual(release.audit(ipa, SHA), ("0.1.0", "42.2"))
+            self.archive(ipa, executable=binary(platform=7), omit_platform=True)
+            with self.assertRaisesRegex(ValueError, "iOS device"):
+                release.audit(ipa, SHA)
 
     def test_workflow_versions_advance_but_retry_marketing_version_stays(self):
         for run, version in [(1, "0.1.44"), (88, "0.1.44"), (89, "0.1.45"),

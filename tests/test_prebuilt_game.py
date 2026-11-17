@@ -171,7 +171,10 @@ class SdkAssetTests(unittest.TestCase):
         def run(command, **kwargs):
             self.assertEqual(command[-3:], ["surface", str(prebuilt_game.ROOT), str(dist / "surface.json")])
             (dist / "surface.json").write_text('{"hash": "ab"}')
-        with patch.object(prebuilt_game, "head", return_value=COMMIT), patch.object(prebuilt_game, "run", side_effect=run):
+        # These members deliberately describe an ELF/Linux SDK, on any test host.
+        with patch.object(sys, "platform", "linux"), \
+                patch.object(prebuilt_game, "head", return_value=COMMIT), \
+                patch.object(prebuilt_game, "run", side_effect=run):
             prebuilt_game.pack(out, dist, stage_tool=Path("horizon-stage"))
 
     def test_pack_writes_three_archives_that_split_the_package_and_the_same_every_run(self):
@@ -343,7 +346,7 @@ class SdkAssetTests(unittest.TestCase):
             refused("no build-data.tar.xz", lambda leg: (leg / "build-data.tar.xz").unlink())
 
     def test_pack_refuses_another_commits_package(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.object(sys, "platform", "linux"):
             root = Path(directory)
             out = self.out(root, 1000)
             with patch.object(prebuilt_game, "head", return_value="d" * 40), \
@@ -728,9 +731,13 @@ class SmokeStartTests(unittest.TestCase):
         for code in (1, 0, 2, 3221225477):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                result = subprocess.CompletedProcess([], code, stdout=prebuilt_game.NO_RESOURCES)
+                def command_result(command, **kwargs):
+                    if "--dedicated" in command:
+                        return subprocess.CompletedProcess(command, code, stdout=prebuilt_game.NO_RESOURCES, stderr="")
+                    # Bundle preparation and the Launch API probe precede the smoke run.
+                    return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
                 with patch.dict(sys.modules, {"lab": SimpleNamespace(game_env=lambda **_: {"HORIZON_HOME": "/inherited"})}), \
-                     patch.object(prebuilt_game.subprocess, "run", return_value=result) as run, \
+                     patch.object(prebuilt_game.subprocess, "run", side_effect=command_result) as run, \
                      contextlib.redirect_stdout(io.StringIO()):
                     if code == 1:
                         prebuilt_game.start(root / "out")

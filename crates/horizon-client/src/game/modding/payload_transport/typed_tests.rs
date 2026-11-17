@@ -162,8 +162,18 @@ fn typed_payloads_follow_the_raw_routes() {
                 world_type: horizon_client::save::WorldPreset::Flat,
                 ..Default::default()
             };
-            game.open_integrated("typed", Some("Typed"), Some(1), true, Some(&options))
-                .unwrap();
+            game.open_integrated(
+                "typed",
+                Some("Typed"),
+                Some(1),
+                true,
+                Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir().unwrap().join("saves").join("typed"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);
             while !game
                 .remote

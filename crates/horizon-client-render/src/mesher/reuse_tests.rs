@@ -150,6 +150,7 @@ fn padded_fill_reads_every_neighbour_and_its_light_like_chunk_reads() {
 #[ignore = "daily"]
 fn a_shader_pack_lights_the_faces_itself() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
+        .or_else(|| std::env::var_os("HORIZON_TEST_RESOURCES"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -274,7 +275,7 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
 }
 
 #[test]
-#[ignore = "requires prepared 26.3 resources (HORIZON_MESH_TEST_RESOURCES or .local/horizon-client/26.3)"]
+#[ignore = "daily"]
 fn separate_ao_preserves_native_vertices_and_carries_exact_sidecar_lighting() {
     let root = std::env::var_os("HORIZON_MESH_TEST_RESOURCES")
         .map(std::path::PathBuf::from)

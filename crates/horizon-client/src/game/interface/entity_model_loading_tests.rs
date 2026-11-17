@@ -1,6 +1,7 @@
 //! Model-batch equivalence tests and an opt-in benchmark of the actual loaders.
 use super::{armor_stands::ArmorStandAssets, boats::BoatModels, minecarts::CartModels};
 use horizon_client::mobs::{EntityModelDocument, Part, load_model};
+use horizon_client::resource_source::ResourceSource;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, hint::black_box, path::Path, time::Instant};
 
@@ -311,18 +312,26 @@ fn equipment_assets_native_fixture() {
     )
     .unwrap();
     let document = EntityModelDocument::load(&model_root.0).unwrap();
-    let mut assets = ArmorStandAssets::load(&root.join("base"), Some(&document));
+    let mut assets = ArmorStandAssets::load(
+        &ResourceSource::directory(root.join("base")),
+        Some(&document),
+    );
     let prepared_model = assets.main.clone().unwrap();
     let mut rows = Vec::new();
     for (phase, directory) in ["base", "merged", "base"].into_iter().enumerate() {
         if phase != 0 {
-            assets.apply_resources(ArmorStandAssets::load(&root.join(directory), None));
+            assets.apply_resources(ArmorStandAssets::load(
+                &ResourceSource::directory(root.join(directory)),
+                None,
+            ));
         }
         assert!(
             std::sync::Arc::ptr_eq(assets.main.as_ref().unwrap(), &prepared_model),
             "metadata reload discarded prepared model geometry"
         );
-        let atlas = horizon_client::hud::HudAtlas::build(&root.join(directory)).unwrap();
+        let atlas =
+            horizon_client::hud::HudAtlas::build(&ResourceSource::directory(root.join(directory)))
+                .unwrap();
         for (id, kinds) in &assets.equipment {
             for (kind, layers) in kinds {
                 for (index, (texture, dyeable)) in layers.iter().enumerate() {
@@ -386,12 +395,14 @@ fn equipment_reload_replaces_pack_metadata_and_retains_prepared_geometry() {
     )
     .unwrap();
     let document = EntityModelDocument::load(&old.0).unwrap();
-    let mut assets = ArmorStandAssets::load(&old.0, Some(&document));
+    let mut assets =
+        ArmorStandAssets::load(&ResourceSource::directory(old.0.clone()), Some(&document));
     let prepared = assets.main.as_ref().unwrap().clone();
     for (root, name, player, has_added) in
         [(&new.0, "new", true, true), (&old.0, "old", false, false)]
     {
-        assets.apply_resources(ArmorStandAssets::load(root, None));
+        let source = ResourceSource::directory(root.clone());
+        assets.apply_resources(ArmorStandAssets::load(&source, None));
         assert!(std::sync::Arc::ptr_eq(
             assets.main.as_ref().unwrap(),
             &prepared
@@ -405,7 +416,7 @@ fn equipment_reload_replaces_pack_metadata_and_retains_prepared_geometry() {
             assets.equipment.contains_key("gems:nested/added"),
             has_added
         );
-        assert_eq!(assets.root, *root);
+        assert_eq!(assets.root, source);
     }
 }
 
@@ -419,11 +430,12 @@ fn equipment_commit_uses_the_prepared_snapshot_not_later_file_edits() {
         br#"{"layers":{"wings":[{"texture":"minecraft:prepared","use_player_texture":true}]}}"#,
     )
     .unwrap();
-    let prepared = ArmorStandAssets::load(&root.0, None);
+    let prepared = ArmorStandAssets::load(&ResourceSource::directory(root.0.clone()), None);
     fs::write(&file, br#"{"layers":{"wings":[{"texture":"minecraft:edited_after_staging","use_player_texture":false}]}}"#).unwrap();
     let expected = prepared.equipment.clone();
     let expected_flags = prepared.wing_player_textures.clone();
-    let mut destination = ArmorStandAssets::load(&root.0.join("empty"), None);
+    let mut destination =
+        ArmorStandAssets::load(&ResourceSource::directory(root.0.join("empty")), None);
     // The render-thread operation consumes what the CPU worker prepared.
     destination.apply_resources(prepared);
     assert_eq!(

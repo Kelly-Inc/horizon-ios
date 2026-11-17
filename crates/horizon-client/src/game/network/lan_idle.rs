@@ -13,7 +13,7 @@ use horizon_client::fast_hash::FxHashMap;
 use horizon_client::lan::{hub::Hub, tracking};
 
 #[cfg(test)]
-#[path = "lan_idle_backend_tests.rs"]
+#[path = "tests/lan_idle_backend.rs"]
 mod backend_tests;
 
 /// Per level, the idle entities the last pass noted (`Kept`).

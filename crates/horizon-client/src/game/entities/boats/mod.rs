@@ -2502,7 +2502,7 @@ mod native_move_threshold_tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires prepared resources"]
+    #[ignore = "daily"]
     fn boat_position_threshold_keeps_residual_velocity_and_unblocked_tiny_moves() {
         super::super::lan_actions::vehicle_loot_tests::with_fixture(|game| {
             game.boats.clear();

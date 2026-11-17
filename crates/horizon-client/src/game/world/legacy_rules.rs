@@ -107,7 +107,7 @@ mod tests {
     /// of two successive remote sessions. A native full-charge diamond axe
     /// deals 9; the explicit hosted 1.8 rules deal 7.
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn host_legacy_rules_do_not_follow_the_player_into_remote_sessions() {
         let root = std::path::PathBuf::from(
             std::env::var_os("HORIZON_TEST_RESOURCES")
@@ -118,13 +118,16 @@ mod tests {
         settings.extras.pvp.combat.legacy = true;
         settings.extras.pvp.combat.sounds = true;
         let loaded = load_resources(
-            root.clone(),
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
             None,
             &root,
             &settings,
             std::time::Instant::now(),
             false,
-            true,
+            super::super::mods::LoadRole::startup(
+                super::super::execution_role::ExecutionRole::Client,
+            ),
             &Progress::new(),
             &mut |_, _| unreachable!("no menu handoff"),
         )
@@ -138,28 +141,30 @@ mod tests {
             loaded.gui.unwrap(),
             options,
             settings,
-            Audio::silent(&root),
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
             None,
         )
         .unwrap();
         equip_axe(&mut game);
-        assert_eq!(game.melee_damage("minecraft:player", true).0, 7.0);
+        assert_eq!(game.melee_damage("minecraft:player", true, None).0, 7.0);
 
         for name in ["LegacyTransitionA", "LegacyTransitionB"] {
             let (client, server) = Pipe::pair();
             game.connect_local(client, name).unwrap();
             equip_axe(&mut game);
             assert!(game.settings.extras.pvp.combat.rules);
-            assert_eq!(game.melee_damage("minecraft:player", true).0, 9.0);
+            assert_eq!(game.melee_damage("minecraft:player", true, None).0, 9.0);
             // A fresh attack remains cooldown-scaled despite the saved rule.
             game.attack_ticks = 0;
-            let uncharged = game.melee_damage("minecraft:player", true).0;
+            let uncharged = game.melee_damage("minecraft:player", true, None).0;
             assert!(uncharged > 0.0 && uncharged < 9.0, "{uncharged}");
             game.leave_server(None).unwrap();
             server.shutdown();
         }
         assert!(game.settings.extras.pvp.combat.rules);
         equip_axe(&mut game);
-        assert_eq!(game.melee_damage("minecraft:player", true).0, 7.0);
+        assert_eq!(game.melee_damage("minecraft:player", true, None).0, 7.0);
     }
 }

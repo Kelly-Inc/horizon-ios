@@ -180,6 +180,13 @@ fn compiled_guest_runs_in_actual_game_roots_on_guest_stack() {
                     Some(1),
                     true,
                     Some(&options),
+                    horizon_client::save::SessionLock::acquire(
+                        &std::env::current_dir()
+                            .unwrap()
+                            .join("saves")
+                            .join("wasm_raw_transport"),
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
                 let deadline = Instant::now() + Duration::from_secs(60);
@@ -221,6 +228,7 @@ fn compiled_guest_runs_in_actual_game_roots_on_guest_stack() {
                 if !trap {
                     game.remote.as_ref().unwrap().session.start_recording(
                         super::tests::WireReceipt {
+                            stopped: std::sync::atomic::AtomicBool::new(false),
                             channel: "raw_probe:receipt",
                             expected: Arc::new(bytes.clone()),
                             hits: wire_hits.clone(),

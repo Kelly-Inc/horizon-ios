@@ -451,7 +451,7 @@ fn sampled_attempt(game: &mut Game<'_>, overlap_self: bool) -> MobEvent {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn leave_block_raw_query_uses_non_mob_presence_and_snapshot_identity() {
     use horizon_client::{
         items::ItemStack,

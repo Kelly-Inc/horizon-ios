@@ -109,6 +109,13 @@ fn published_tcp_attributes_players_and_orders_actions() {
                 Some(1),
                 true,
                 Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir()
+                        .unwrap()
+                        .join("saves")
+                        .join("sender_transport"),
+                )
+                .unwrap(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);

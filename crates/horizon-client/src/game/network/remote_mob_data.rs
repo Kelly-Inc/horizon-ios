@@ -991,9 +991,13 @@ mod tests {
     /// A mob of the prepared resources' type `kind`, as a client spawns it
     /// (None without the resources).
     fn root() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION)
+        std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
+            })
     }
 
     /// The prepared resources' built-in registries (empty without them).
@@ -1443,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs prepared resources in .local/horizon-client/26.3"]
+    #[ignore = "daily"]
     fn mannequin_shared_metadata_reaches_living_avatar_animation() {
         let mut m = mob("minecraft:mannequin").expect("prepared mannequin facts and models");
         apply(

@@ -11504,6 +11504,43 @@ pub(crate) fn run_with(
 ) -> Result<()> {
     let mut options = Options::read(options)?;
     options.mods.native = Arc::new(native);
+    // The PC half of a phone import: one command, one archive, no window, no GPU. It is the game's own
+    // binary because it is the game that decides what the archive means (`horizon_client::import`), and
+    // a player already has this executable on the computer with the prepared folder on it.
+    if let Some(folder) = options.pack.clone() {
+        let out = match options.pack_out.clone() {
+            Some(out) => out,
+            None => {
+                let name = folder
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "horizon".to_owned());
+                folder
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(format!("{name}.zip"))
+            }
+        };
+        let terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let packed = horizon_client::import::pack(&folder, &out, |files, bytes| {
+            // One line that redraws itself: five thousand files would otherwise be a five-thousand-line scroll.
+            if terminal {
+                eprint!("\rHorizon: {files} files, {} MB", bytes / 1_048_576);
+            }
+        })?;
+        if terminal {
+            eprintln!();
+        }
+        println!(
+            "Horizon: packed {} {} ({} files, {} MB) into {}",
+            packed.kind.label(),
+            folder.display(),
+            packed.files,
+            packed.bytes / 1_048_576,
+            out.display()
+        );
+        return Ok(());
+    }
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
     {

@@ -5,132 +5,51 @@ The current app is the `HorizonGame` target: the `horizon-official` Rust executa
 steps are in [the iOS workflow](../../.github/workflows/ios.yml). It uploads the
 `horizon-ios-game` artifact containing `Horizon-game-unsigned.ipa`.
 
-The shell/probe commands below document the earlier packaging prototypes; they are not
-a complete build of the current native-launcher app. Use the workflow’s `Build the game`
-and `Bundle it` steps together to reproduce the current distributable.
+Use the workflow’s `Build the game` and `Bundle it` steps together to reproduce the
+current distributable. The old shell target is retained for diagnostics only.
 
-## Historical shell prototype
+## Targets and local builds
 
-Three files and one crate make the app shell, and a fourth puts the game itself in a bundle beside it.
+`HorizonGame` is the playable app. `HorizonLauncherKit` supplies its SwiftUI launcher.
+The separate `Horizon` target is an old diagnostic shell that calls `horizon_probe()`;
+its output is not proof that the game starts. `GameShell/main.m` is a placeholder
+replaced by Cargo's executable before signing.
 
-- `project.yml`: the Xcode project, as an [XcodeGen](https://github.com/yonaskolb/XcodeGen) spec. Run
-  `brew install xcodegen && xcodegen generate` in this folder to write `HorizonIOS.xcodeproj`, which is
-  not checked in. Its paths are relative to this directory, so generate it from here.
-- `Info.plist`: the bundle's plist, filled in by Xcode from `project.yml`'s `MARKETING_VERSION` and
-  `CURRENT_PROJECT_VERSION`. Bundle id `dev.horizon.ios`, iOS 16 or later, iPhone and iPad.
-- `Sources/main.m`: the app. One `AppDelegate`, one view controller, and no storyboard: it calls
-  `horizon_probe()` in `viewDidLoad` and shows what came back in a monospaced text view.
-- `GameInfo.plist`: a second bundle's plist, for the `.ipa` whose executable is the cross-compiled
-  `horizon-client` rather than an app written here. Bundle id `dev.horizon.game`, and literal versions because no
-  Xcode substitutes anything. See "The second bundle" below.
-
-The Rust half is [`crates/horizon-ios`](../../crates/horizon-ios), whose header is
-`crates/horizon-ios/include/horizon_ios.h`. The project links it by name out of
-`target/aarch64-apple-ios/release`, so nothing here pretends a fresh clone is buildable: the archive
-has to be cross-compiled first.
-
-## Building it, as the workflow does
-
-```sh
-cargo rustc --release --locked --target aarch64-apple-ios -p horizon-ios --lib --crate-type staticlib
-cd packaging/ios && xcodegen generate && cd ../..
-xcodebuild -project packaging/ios/HorizonIOS.xcodeproj -target Horizon -configuration Release \
-  -sdk iphoneos -arch arm64 \
-  CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
-  CONFIGURATION_BUILD_DIR="$PWD/build-ios" build
-mkdir -p ipa/Payload && cp -a build-ios/Horizon.app ipa/Payload/
-( cd ipa && zip -qry ../Horizon-unsigned.ipa Payload )
-```
-
-`.github/workflows/ios.yml` does exactly this on a Mac runner, checks the bundle's binary is arm64
-iOS machine code with `_horizon_probe` really linked into it, and uploads `Horizon-unsigned.ipa`.
-
-## What the .ipa is, and what it is not
-
-It is **unsigned**: iOS refuses to install it, on your own phone included. What it is for is proof of
-the chain — Cargo's arm64 objects, an Objective-C caller, a linker, a bundle, a Payload archive — so
-that the only thing standing between it and a hand is a signing certificate, which is an account and
-not a build problem. With any Apple ID added to Xcode, open the generated project, pick a team, and
-run it on the device.
-
-It is **not the game**: this bundle holds the probe crate, not `horizon-client`. The client now *compiles*
-for `aarch64-apple-ios` -- the Mac runner measured that on 2026-10-24, with `--no-default-features`, and the
-clipboard that used to drag the Wayland stack into a phone build is gated to the four targets `arboard` has
-a backend for (`crates/horizon-client/Cargo.toml`). Compiling is the entry fee and not the port. What stands
-between this bundle and a playable one:
-
-| Gap | Why it is structural | Decided |
-|---|---|---|
-| Assets | `horizon-prepare` runs a JDK against the player's own Minecraft install to produce `.local/horizon-client/26.3`; there is no Java on iOS | Prepare off-device, download to the phone |
-| Mods | `horizon-mods` runs them through wasmtime's cranelift JIT, and Apple forbids generating executable code at runtime (`docs/mods.md`) -- note the runner says the `mods` *feature compiles*, which is about the compiler and not about running | Disabled on iOS |
-| Input | the client's winit loop is desktop-shaped: cursor-warp mouse look, no touch | A touch layer, in no crate yet |
-| Sound, controllers | `hidapi`/`gilrs` need libudev or IOKit, which is what `--no-default-features` drops and why the phone build asks for that flag; `cpal` (the `audio` feature) has a CoreAudio backend for iOS too, through RemoteIO | `--features audio` on the phone, with the launcher setting up the audio session; `GCController` for pads |
-
-So this app runs the half that was already portable before the client was: `horizon-core`'s Java-accurate RNG
-and HotSpot-exact `Math`, its paletted block storage, and `horizon-world`'s NBT codec -- the four probes whose
-answers you can read on the screen, all of them computed on the phone rather than shipped to it.
-
-## The second bundle: the game, with no Xcode in its build
-
-`.github/workflows/ios.yml` uploads two `.ipa` files, because two things are being measured. `Horizon-unsigned.ipa`
-is the shell above. `Horizon-game-unsigned.ipa` is `horizon-client` itself:
-
-```sh
-cargo build --release --locked --target aarch64-apple-ios -p horizon-client --no-default-features --features audio
-rm -rf game-payload && mkdir -p game-payload/Payload/Horizon.app
-cp target/aarch64-apple-ios/release/horizon-client game-payload/Payload/Horizon.app/Horizon
-cp GameInfo.plist game-payload/Payload/Horizon.app/Info.plist
-printf 'APPL????' > game-payload/Payload/Horizon.app/PkgInfo
-( cd game-payload && zip -qry ../Horizon-game-unsigned.ipa Payload )
-```
-
-No `.xcodeproj` and no `xcodegen`: rustc produced an executable, and the rest is a folder layout iOS loads. The
-bundle id is `dev.horizon.game`, so the two install side by side. `GameInfo.plist` carries literal versions where
-`Info.plist` carries `$(MARKETING_VERSION)` for Xcode to fill in -- keep the two in step with `project.yml`.
-
-What that bundle cannot do yet, in the order it will be found: it has **no assets** (CI has no Minecraft jar to run
-`horizon-prepare` against, and this repository must not ship one; `UIFileSharingEnabled` in the plist is the
-deliberate door for the player to put the prepared folder where the game looks), and **no touch input** -- the first
-frame may be the whole show until something turns a tap into a key. The game starts in `$HOME/Documents`, which is
-why `saves/`, `options.txt` and `.horizon-cache` are where a player can reach them; see `crates/horizon-client/src/main.rs`
-`into_app_sandbox`.
-
-## Running it on a phone
-
-An unsigned `.ipa` installs nowhere, so the route that works today is the one Xcode signs for you. `project.yml`
-has two application targets and two schemes:
-
-| Scheme | Bundle id | Executable | What it is |
-|---|---|---|---|
-| **Horizon shell** | `dev.horizon.ios` | Objective-C + `libhorizon_ios.a` | the four probes, printed on screen |
-| **Horizon game** | `dev.horizon.game` | Cargo's `horizon-client` | the game |
+From the repository root, the game build uses:
 
 ```sh
 rustup target add aarch64-apple-ios
-brew install xcodegen
-cd packaging/ios && xcodegen generate && open HorizonIOS.xcodeproj
+cargo build --release --locked --target aarch64-apple-ios -p horizon-official \
+  --no-default-features --features audio,horizon-extras
+( cd packaging/ios && xcodegen generate )
+HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonIOS.xcodeproj \
+  -target HorizonGame -configuration Release -sdk iphoneos -arch arm64 \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO \
+  CONFIGURATION_BUILD_DIR="$PWD/build-ios" build
 ```
 
-Pick **Horizon game**, choose your device, set a signing team on the target, and press Run. The target's first
-build phase runs `cargo build --release --target aarch64-apple-ios -p horizon-client --no-default-features --features audio`;
-Xcode then links a placeholder `GameShell/main.m` so the bundle has an executable, and a phase after it
-overwrites that file with Cargo's binary -- which is what the signature then covers. rustc cannot emit a library
-from a bin target and `Game` is bin-only code, so this is the only shape that gets the game into a signed bundle
-without moving 30k lines into the library. `.github/workflows/ios.yml` builds the same target with
-`CODE_SIGNING_ALLOWED=NO` and `cmp`s the bundle's executable against Cargo's, so "the copy stuck" is a checked
-claim and not an assumption.
+Use the workflow's stamping, packaging and audit steps before distributing an IPA;
+the raw Xcode output above has not had its release version and source identity stamped.
+Microsoft sign-in configuration must agree in the Rust executable and native launcher;
+the workflow supplies `HORIZON_MSA_CLIENT_ID` to both.
 
-**If you open the shell and see the probe report, that is the other target.** The report text is
-`crates/horizon-ios`, printed by `Sources/main.m`; nothing about it is the game.
+An unsigned IPA needs signing before installation. For a development install, open
+`packaging/ios/HorizonIOS.xcodeproj`, select the **Horizon game** scheme and set a
+signing team on the `HorizonGame` target. The source, assets and account configuration
+used for that build determine what it can run; a compile alone is not a gameplay test.
+
+The native launcher supports touch layouts, keyboard/pointer input and controllers.
+Keep Cargo's desktop `controllers` feature disabled on iOS: the app uses Apple's
+GameController APIs instead. The [simulator preview](Preview/README.md) runs the
+launcher and its tests with a fake backend, without starting the Rust game.
 
 ### Landscape, which two places have to say
 
-The game is landscape-only on a phone, and both halves are needed:
+The game runs in landscape on a phone; the native launcher can use portrait. Both the bundle and the active view controller must permit the requested orientation:
 
-- `UISupportedInterfaceOrientations` in `Info.plist` and `GameInfo.plist` lists the two landscape directions and
-  no portrait. This is what the launch screen and the bundle's own metadata are judged by.
-- `ValidOrientations::Landscape` on the winit window attributes (`crates/horizon-client/src/game.rs`, both
-  `resumed` implementations). Without it the plist alone does not hold: winit implements
+- `GameInfo.plist` lists the orientations the game/launcher bundle can use. The native
+  launcher and winit controller narrow that mask as ownership moves between them.
+- `ValidOrientations::Landscape` on the winit window attributes (the startup and game window setup). Without it the plist alone does not hold: winit implements
   `supportedInterfaceOrientations` on its own view controller from its default
   (`LandscapeAndPortrait`, and it never reads the plist), and a phone asks the root view controller rather than
   the bundle, so the game would rotate into portrait under it.
@@ -140,7 +59,7 @@ each, so nothing in the render path has to care.
 
 ### Where the game looks, on the phone
 
-- It works in `$HOME/Documents`, which on iOS is the app's data container (`main.rs` `into_app_sandbox`). Saves
+- It works in `$HOME/Documents`, which on iOS is the app's data container (`entry.rs` `into_app_sandbox`). Saves
   land in `Documents/saves`, settings in `Documents/options.txt`, pack caches in `Documents/.horizon-cache`.
 - The log is `Library/Application Support/horizon/logs/latest.log` -- the container Xcode's *Devices and
   Simulators* window downloads, and the way to read what happened when nothing appeared.
@@ -160,7 +79,9 @@ each, so nothing in the render path has to care.
 
 A published `.ipa` carries no assets: `horizon-resources.json` in a bundle is a refusal in
 `.github/workflows/ios.yml`, and the bundle a phone installs is read-only while the game runs anyway. So the
-files come from the computer that prepared them, as one ZIP, through one of two doors.
+native launcher can download a prepared archive from the configured source, accept a
+custom download link, or import a ZIP through Files. Preparation of raw Java files
+runs off-device. The shared game's recovery import screen also supports the routes below.
 
 On the computer, with the same `horizon-client` a player already has:
 
@@ -175,7 +96,7 @@ both being on the phone at once.
 
 **Over Wi-Fi, while the phone is asking.** A game that cannot start does not exit; it keeps its window, shows the
 loader's own reason, and asks for its files at `http://<address>:<port>/` with six digits beside it
-(`crates/horizon-client/src/game/import_screen.rs`, drawn with the one atlas that exists before Mojang's files
+(`crates/horizon-client/src/game/interface/import_screen.rs`, drawn with the one atlas that exists before Mojang's files
 do). Open that address on the computer, choose the archive, type the digits, and watch the bar on the phone. Or,
 from a terminal:
 
@@ -267,4 +188,4 @@ data. No extra publishing token or signing certificate is required.
 Files upload to a draft release before it becomes public. A release-only retry can
 resume a partial draft, but cannot overwrite a published build or reuse a tag pointing
 at another commit. Downloaded IPAs still need the user's own signing method before
-installation. Prereleases are not marked as the stable `latest` release.
+installation. Only the newest eligible release is marked as `latest`; retries of older builds cannot replace it.

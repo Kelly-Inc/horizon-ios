@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn each_group_has_its_own_limit_and_a_reload_drops_only_provider_particles_of_a_group() {
+    fn each_group_has_its_own_limit_and_reload_clears_all_particles_before_rebinding() {
         let (scene, pack) = (Scene::new(), Pack::new("limits"));
         let level = scene.level();
         let mut e = pack.engine(vec![
@@ -296,9 +296,8 @@ mod tests {
             e.particles.len(),
         );
         assert_eq!(sizes, (MAX_PARTICLES, 1, 1));
-        // A reload drops the particles a controller moves (the provider's sprite-set handles
-        // belong to the load) in a group as in the built-in one; the declarative particles stay and
-        // still draw in their group.
+        // ParticleResources calls clearParticles before rebinding: declarative
+        // and provider-controlled particles both leave the old generation.
         pack.reload(&mut e);
         assert_eq!(
             (
@@ -306,7 +305,7 @@ mod tests {
                 e.groups[1].particles.len(),
                 e.particles.len()
             ),
-            (MAX_PARTICLES, 0, 1)
+            (0, 0, 0)
         );
         assert_eq!(e.mod_sets["mymod:shade"].group, Some(1));
     }

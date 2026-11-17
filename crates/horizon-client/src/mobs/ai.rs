@@ -7288,7 +7288,7 @@ mod noai_climb_cache_tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn whole_tick_pushability_tracks_climbables_with_and_without_ai() {
         let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
         let mut rows = Vec::new();
@@ -7318,8 +7318,13 @@ mod noai_climb_cache_tests {
                         mob.no_gravity = true;
                         mob.persistent = true;
                         mob.attrs.speed = 0.0;
-                        let mut random = LegacyRandom::new(0);
-                        assert!(tick(&mut mob, world, &mut random, &mut Vec::new()));
+                        let mut test_level = crate::health::TestLevel::new(0);
+                        assert!(tick(
+                            &mut mob,
+                            world,
+                            &mut test_level.level(),
+                            &mut Vec::new()
+                        ));
                         assert_eq!(mob.age, 1, "actual eligible whole tick");
                         assert_eq!(mob.position, at, "native stationary scene");
                         assert_eq!(mob.health, 10.0);
@@ -7339,7 +7344,12 @@ mod noai_climb_cache_tests {
                             let to = Vec3::new(4.5, 64.0, 2.5);
                             mob.position = to;
                             mob.previous = to;
-                            assert!(tick(&mut mob, world, &mut random, &mut Vec::new()));
+                            assert!(tick(
+                                &mut mob,
+                                world,
+                                &mut test_level.level(),
+                                &mut Vec::new()
+                            ));
                             assert_eq!(mob.age, 2);
                             assert_eq!(mob.position, to);
                             assert!(!mob.on_climbable(world));

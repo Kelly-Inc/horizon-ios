@@ -76,6 +76,7 @@ struct Game {
     veto: bool,
 }
 impl Game {
+    fn items(&self) -> &Resources { self.res.items() }
     fn main_hand_key(&self) -> String { String::new() }
     fn same_destroying_item(&self, began: &String) -> bool { *began == self.main_hand_key() }
     fn reset_attack_strength(&mut self) {}

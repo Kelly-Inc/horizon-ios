@@ -72,7 +72,7 @@ fn sting(mobs: &mut [Mob]) -> Vec<MobEvent> {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn sting_native_hook_sees_fish_full_stack_and_restores_outer_attacker() {
     let mut stick = ItemStack::new("minecraft:stick", 7);
     stick.damage = 9;
@@ -103,7 +103,7 @@ fn sting_native_hook_sees_fish_full_stack_and_restores_outer_attacker() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn an_empty_fish_hand_does_not_inherit_an_enclosing_players_item() {
     let mut mobs = fixture(None);
     let outer = health::knockback_from_holding(

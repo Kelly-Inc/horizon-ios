@@ -10187,18 +10187,23 @@ mod piglin_live_anger_memory_tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn forgotten_owned_memory_cannot_resurrect_stale_raw_anger() {
-        let mut m = mob();
-        crate::mobs::piglin::set_guarded_anger_target(&mut m, Some([1, 2, 3, 4]));
-        crate::mobs::piglin::set_avoid_target_and_dont_hunt(
-            &mut m,
-            &mut horizon_core::random::LegacyRandom::new(7),
-            Who::Player,
-            Vec3::ZERO,
-        );
-        let saved = mob_to_nbt(&m, [42, 43, 44, 45], Some(&raw()), None, |_| None);
-        assert!(memory(&saved).is_none());
-        assert_unrelated(&saved);
+        let ran = crate::mobs::with_test_world(&[], |world, _| {
+            let mut m = mob();
+            crate::mobs::piglin::set_guarded_anger_target(&mut m, Some([1, 2, 3, 4]));
+            crate::mobs::piglin::set_avoid_target_and_dont_hunt(
+                &mut m,
+                world,
+                &mut crate::mobs::level_random(7),
+                Who::Player,
+                Vec3::ZERO,
+            );
+            let saved = mob_to_nbt(&m, [42, 43, 44, 45], Some(&raw()), None, |_| None);
+            assert!(memory(&saved).is_none());
+            assert_unrelated(&saved);
+        });
+        assert!(ran, "requires HORIZON_TEST_RESOURCES");
     }
 
     #[test]

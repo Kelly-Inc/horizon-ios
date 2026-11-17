@@ -490,10 +490,20 @@ fn a_mods_pack_is_on_the_screen_and_applies_through_client_reload() {
         crate::game::native_entity_refs::tests::with_client_game(|game| {
             ran = true;
             game.mods = fixture.sources();
+            let content = crate::game::mods::prepare_content(
+                &game.vanilla_root(),
+                &game.settings.mods.enabled,
+                &game.settings.mods.disabled,
+                &game.mods.dev,
+                &game.mods,
+            )
+            .unwrap();
             let staged = crate::game::packs::stage_pack(
                 &game.vanilla_root(),
                 &[],
                 &[],
+                &content.selection,
+                content.catalog.clone(),
                 &game.mods,
                 game.register_client_reload_listeners(),
                 &[],
@@ -526,10 +536,20 @@ fn a_mods_pack_is_on_the_screen_and_applies_through_client_reload() {
             game.settings.resource_packs = vec![fixture.asset_id()];
             for expected in ["first", "second"] {
                 let listeners = game.register_client_reload_listeners();
+                let content = crate::game::mods::prepare_content(
+                    &game.vanilla_root(),
+                    &game.settings.mods.enabled,
+                    &game.settings.mods.disabled,
+                    &game.mods.dev,
+                    &game.mods,
+                )
+                .unwrap();
                 let staged = crate::game::packs::stage_pack(
                     &game.vanilla_root(),
                     &game.settings.resource_packs,
                     &[],
+                    &content.selection,
+                    content.catalog.clone(),
                     &game.mods,
                     listeners,
                     &[],

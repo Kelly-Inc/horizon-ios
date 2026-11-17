@@ -14,12 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    source = (ROOT / 'crates/horizon-client/src/game/pad/ios.rs').read_text()
+    source = (ROOT / 'crates/horizon-client/src/game/interface/pad/ios.rs').read_text()
     router = source[source.index('pub(in crate::game) type PadId'):source.index('\nimpl Pads {', source.index('struct RoutedPad'))]
     router = router.replace('pub(in crate::game)', 'pub(crate)')
     code = '#![allow(dead_code)]\n'
     code += f'#[path={str(ROOT / "crates/horizon-gamecontroller/src/lib.rs")!r}] mod horizon_gamecontroller;\n'.replace("'", '"')
-    for name in ("radial", "input_source"):
+    for name in ("radial", "input_source", "mouse"):
         code += f'#[path="{ROOT / "crates/horizon-client-input/src" / (name + ".rs")}"] mod {name};\n'
     gamepad = (ROOT / 'crates/horizon-client-input/src/gamepad.rs').read_text()
     gamepad = gamepad.replace("mod radial_file;", f'#[path="{ROOT / "crates/horizon-client-input/src/gamepad/radial_file.rs"}"] mod radial_file;')

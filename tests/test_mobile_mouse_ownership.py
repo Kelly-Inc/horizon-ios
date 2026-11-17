@@ -9,9 +9,9 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def program():
-    game=(ROOT/'crates/horizon-client/src/game/play_input.rs').read_text()
-    touch=(ROOT/'crates/horizon-client/src/game/touch.rs').read_text()
-    methods='\n'.join(method(game,n) for n in ['mouse_mapping','mouse_mapping_held_elsewhere'])+'\n'+method(touch,'touch_holds_mouse_mapping')
+    game=(ROOT/'crates/horizon-client/src/game/interface/play_input.rs').read_text()
+    touch=(ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
+    methods='\n'.join(method(game,n) for n in ['mouse_mapping','mouse_mapping_held_elsewhere','input_holds'])+'\n'+method(touch,'touch_holds_mouse_mapping')
     return STUBS.replace('TOUCH_SOURCE',str(ROOT/'crates/horizon-client/src/touch.rs'))+'\nimpl Game{'+methods+'}\n'+CASES
 
 

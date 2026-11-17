@@ -63,10 +63,9 @@ pub fn utf16_len(s: &str) -> usize {
 }
 /// The longest prefix of `s` that fits `max` UTF-16 code units without
 /// splitting a character. `EditBox.insertText` drops the half surrogate it
-/// would otherwise keep, so this is what vanilla inserts; Rust strings cannot
-/// hold the lone surrogate that `setValue`'s unguarded `substring` may leave,
-/// so a value too long by half a character keeps the whole characters before
-/// the cut.
+/// would otherwise keep, so this is what vanilla inserts. `setValue` has a
+/// different, unguarded cutoff; [`TextEdit::set_value`] preserves its UTF-8
+/// transport representation.
 pub fn utf16_prefix(s: &str, max: usize) -> String {
     let mut units = 0;
     for (i, c) in s.char_indices() {
@@ -91,6 +90,13 @@ impl TextEdit {
     /// `EditBox.setValue`: the text, cut to the maximum length, with the cursor at its end.
     pub fn set_value(&mut self, value: &str) {
         self.value = utf16_prefix(value, self.max_length);
+        // Java's setValue uses substring by UTF-16 units, unlike insertText's
+        // surrogate-safe cutoff. A cut high surrogate occupies one unit and
+        // encodes as '?' in Java's UTF-8 transport. Keep that observable value
+        // without putting an invalid surrogate in this UTF-8 String.
+        if self.value.len() < value.len() && utf16_len(&self.value) < self.max_length {
+            self.value.push('?');
+        }
         self.move_cursor_to_end(false);
     }
 
@@ -339,6 +345,27 @@ mod tests {
         let mut edit = TextEdit::new(32);
         edit.set_value(value);
         edit
+    }
+
+    #[test]
+    fn set_value_keeps_java_utf8_at_a_cut_surrogate_while_typing_keeps_pairs() {
+        // Pinned EditBox.setValue uses UTF-16 substring; Java's UTF-8 encoder
+        // replaces the resulting lone high surrogate with '?'. insertText
+        // explicitly backs off that boundary instead.
+        for (value, limit, expected) in [
+            ("a🦀b🦀", 5, "a🦀b?"),
+            ("🦀", 1, "?"),
+            ("abc", 0, ""),
+            ("🦀", 2, "🦀"),
+        ] {
+            let mut edit = TextEdit::new(limit);
+            edit.set_value(value);
+            assert_eq!(edit.value, expected);
+            assert!(utf16_len(&edit.value) <= limit);
+        }
+        let mut edit = TextEdit::new(1);
+        edit.insert_text("🦀");
+        assert!(edit.value.is_empty());
     }
 
     /// A cursor or selection left past the end by setting `value` directly is brought back

@@ -550,9 +550,10 @@ mod tests {
         let file = root.join("mutes.json");
         let _ = std::fs::remove_file(&file);
         let now = 1_800_000_000_000;
-        let millis = parse_duration("9223372036854775s").unwrap();
+        assert!(parse_duration("9223372036854775s").is_none());
+        let millis = parse_duration("4611686018427387s").unwrap();
         let until = mute_expiry(now, Some(millis));
-        assert_eq!(until, Some(i64::MAX));
+        assert_eq!(until, Some(4_611_687_818_427_387_000));
         let mut guard = Guard::new(
             Config::default(),
             Filter::default_list(),
@@ -563,7 +564,7 @@ mod tests {
         drop(guard);
         let restored = Guard::new(Config::default(), Filter::default_list(), Some(file));
         let mute = restored.muted(7, i64::MAX / 2).unwrap();
-        assert_eq!(mute.until, Some(i64::MAX));
+        assert_eq!(mute.until, Some(4_611_687_818_427_387_000));
         assert_eq!(
             (
                 mute.name.as_str(),
@@ -578,7 +579,7 @@ mod tests {
                 duration.translation_key(),
                 Some("horizon.moderation.duration.days")
             );
-            assert_eq!(duration.plain(), "106751991168 days");
+            assert_eq!(duration.plain(), "53375995584 days");
         });
         assert_eq!(mute_expiry(now, None), None);
         std::fs::remove_dir_all(root).unwrap();

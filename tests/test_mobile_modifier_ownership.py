@@ -16,9 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    game = (ROOT / 'crates/horizon-client/src/game/play_input.rs').read_text()
+    game = (ROOT / 'crates/horizon-client/src/game/interface/play_input.rs').read_text()
     modules = '\n'.join(f'#[path="{ROOT / path}"] mod {name};' for name, path in (
         ('held', 'crates/horizon-client-input/src/held.rs'),
+        ('input_queue', 'crates/horizon-client-input/src/input_queue.rs'),
         ('actions', 'crates/horizon-client-input/src/actions.rs'),
         ('keymapping', 'crates/horizon-client-input/src/keymapping.rs'),
     ))
@@ -36,6 +37,9 @@ STUBS = r'''
 #![allow(dead_code)]
 extern crate self as winit;
 extern crate self as horizon_client;
+extern crate self as log;
+#[macro_export]macro_rules! warn{($($t:tt)*)=>{{}}}
+pub mod event {#[derive(Clone,Copy,Debug,Hash,PartialEq,Eq)]pub enum MouseButton{Left,Right,Middle}}
 pub mod keyboard {#[derive(Clone,Copy,Debug,Hash,PartialEq,Eq)]pub enum KeyCode{KEY_CODES}}
 use keyboard::KeyCode;use actions::Action;use held::Source;use keymapping::{KeyAction,SNEAK};
 type Result<T>=std::result::Result<T,String>;
@@ -46,6 +50,7 @@ fn gameplay_has_keyboard(screen:Screen,title:bool,dialog:bool)->bool{matches!(sc
 use std::collections::HashSet;
 pub mod keybinds{
  use super::KeyCode;
+ pub fn mouse_button(_:&str)->Option<crate::event::MouseButton>{None}
  pub fn key_code(name:&str)->Option<KeyCode>{Some(match name{"shift"=>KeyCode::ShiftLeft,"control"=>KeyCode::ControlLeft,"a"=>KeyCode::KeyA,_=>return None})}
 }
 struct Bindings{rebound:bool}
@@ -78,7 +83,7 @@ fn main(){
   // Releasing touch really releases its modifier action; it is not a latch
   // that remains merely because it was once protected during healing.
   g.keys.release(&key,Source::Touch);g.toggles.key(slot,keymapping::KeyAction::Release,false,false);g.heal_hold_latches();
-  assert!(!g.keys.contains(&key));assert!(!g.toggles.is_down(slot));
+  assert!(!g.keys.raw(&key));assert!(!g.toggles.is_down(slot));
  }
  // Exercise the actual default-action dispatcher, not only HeldKeys:
  // releasing either physical or touch Shift must keep the other's sneak
@@ -90,7 +95,7 @@ fn main(){
    if first!=Source::Keyboard {assert!(!g.keys.held_by(&key,Source::Keyboard),"sync must not invent a physical keyboard hold");}
    g.mapped_key(key,true,false,key,second).unwrap();g.mapped_key(key,false,false,key,first).unwrap();
    assert!(g.toggles.is_down(slot));assert!(g.keys.held_by(&key,second));assert!(!g.keys.held_by(&key,first));
-   g.mapped_key(key,false,false,key,second).unwrap();assert!(!g.toggles.is_down(slot));assert!(!g.keys.contains(&key));
+   g.mapped_key(key,false,false,key,second).unwrap();assert!(!g.toggles.is_down(slot));assert!(!g.keys.raw(&key));
    assert!(g.toggles.0[slot].consume_click());assert!(g.toggles.0[slot].consume_click());assert!(!g.toggles.0[slot].consume_click());
   }
  }
@@ -98,7 +103,7 @@ fn main(){
  // physical hold that needs an extra release.
  let mut g=Game::new();let key=KeyCode::ShiftLeft;
  g.mapped_key(key,true,false,key,Source::Touch).unwrap();g.mapped_key(key,true,true,key,Source::Touch).unwrap();g.mapped_key(key,false,false,key,Source::Touch).unwrap();
- assert!(!g.toggles.is_down(0));assert!(!g.keys.contains(&key));assert_eq!(g.dispatched,vec![key]);
+ assert!(!g.toggles.is_down(0));assert!(!g.keys.raw(&key));assert_eq!(g.dispatched,vec![key]);
  // A touch Shift hold and release preserve independent hardware ownership.
  let mut g=Game::new();g.mapped_key(key,true,false,key,Source::Keyboard).unwrap();
  g.touch_sneak(true).unwrap();assert!(g.keys.held_by(&key,Source::Touch));assert!(g.keys.held_by(&key,Source::Keyboard));
@@ -114,16 +119,16 @@ fn main(){
  let mut g=Game::new();g.settings.toggle_crouch=true;
  g.mapped_key(key,true,false,key,Source::Touch).unwrap();g.mapped_key(key,false,false,key,Source::Touch).unwrap();assert!(g.toggles.is_down(0));
  g.mapped_key(key,true,false,key,Source::Keyboard).unwrap();g.mapped_key(key,false,false,key,Source::Keyboard).unwrap();assert!(!g.toggles.is_down(0));
- g.screen=Screen::Menu;g.mapped_key(key,true,false,key,Source::Touch).unwrap();assert!(!g.toggles.is_down(0));assert!(!g.keys.contains(&key));
+ g.screen=Screen::Menu;g.mapped_key(key,true,false,key,Source::Touch).unwrap();assert!(!g.toggles.is_down(0));assert!(!g.keys.raw(&key));
  // The existing keyboard stale-modifier repair remains effective.
  let mut g=Game::new();g.press(0,Source::Keyboard);g.physical_keys.insert(KeyCode::ShiftLeft);g.physical_keys.insert(KeyCode::ShiftRight);g.heal_hold_latches();
- assert!(!g.keys.contains(&KeyCode::ShiftLeft));assert!(!g.toggles.is_down(0));assert!(g.physical_keys.is_empty());
+ assert!(!g.keys.raw(&KeyCode::ShiftLeft));assert!(!g.toggles.is_down(0));assert!(g.physical_keys.is_empty());
  // A controller action still protects its held mapping independently.
  let mut g=Game::new();g.press(0,Source::Pad);g.pad.held.push("key.sneak");g.heal_hold_latches();assert!(g.keys.held_by(&KeyCode::ShiftLeft,Source::Pad));
  // A real modifier still protects the keyboard mapping.
  let mut g=Game::new();g.press(1,Source::Keyboard);g.modifiers.control=true;g.heal_hold_latches();assert!(g.keys.held_by(&KeyCode::ControlLeft,Source::Keyboard));
  // Shift's OS modifier report says nothing about a rebound sneak key.
- let mut g=Game::new();g.settings.keys.rebound=true;g.press(0,Source::Keyboard);g.heal_hold_latches();assert!(g.keys.contains(&KeyCode::ShiftLeft));
+ let mut g=Game::new();g.settings.keys.rebound=true;g.press(0,Source::Keyboard);g.heal_hold_latches();assert!(g.keys.raw(&KeyCode::ShiftLeft));
 }
 '''
 

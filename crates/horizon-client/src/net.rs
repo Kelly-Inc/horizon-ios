@@ -2336,8 +2336,9 @@ mod tests {
         assert!(
             !session
                 .poll()
-                .iter()
-                .any(|event| matches!(event, Event::Joined { .. }))
+                .into_iter()
+                .map(ingress::OwnedReceipt::into_parts)
+                .any(|(event, _lease)| matches!(event, Event::Joined { .. }))
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3152,11 +3153,11 @@ mod tests {
     fn local_send_rejects_unknown_oversize_payload_before_writing() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (_, writer) = Connection::local(client).split();
-        let (_, events) = event_channel();
+        let (send, events) = event_channel();
         let session = Session {
             cancellation: Arc::new(Cancellation::default()),
             events,
-            payload_events: _.clone(),
+            payload_events: send.clone(),
             payloads: crate::raw_payloads::Transport::empty(),
             writer: Arc::new(Mutex::new(Some(QueuedWriter::new(writer).unwrap()))),
             configuring: Arc::new(AtomicBool::new(false)),
@@ -3670,7 +3671,7 @@ mod tests {
         let canonical = std::fs::canonicalize(&resources).unwrap();
         let data = known_json(
             &canonical,
-            Path::new("data/minecraft/worldgen/biome/plains.json"),
+            std::path::Path::new("data/minecraft/worldgen/biome/plains.json"),
             &mut (64 * 1024 * 1024),
         )
         .unwrap();

@@ -251,6 +251,7 @@ mod tests {
             ] {
                 game.spawn_entity(
                     id,
+                    id as u128,
                     "minecraft:pig",
                     [face + 0.44999998807907104, eye_height - 0.45, 0.0],
                     [0.0; 3],
@@ -288,6 +289,7 @@ mod tests {
             game.selected = 0;
             game.inventory[0] = Some(weapon);
             game.spawn_entity(
+                25,
                 25,
                 "minecraft:pig",
                 [9.449999988079071, eye_height - 0.45, 0.0],

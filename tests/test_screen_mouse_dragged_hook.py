@@ -32,7 +32,6 @@ class ScreenMouseDraggedHookTests(unittest.TestCase):
         focus = source[start:source.index("        if let WindowEvent::ModifiersChanged", start)]
         fixture = r"""
 use std::{cell::RefCell, collections::HashSet};
-mod winit { pub mod keyboard { pub struct ModifiersState; impl ModifiersState { pub fn empty()->u32{0} } } }
 type MouseButton = i32;
 mod winit {
     pub mod keyboard {
@@ -110,7 +109,6 @@ fn lifecycle_and_cancellation() {
         game.focus(WindowEvent::Focused(false));
         assert_eq!(game.modifiers.0, 0);
         assert_eq!(game.drag_button, None);
-        assert_eq!(game.modifiers,0);
         assert!(game.physical_buttons.is_empty() && game.physical_keys.is_empty());
         game.pointer(Point { x: 62.0, y: 42.0 }).unwrap();
         assert!(game.calls.borrow().is_empty());

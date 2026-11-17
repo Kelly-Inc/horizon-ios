@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def program():
     skins = (ROOT / 'crates/horizon-client-render/src/skins.rs').read_text()
-    commands = (ROOT / 'crates/horizon-client/src/game/commands/extra.rs').read_text()
+    commands = (ROOT / 'crates/horizon-client/src/game/administration/commands/extra.rs').read_text()
     a = skins.index('#[derive(Clone, Debug)]\npub struct ResolvedProfile')
     b = skins.index('impl ResolvedProfile', a)
     profile = skins[a:b] + 'impl ResolvedProfile {pub ' + method(skins, 'textures') + '}\n'
@@ -30,6 +30,8 @@ def program():
 
 
 STUBS = r'''
+extern crate self as horizon_core;
+
 use skins::{NameOrId,ProfileLookup,Resolve,ResolvedProfile};
 use text::Text;
 type R<T>=Result<T,String>;
@@ -40,7 +42,8 @@ impl Context{fn get(&self,_:&str)->Option<&Arg>{Some(&self.arg)}}
 pub mod command{pub mod selector{pub fn java_uuid(s:&str)->Option<u128>{u128::from_str_radix(s,16).ok()}}}
 pub mod crypto{pub fn uuid_string(id:u128)->String{format!("{id:032x}")}}
 pub mod lan{pub mod playerdata{pub fn ints_uuid(_:u128)->u128{1}}}
-mod text{
+pub mod text{
+ pub fn parse_java_uuid(s:&str)->Option<u128>{crate::command::selector::java_uuid(s)}
  #[derive(Clone)]pub struct Text(pub String);
  impl Text{pub fn literal(v:impl Into<String>)->Self{Self(v.into())}pub fn translate(key:&str,args:&[Self])->Self{Self(format!("{key}:{}",args.iter().map(|a|a.0.as_str()).collect::<Vec<_>>().join(",")))}}
 }

@@ -225,6 +225,7 @@ class IgnoredTests(unittest.TestCase):
     def test_explicit_client_lib_selection_is_not_split_again(self):
         with patch.object(ignored_tests, "known_failures", return_value={}), \
                 patch.object(ignored_tests, "daily_rows", return_value=[]), \
+                patch.object(ignored_tests, "harness_inputs", return_value={}), \
                 patch.object(ignored_tests, "run", return_value={}) as execute:
             self.assertEqual(ignored_tests.main(["horizon-client-lib#2of3"]), 0)
         self.assertEqual(execute.call_args.args, ("horizon-client-lib", [], 2, 3))

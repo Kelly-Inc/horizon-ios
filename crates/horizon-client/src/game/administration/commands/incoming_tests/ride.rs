@@ -54,6 +54,10 @@ fn game<'a>(resources: &'a mut Option<std::sync::Arc<crate::game::Resources>>) -
     )
     .ok()?;
     game.build_registries();
+    game.reset_entity_residency();
+    game.native_lifecycle
+        .begin_open(mod_api::Authority::IntegratedServer);
+    crate::game::native_entity_refs::tests::resolve_parts(&game).unwrap();
     game.set_allow_commands(true);
     for x in 0..2 {
         game.world.chunks.insert(

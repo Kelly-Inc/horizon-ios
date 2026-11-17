@@ -204,6 +204,13 @@ fn tcp_configuration_reply_precedes_finish() {
                 Some(1),
                 true,
                 Some(&options),
+                horizon_client::save::SessionLock::acquire(
+                    &std::env::current_dir()
+                        .unwrap()
+                        .join("saves")
+                        .join("config_transport"),
+                )
+                .unwrap(),
             )
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);

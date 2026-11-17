@@ -13,7 +13,7 @@ class NativeGestureDispatchTests(unittest.TestCase):
     def test_timed_releases_context_changes_and_menu_button_dispatch(self):
         if not shutil.which("rustc"):
             self.skipTest("rustc required")
-        source = (ROOT / "crates/horizon-client/src/game/touch.rs").read_text()
+        source = (ROOT / "crates/horizon-client/src/game/interface/touch.rs").read_text()
         methods = "\n".join(method(source, name) for name in ["touch_menu_cursor_mode", "touch_native_reset", "touch_native_input", "touch_native_frame"])
         key = method(source, "gesture_key") + method(source, "gesture_modifiers")
         start = source.index("struct ClickContext {")

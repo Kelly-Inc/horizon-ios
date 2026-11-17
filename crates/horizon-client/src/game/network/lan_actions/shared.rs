@@ -318,8 +318,8 @@ fn building_player(g: &horizon_client::lan::guest::Guest) -> BuildingPlayer {
     BuildingPlayer {
         conn: Some(g.conn),
         dimension: Dim::from_id(&g.dimension),
+        // Terrain acknowledgement gates actions, not a server entity's presence.
         bounds: (g.participates_in_player_simulation()
-            && g.loaded
             && crate::game::building_players::guest_body_present(g)
             && !g.spectator())
         .then(|| g.bounds()),

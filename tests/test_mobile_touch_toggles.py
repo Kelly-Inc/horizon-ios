@@ -12,7 +12,7 @@ class TouchToggleTests(unittest.TestCase):
     def test_toggle_options_and_independent_sources(self):
         if not shutil.which('rustc'):
             self.skipTest('requires Rust')
-        source = (ROOT / 'crates/horizon-client/src/game/touch.rs').read_text()
+        source = (ROOT / 'crates/horizon-client/src/game/interface/touch.rs').read_text()
         begin = source.index('                Out::Press(control) | Out::Release(control) => {')
         end = source.index('                Out::Look(', begin)
         arms = source[begin:end]

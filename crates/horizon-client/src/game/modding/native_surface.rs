@@ -109,7 +109,7 @@ mod tests {
         let step = item.tick_move(
             &game.world,
             game.res.facts(),
-            game.collision,
+            &game.collision,
             false,
             (0.0, 0.0),
             &[],
@@ -130,7 +130,7 @@ mod tests {
         let (alive, _) = orb.tick_among(
             &game.world,
             game.res.facts(),
-            game.collision,
+            &game.collision,
             None,
             false,
             &mut || 0.0,
@@ -171,8 +171,8 @@ mod tests {
                     player: &mut player,
                     scene: &mut game.world,
                     assets: &game.pack.assets,
-                    collision_binding: game.collision,
-                    resources: game.motion,
+                    collision_binding: &game.collision,
+                    resources: &game.motion,
                     health: &game.health_resources,
                     tag_items: Some(game.res.items()),
                     loop_context: &game.loop_context,
@@ -202,7 +202,7 @@ mod tests {
                 stand.velocity = Vec3::new(0.2, 0.0, 0.0);
                 let mut scene = horizon_client::collisions::SceneCollisions {
                     world: &game.world,
-                    binding: game.collision,
+                    binding: &game.collision,
                     subject: None,
                 };
                 let step = stand

@@ -124,6 +124,12 @@ jobs:
 
   release:
     needs: ipa
+    # Publishing reads and then updates Latest. Serialize this across SHAs,
+    # while keeping completed builds queued instead of canceling a pending release.
+    concurrency:
+      group: horizon-ios-release
+      cancel-in-progress: false
+      queue: max
     # Never grant publication privileges to PRs or builds of arbitrary branches.
     if: >-
       (github.repository == 'Kelly-Inc/horizon-ios' || github.repository == 'heyskylo/horizon-ios') && github.ref == 'refs/heads/main' &&

@@ -365,7 +365,7 @@ mod transaction_tests {
     }
 
     #[test]
-    #[ignore = "requires prepared HORIZON_TEST_RESOURCES and isolated HORIZON_HOME"]
+    #[ignore = "daily"]
     fn owned_content_transaction_preserves_generations_and_blocks_input_until_ack() {
         assert!(std::env::var_os("HORIZON_HOME").is_some());
         let root = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
@@ -463,7 +463,7 @@ mod transaction_tests {
             .unwrap(),
         );
         client.title = None;
-        client.open_chat("keep", false);
+        client.begin_chat_screen("keep", false);
         client.begin_content_reload(ReloadKind::Selection, stage(&client, next.clone()));
         assert!(client.content_reload_busy());
         client.ime_commit("ignored");
@@ -500,7 +500,7 @@ mod transaction_tests {
         assert!(client.pending_entry.take().is_some());
         client.finish_reload_input_disarm(&TestLoop);
         client.title = None;
-        client.open_chat("keep", false);
+        client.begin_chat_screen("keep", false);
         client.ime_commit(" accepted");
         assert_eq!(
             client.ui.chat_screen.as_ref().unwrap().input.value,

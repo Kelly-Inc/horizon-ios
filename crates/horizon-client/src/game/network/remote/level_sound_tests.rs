@@ -257,7 +257,7 @@ fn game_events_ask_client_level_before_playback() {
             let level = horizon_client::particles::ParticleLevel {
                 world: &game.world,
                 facts: game.res.facts(),
-                collision: game.collision,
+                collision: &game.collision,
                 player: None,
                 cached_chunk: std::cell::Cell::new(None),
             };

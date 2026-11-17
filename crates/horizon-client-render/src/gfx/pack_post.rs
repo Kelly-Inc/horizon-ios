@@ -2836,6 +2836,13 @@ impl PackPost {
             let mut computes: Vec<Pass> = compute
                 .into_iter()
                 .filter_map(|(name, c)| {
+                    // A dispatch naming an absent buffer is deliberately skipped,
+                    // with a note, before attempting its pipeline. Other passes
+                    // (including final) still run; a real pipeline/input failure
+                    // must continue to mark the pack incomplete.
+                    let absent_indirect_buffer = c.indirect.is_some_and(|request| {
+                        pack.gpu.indirect && !pack.buffers.has(request.buffer)
+                    });
                     let result = build_compute(
                         device,
                         name,
@@ -2847,7 +2854,7 @@ impl PackPost {
                         &custom_names,
                         &pack,
                     );
-                    complete &= result.is_some();
+                    complete &= result.is_some() || absent_indirect_buffer;
                     result
                 })
                 .collect();

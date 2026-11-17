@@ -9,13 +9,13 @@ def struct(source,name):
 class VirtualCursorTests(unittest.TestCase):
  def test_menu_drag_buttons_screen_change_and_cancel(self):
   if not shutil.which('rustc'): self.skipTest('requires Rust')
-  code=(ROOT/'crates/horizon-client/src/game/touch.rs').read_text()
+  code=(ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
   methods='\n'.join(method(code,n) for n in ['touch_menu_cursor_mode','visible_touch_layout','touch_render_point','touch_click_context','touch_record_click_context','touch_cursor_flush','touch_cursor_reset','touch_cursor_motion','touch_cursor_event','touch_cursor_frame','touch_menu_mouse_held','touch_queue_cursor_button'])
-  window=(ROOT/'crates/horizon-client/src/game/window_handler.rs').read_text()
+  window=(ROOT/'crates/horizon-client/src/game/runtime/window_handler.rs').read_text()
   a=window.index('        if let WindowEvent::MouseInput { state, button, .. } = &event {')
   b=window.index('        let mouse =',a)
   ledger=window[a:b]
-  methods += method((ROOT/'crates/horizon-client/src/game/hud_editor.rs').read_text(),'hud_editor_release')
+  methods += method((ROOT/'crates/horizon-client/src/game/interface/hud_editor.rs').read_text(),'hud_editor_release')
   hud = method((ROOT/'crates/horizon-client/src/game.rs').read_text(), 'hud')
   # Execute the production final composition wrapper, with unrelated renderers stubbed.
   # Its touch overlay acknowledgement drives the real deferred click dispatcher below.
@@ -51,12 +51,12 @@ enum WindowEvent{MouseInput{state:ElementState,button:MouseButton},Other}
 #[derive(Default)]struct Editor{drag:Option<()>,guides:(Option<f32>,Option<f32>)}
 #[derive(Default)]struct Pvp{editor:Option<Editor>}
 #[derive(Default)]struct Settings{horizon:Horizon,saved:std::cell::Cell<usize>}
-impl Settings{fn save(&self,_:&str){self.saved.set(self.saved.get()+1);}}
+impl Settings{fn gui_scale_inputs(&self){} fn save(&self,_:&str){self.saved.set(self.saved.get()+1);}}
 struct RenderBatch{scale:f32}
 trait EventLoopCtl{} struct Loop;impl EventLoopCtl for Loop{}
 struct Batch{width:f32,height:f32}
 type HudBatch=Batch;
-impl Batch{fn new(size:[u32;2])->Self{Self{width:size[0] as f32,height:size[1] as f32}}}
+impl Batch{fn new(size:[u32;2],_:())->Self{Self{width:size[0] as f32,height:size[1] as f32}}}
 #[derive(Default)]pub struct Room;
 impl Room{fn new(_:f32,_:f32)->Self{Self}}
 #[derive(Default)]struct Ui{room:Room}
@@ -76,7 +76,7 @@ TYPES
 impl Game{
  fn advance_skin_frame(&mut self){}
  fn dialog_open(&self)->bool{false}
- fn hud_layers(&mut self,size:[u32;2])->Batch{Batch::new(size)}
+ fn hud_layers(&mut self,size:[u32;2])->Batch{Batch::new(size,())}
  fn draw_dialog(&mut self,_:&mut Batch){}
  fn draw_pack_prompt(&mut self,_:&mut Batch){}
  fn draw_code_of_conduct(&mut self,_:&mut Batch){}

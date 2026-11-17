@@ -2,10 +2,12 @@
 from pathlib import Path
 import subprocess,tempfile,unittest
 from test_mobile_command_keyboard import method
+import shutil
 ROOT=Path(__file__).resolve().parents[1]
 class DragonShaderRouting(unittest.TestCase):
+ @unittest.skipUnless(shutil.which("rustc"), "requires Rust toolchain")
  def test_dragon_and_wrapped_beam_have_separate_final_buffer_spans(self):
-  dragon=(ROOT/'crates/horizon-client/src/game/dragon.rs').read_text()
+  dragon=(ROOT/'crates/horizon-client/src/game/mobs/dragon.rs').read_text()
   pack=(ROOT/'crates/horizon-client-render/src/gfx/pack_entities.rs').read_text()
   orchestration=method(dragon,'dragon_frame_geometry')
   # Reuse the production beam-boundary operation, with geometry/animation as fixtures.

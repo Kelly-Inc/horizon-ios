@@ -88,7 +88,7 @@ fn context() -> crate::Result<Arc<WorkerContext>> {
 /// This deliberately crosses the production 30-second synchronous-save
 /// deadline. A late decoration owns dirty proto chunks outside World.
 #[test]
-#[ignore = "requires HORIZON_TEST_RESOURCES; holds an actual worker for 32 seconds"]
+#[ignore = "daily"]
 fn synchronous_save_cannot_acknowledge_before_late_owned_decoration_is_saved() -> crate::Result<()>
 {
     let context = context()?;
@@ -169,7 +169,7 @@ fn synchronous_save_cannot_acknowledge_before_late_owned_decoration_is_saved() -
 }
 
 #[test]
-#[ignore = "requires prepared models/textures in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn closing_stream_preserves_owned_generation_before_ack() -> crate::Result<()> {
     let context = context()?;
     let stone = context

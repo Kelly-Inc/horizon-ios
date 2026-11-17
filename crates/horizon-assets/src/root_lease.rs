@@ -298,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess"]
     fn lease_child() {
         let Some(root) = std::env::var_os("HORIZON_LEASE_CHILD_ROOT") else {
             return;
@@ -310,11 +311,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn another_process_prevents_collection_until_it_releases() {
         let _serial = test_guard();
         let root = root("process");
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["root_lease::tests::lease_child", "--exact", "--nocapture"])
+            .args([
+                "root_lease::tests::lease_child",
+                "--include-ignored",
+                "--exact",
+                "--nocapture",
+            ])
             .env("HORIZON_LEASE_CHILD_ROOT", &root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

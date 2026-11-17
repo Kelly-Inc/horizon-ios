@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def program():
     source = (ROOT / 'crates/horizon-client-render/src/skins.rs').read_text()
-    remote = (ROOT / 'crates/horizon-client/src/game/remote.rs').read_text()
+    remote = (ROOT / 'crates/horizon-client/src/game/network/remote/mod.rs').read_text()
     a = source.index('pub struct Downloader {')
     b = source.index('/// `images` is bounded only', a)
     downloader = source[a:b]
@@ -37,6 +37,8 @@ def program():
 STUBS = r'''
 #![allow(dead_code)]
 extern crate self as horizon_client;
+extern crate self as horizon_assets;
+mod resource_source{#[derive(Default)]pub struct ResourceSource;impl ResourceSource{pub fn directory(_:std::path::PathBuf)->Self{Self}}}
 mod tab_list{pub fn default_skin(_:u128)->&'static str{"entity/player/wide/steve"}}
 use std::{cell::RefCell,collections::HashMap,path::PathBuf,sync::{Arc,atomic::{AtomicBool,Ordering}}};
 // Atlas residency has no IO jobs; the real owned service/pressure lifecycle
@@ -115,7 +117,7 @@ fn main(){
  d.queue(patch.into(),vec![255,0,0,255]);d.queue(scoped.into(),vec![255,0,0,255]);
  d.queue("skins/url".into(),vec![1,2,3,4]);d.queue("horizon/offline_skin".into(),vec![4,3,2,1]);
  d.drawn(patch);d.drawn("skins/url");d.drawn("horizon/offline_skin");d.begin_draw();d.drawn(scoped);
- d.set_resource_root(PathBuf::from("new-pack"));d.finish_draw(true);
+ d.set_resource_root(resource_source::ResourceSource::directory(PathBuf::from("new-pack")));d.finish_draw(true);
  assert!(d.image(patch).is_none());assert!(d.image(scoped).is_none());
  let refs=d.take_drawn();assert!(!refs.contains(patch)&&!refs.contains(scoped));assert!(refs.contains("skins/url")&&refs.contains("horizon/offline_skin"));
  d.resources.insert(patch.into(),Download::Ready);d.queue(patch.into(),vec![0,0,255,255]);

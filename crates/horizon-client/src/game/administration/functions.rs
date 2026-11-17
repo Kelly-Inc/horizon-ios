@@ -3152,7 +3152,7 @@ mod reload_transaction_tests {
     /// publish functions, tables, a new root, or a load-tag tick. A second
     /// candidate prepared against the same old generation is superseded.
     #[test]
-    #[ignore = "requires prepared HORIZON_TEST_RESOURCES and isolated HORIZON_HOME"]
+    #[ignore = "daily"]
     fn prepared_reload_failure_and_supersession_keep_the_running_generation() {
         assert!(
             std::env::var_os("HORIZON_HOME").is_some(),

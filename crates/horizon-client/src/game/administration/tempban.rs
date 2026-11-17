@@ -383,8 +383,9 @@ mod tests {
         use horizon_server_files::user_lists::Entry;
         let mut bans = list("long-duration");
         let now = 1_800_000_000_000;
-        let request = parse(&["tempban", "Fay", "9223372036854775s", "reason"]).unwrap();
-        assert_eq!(request.millis, 9_223_372_036_854_775_000);
+        assert!(parse(&["tempban", "Fay", "9223372036854775s"]).is_err());
+        let request = parse(&["tempban", "Fay", "4611686018427387s", "reason"]).unwrap();
+        assert_eq!(request.millis, 4_611_686_018_427_387_000);
         let ban = add_ban(
             &mut bans,
             user(9, "Fay"),
@@ -394,20 +395,20 @@ mod tests {
             request.reason,
         )
         .unwrap();
-        assert_eq!(ban.expires, Some(i64::MAX));
+        assert_eq!(ban.expires, Some(4_611_687_818_427_387_000));
         assert!(!ban.expired(i64::MAX / 2));
         let text = std::fs::read_to_string(&bans.file).unwrap();
-        assert!(text.contains(&format_date(i64::MAX)));
+        assert!(text.contains(&format_date(4_611_687_818_427_387_000)));
         let reply = success_reply(&ban, request.millis, ban.expires.unwrap());
         assert_eq!(
             reply.text().component()["with"][2],
-            serde_json::json!({"text": format_date(i64::MAX)})
+            serde_json::json!({"text": format_date(4_611_687_818_427_387_000)})
         );
         let mut restored = BanList::new(bans.file.clone());
         restored.load().unwrap();
         let after = restored.get(&user(9, "Fay")).unwrap();
         // The persisted date has vanilla's one-second precision.
-        assert_eq!(after.expires, Some(i64::MAX / 1000 * 1000));
+        assert_eq!(after.expires, Some(4_611_687_818_427_387_000));
         assert!(!after.expired(i64::MAX / 2));
         assert_eq!(
             (after.source.as_str(), after.reason.as_deref()),

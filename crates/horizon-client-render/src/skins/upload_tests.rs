@@ -138,7 +138,13 @@ fn downloaded_wings_survive_cache_and_atlas_eviction_and_render_source_pixels() 
     let reloaded = downloads.take_ready();
     assert_eq!(reloaded.len(), 1);
     slots.next_frame(Default::default());
-    let mut batch = HudBatch::new([64, 32]);
+    let mut batch = HudBatch::new(
+        [64, 32],
+        crate::hud::GuiScale {
+            requested: 0,
+            unicode: false,
+        },
+    );
     for (name, rgba) in reloaded {
         batch
             .patches

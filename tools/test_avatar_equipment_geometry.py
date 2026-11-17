@@ -144,7 +144,7 @@ def main():
     if args.binary:
         binary = args.binary.resolve()
     else:
-        subprocess.run(['cargo', 'build', '--locked', '--profile', 'dev', '-p', 'horizon-client', '--bin', 'horizon-client'], cwd=lab.ROOT, check=True)
+        subprocess.run(['cargo', 'build', '--locked', '--profile', 'dev', '-p', 'horizon-game', '--bin', 'horizon-client'], cwd=lab.ROOT, check=True)
         binary = lab.cargo_target() / 'debug' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
     # HORIZON_HOME holds logs; saves/options/caches belong to --game-dir.
     # Keep both the process CWD and that game directory private for this run.

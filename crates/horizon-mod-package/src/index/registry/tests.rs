@@ -720,6 +720,7 @@ fn local_images_keep_their_formats_and_actual_size_limits() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "daily"]
 fn a_fifo_image_is_rejected_without_waiting_for_a_writer() {
     let s = Scratch::new("fifo-image");
     let repo = s.0.join("repo");

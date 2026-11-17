@@ -1980,7 +1980,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "explicit Unix write-failure fixture; requires Python resource limits"]
+    #[ignore = "daily"]
     fn a_failed_polytone_save_preserves_existing_choices() {
         const CHILD: &str = "HORIZON_TEST_LIMIT_POLYTONE_WRITE";
         if let Some(path) = std::env::var_os(CHILD) {

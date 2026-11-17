@@ -149,8 +149,8 @@ fn refused_body_construction_does_not_begin_guest_or_hook_loans() {
             "data_version": horizon_core::version::DATA_VERSION, "attributes": [], "entities": {}
         })).unwrap());
         assert!(horizon_client::motion::PlayerMotion::new(&bad, Vec3::ZERO).is_err());
-        let original = game.motion;
-        game.motion = Box::leak(Box::new(bad));
+        let original = game.motion.clone();
+        game.motion = std::sync::Arc::new(bad);
         game.lan
             .as_mut()
             .unwrap()

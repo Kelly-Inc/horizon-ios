@@ -17,7 +17,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def program():
     actions=(ROOT/'crates/horizon-client-input/src/actions.rs').read_text()
     sprint=(ROOT/'crates/horizon-client/src/sprint.rs').read_text()
-    overlay=(ROOT/'crates/horizon-client/src/game/extras_ios.rs').read_text()
+    overlay=(ROOT/'crates/horizon-client/src/game/interface/extras_ios.rs').read_text()
     keys=sprint[sprint.index('#[derive(Clone, Copy, Debug, Default)]'):sprint.index('impl Keys')]
     codes=sorted(set(re.findall(r'KeyCode::(\w+)',actions)) | {'KeyZ'})
     code='#![allow(dead_code)]\nextern crate self as winit;\npub mod keyboard{#[derive(Clone,Copy,Debug,Hash,PartialEq,Eq)]pub enum KeyCode{'+','.join(codes)+'}}\n'

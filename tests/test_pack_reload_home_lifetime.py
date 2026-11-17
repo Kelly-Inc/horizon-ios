@@ -16,16 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    source = Path(os.environ.get('HORIZON_PACK_RELOAD_SOURCE', ROOT / 'crates/horizon-client/src/game/packs.rs')).read_text()
+    source = Path(os.environ.get('HORIZON_PACK_RELOAD_SOURCE', ROOT / 'crates/horizon-client/src/game/world/packs/mod.rs')).read_text()
     imports = (ROOT / 'crates/horizon-client/src/import.rs').read_text()
     a = imports.rfind('#[derive', 0, imports.index('struct HomeGate {'))
     b = imports.rfind('#[derive', a, imports.index('pub enum Kind'))
     access = imports[a:b]
     a = source.rfind('#[derive', 0, source.index('pub(super) enum ReloadKind'))
-    b = source.index('#[cfg(test)]', a)
+    b = source.index('/// Reads one converter', a)
     worker = source[a:b].replace('pub(super)', 'pub(crate)')
     spawn = '\n'.join('pub(crate) ' + method(source, name) for name in ('spawn_pack_reload', 'spawn_pack_reload_using'))
-    mods = (ROOT / 'crates/horizon-client/src/game/mods.rs').read_text()
+    mods = '\n'.join((ROOT / ('crates/horizon-client/src/game/modding/mods/' + name)).read_text() for name in ['mod.rs', 'snapshots.rs'])
     spawn += '\n' + method(mods, 'requested_mod_selection')
     a = source.index('        let StagedPack {', source.index('fn apply_staged_pack('))
     b = source.index('} = staged;', a) + len('} = staged;')
@@ -42,6 +42,12 @@ def program():
 STUBS = r'''
 #![allow(dead_code,unused_variables)]
 extern crate self as horizon_client;
+extern crate self as horizon_assets;
+extern crate self as horizon_guest_stack;
+fn builder()->std::thread::Builder{std::thread::Builder::new()}
+fn cache_dir()->PathBuf{import::home().join("cache")}
+mod resource_source{use super::*;pub struct ResourceRoot(PathBuf);impl ResourceRoot{pub fn new(root:PathBuf,_:PathBuf,_:())->Self{Self(root)}pub fn with_data(self,_:(),_:())->Self{self}pub fn prepared(&self)->&Path{&self.0}}}
+mod client_reload{pub fn collect_runtime_sprites()->Vec<()>{vec![]}pub fn collect_texture_atlases()->Vec<()>{vec![]}}
 use std::{collections::BTreeMap,fs,path::{Path,PathBuf},sync::{Arc,Mutex,OnceLock,PoisonError,Weak,Condvar,mpsc},time::{Duration,Instant}};
 type Result<T>=std::result::Result<T,Box<dyn std::error::Error+Send+Sync>>;
 mod import{use super::*;HOME_ACCESS_API
@@ -52,34 +58,35 @@ const RELOAD_LINES:[&str;0]=[];
 #[derive(Clone)]struct Mods{enabled:Vec<String>}
 struct Settings{resource_packs:Vec<String>,mods:Mods,force_unicode:bool,japanese_glyphs:bool}
 struct Ui{vanilla_root:PathBuf}
-struct Options{dev_mods:Vec<PathBuf>,resources:PathBuf}
+struct Options{dev_mods:Vec<PathBuf>,resources:PathBuf,execution_role:()}
 struct ServerPacks{active:Vec<()>}
-mod mods{pub mod catalog{
+mod mods{pub fn register_fluid_models(_:()){}pub mod catalog{
  #[derive(Clone,Default,PartialEq)]pub struct Selection(pub u32);
  #[derive(Default)]pub struct Catalog{pub id:u32}
  }pub struct PreparedContent{pub selection:catalog::Selection,pub catalog:std::sync::Arc<catalog::Catalog>}}
 use mods::catalog::{Selection,Catalog};
-struct ModsState{content:Option<Arc<mods::PreparedContent>>,catalog:Option<Arc<Catalog>>,pending:Option<Selection>}
-struct Pack{assets:Arc<()>,context:(),content:Option<Arc<mods::PreparedContent>>}
+#[derive(Clone)]struct ModsState{content:Option<Arc<mods::PreparedContent>>,catalog:Option<Arc<Catalog>>,pending:Option<Selection>}
+struct Pack{source:(),data_source:(),data_changes:(),additional_data:Vec<()>,assets:Arc<()>,context:(),content:Option<Arc<mods::PreparedContent>>}
 struct Game{keys:Vec<()>,physical_keys:Vec<()>,left:bool,right:bool,ui:Ui,settings:Settings,server_packs:ServerPacks,options:Options,pack:Pack,res:Arc<()>,pack_reload:Option<production::PackReload>,mods:ModsState,remote:Option<()>,integrated:Option<()>,world_root:PathBuf,input_blocks:usize}
 impl Game{
+ fn register_client_reload_listeners(&self) {}
  fn vanilla_root(&self)->PathBuf{import::home().join("resources")}
  // The input-block behavior has its own production-hook fixture. Here its
  // synchronous boundary is counted while the ownership hooks run unchanged.
  fn begin_reload_input_block(&mut self){self.input_blocks+=1;}
- fn new()->Self{Self{keys:vec![],physical_keys:vec![],left:false,right:false,ui:Ui{vanilla_root:PathBuf::new()},settings:Settings{resource_packs:vec![],mods:Mods{enabled:vec![]},force_unicode:false,japanese_glyphs:false},server_packs:ServerPacks{active:vec![]},options:Options{dev_mods:vec![],resources:import::home().join("resources")},pack:Pack{assets:Arc::new(()),context:(),content:None},res:Arc::new(()),pack_reload:None,mods:ModsState{content:Some(Arc::new(mods::PreparedContent{selection:Selection(1),catalog:Arc::new(Catalog{id:3})})),catalog:Some(Arc::new(Catalog{id:7})),pending:Some(Selection(9))},remote:None,integrated:None,world_root:PathBuf::new(),input_blocks:0}}
+ fn new()->Self{Self{keys:vec![],physical_keys:vec![],left:false,right:false,ui:Ui{vanilla_root:PathBuf::new()},settings:Settings{resource_packs:vec![],mods:Mods{enabled:vec![]},force_unicode:false,japanese_glyphs:false},server_packs:ServerPacks{active:vec![]},options:Options{execution_role:(),dev_mods:vec![],resources:import::home().join("resources")},pack:Pack{source:(),data_source:(),data_changes:(),additional_data:vec![],assets:Arc::new(()),context:(),content:None},res:Arc::new(()),pack_reload:None,mods:ModsState{content:Some(Arc::new(mods::PreparedContent{selection:Selection(1),catalog:Arc::new(Catalog{id:3})})),catalog:Some(Arc::new(Catalog{id:7})),pending:Some(Selection(9))},remote:None,integrated:None,world_root:PathBuf::new(),input_blocks:0}}
 }
 static CORE:Mutex<String>=Mutex::new(String::new());
 static SELECTIONS:Mutex<Vec<(u32,u32)>>=Mutex::new(Vec::new());
 '''
 
 STAGE = r'''
-fn stage_pack(root:&Path,_:&Vec<String>,_:&Vec<()>,selection:&Selection,catalog:Arc<Catalog>,_:&Arc<()>,_:&Arc<()>,_:&(),_:bool,_:bool,_:&Progress)->Result<StagedPack>{
+fn stage_pack(root:&Path,_:&Vec<String>,_:&Vec<()>,selection:&Selection,catalog:Arc<Catalog>,_:&ModsState,_:(),_:&[()],_:&[()],_:&Arc<()>,_:&Arc<()>,_:&(),_:bool,_:bool,_:&Progress)->Result<StagedPack>{
  SELECTIONS.lock().unwrap().push((selection.0,catalog.id));
  *CORE.lock().unwrap()=fs::read_to_string(root.join("generation"))?;
  Ok(StagedPack{STAGED_FIELDS})
 }
-fn stage_root(_:&Path,root:PathBuf,_:Option<Arc<mods::PreparedContent>>,_:&Arc<()>,_:&Arc<()>,_:&(),_:bool,_:bool,_:&Progress)->Result<StagedPack>{Ok(StagedPack{STAGED_FIELDS})}
+fn stage_root(_:&Path,resolved:resource_source::ResourceRoot,_:Option<Arc<mods::PreparedContent>>,_:Vec<()>,_:(),_:&Arc<()>,_:&Arc<()>,_:&(),_:bool,_:bool,_:&Progress)->Result<StagedPack>{let root=resolved.prepared();Ok(StagedPack{STAGED_FIELDS})}
 '''
 HELPERS = r'''
 pub fn staged(game:&mut Game)->StagedPack{

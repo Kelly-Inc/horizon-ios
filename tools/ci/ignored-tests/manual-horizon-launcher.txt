@@ -10,7 +10,7 @@ horizon-launcher loaders::forge_install::tests::a_real_installer_installs by-han
 horizon-launcher loaders::tests::the_real_loaders_install by-hand manual # the real Fabric and Quilt services over the network
 horizon-launcher native_mods::registry_compile::tests::real_sdk_registry_compile by-hand manual # requires an explicitly prepared private SDK, mod and launcher executable
 horizon-launcher pictures::tests::a_32k_screenshot_is_read_in_little_memory by-hand manual # slow soak: 2 GiB of pixels; run with --ignored --nocapture
-horizon-launcher rust_toolchain::tests::managed_arm64_toolchain_builds_the_game ci.yml manual # downloads the managed Windows ARM64 toolchain and builds Horizon
+horizon-launcher rust_toolchain::tests::managed_arm64_toolchain_builds_the_game by-hand manual # downloads the managed Windows ARM64 toolchain and builds Horizon
 horizon-launcher storage::inventory::eviction_tests::allocated_forty_gib_cleanup_proof by-hand manual # manual allocated 40 GiB proof; requires HORIZON_EVICTION_PROOF_ROOT in checkout scratch
 horizon-launcher telemetry::tests::official_count_follows_the_srv_record by-hand manual # asks the live official server
 horizon-launcher downloads::tests::benchmark_download_pipeline by-hand manual # local download throughput benchmark; run explicitly in a fresh process per mode

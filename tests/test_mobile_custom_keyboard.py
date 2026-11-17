@@ -6,11 +6,14 @@ ROOT=Path(__file__).resolve().parents[1]
 class CustomKeyboardTests(unittest.TestCase):
  def test_virtual_keys_edit_and_paste_without_typing_characters(self):
   if not shutil.which('rustc'):self.skipTest('rustc required')
-  touch=(ROOT/'crates/horizon-client/src/game/touch.rs').read_text()
+  touch=(ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
   ui=(ROOT/'crates/horizon-client-render/src/ui.rs').read_text();impl=ui[ui.index('impl EditBox {'):]
   clip=(ROOT/'crates/horizon-client-input/src/clipboard.rs').read_text()
-  methods='\n'.join(method(impl,n) for n in ['reset_blink','selected','selected_text','insert_text','delete_chars','word_position','word_position_from','set_cursor','move_cursor_to_end','scroll_to','key','shortcut'])
-  helpers='\n'.join(method(ui,n) for n in ['byte_index','char_len','word_position','multiline_word_position','java_whitespace'])
+  methods='\n'.join(method(impl,n) for n in ['reset_blink','moved','insert_text','delete_chars','set_cursor','move_cursor_to_end','scroll_to','key','shortcut'])
+  # Keep the real shared editing core; Wire only generates serialization metadata.
+  core=(ROOT/'crates/horizon-mod-vocab/src/client/widgets_text_edit.rs').read_text()
+  core=core.replace('#[derive(horizon_mod_api_macros::Wire)]', '')
+  helpers='mod mod_api {pub mod client {pub mod widgets {\n'+core+'\n}}}\nuse mod_api::client::widgets::char_len;'
   clipboard='\n'.join('pub '+method(clip,n) for n in ['shortcut_letter','edit_shortcut','is_allowed_chat_character','filter_text','utf16_prefix','apply'])
   begin=ui.index('impl crate::clipboard::Editable for EditBox');end=ui.index('\nimpl EditBox {',begin)
   source=CODE.replace('TRANSPORT',method(touch,'touch_custom_keyboard')+method(touch,'touch_window_event').replace('super::input_trace::','input_trace::'))
@@ -46,7 +49,7 @@ mod clipboard{
  CLIPBOARD
 }
 HELPERS
-struct EditBox{value:String,cursor:usize,highlight:usize,display:usize,max_length:usize,multiline:bool,editable:bool,focused_at:Instant}
+struct EditBox{edit:mod_api::client::widgets::TextEdit,display:usize,editable:bool,focused_at:Instant}
 impl EditBox{EDIT_METHODS}
 EDITABLE_IMPL
 struct Board;impl clipboard::Clipboard for Board{fn get(&mut self)->String{"fixture paste".into()}fn set(&mut self,_:&str){}}
@@ -68,7 +71,7 @@ impl Game{
  }
 }
 fn main(){
- let mut g=Game{window:Some(Window),touch:Touch{synthetic:false},field:EditBox{value:"abc".into(),cursor:3,highlight:3,display:0,max_length:256,multiline:false,editable:true,focused_at:Instant::now()},command:false,submitted:false,events:0};
+ let mut g=Game{window:Some(Window),touch:Touch{synthetic:false},field:EditBox{edit:mod_api::client::widgets::TextEdit{value:"abc".into(),cursor:3,highlight:3,max_length:256,multiline:false},display:0,editable:true,focused_at:Instant::now()},command:false,submitted:false,events:0};
  g.touch_custom_keyboard(&Loop,KeyCode::Backspace,true);g.touch_custom_keyboard(&Loop,KeyCode::Backspace,false);assert_eq!(g.field.value,"ab");
  g.touch_custom_keyboard(&Loop,KeyCode::ArrowLeft,true);assert_eq!(g.field.cursor,1);
  g.command=true;g.touch_custom_keyboard(&Loop,KeyCode::KeyV,true);assert_eq!(g.field.value,"afixture pasteb");

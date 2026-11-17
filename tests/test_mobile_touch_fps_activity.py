@@ -2,10 +2,12 @@
 from pathlib import Path
 import subprocess,tempfile,unittest
 from test_mobile_command_keyboard import method
+import shutil
 ROOT=Path(__file__).resolve().parents[1]
 class TouchFpsActivityTests(unittest.TestCase):
+ @unittest.skipUnless(shutil.which("rustc"), "requires Rust toolchain")
  def test_stationary_hold_is_active_but_release_cancel_and_latches_are_not(self):
-  game=(ROOT/'crates/horizon-client/src/game/touch.rs').read_text()
+  game=(ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
   self.assertIn('self.touch_refresh_activity(playing);',method(game,'touch_frame'))
   window=(ROOT/'crates/horizon-client-input/src/window.rs').read_text()
   policy=window[window.index('/// `InactivityFpsLimit`.'):window.index('/// `isHeavilyThrottled`.')]

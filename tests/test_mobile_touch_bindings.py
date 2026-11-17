@@ -22,11 +22,11 @@ class TouchBindingTests(unittest.TestCase):
         variants = sorted(set(re.findall(r"KeyCode::(\w+)", bindings)))
         # Layout learning/display labels are separate platform functions; keep
         # all of KeyBinds and its input-name tables unchanged.
-        start = bindings.index("pub use horizon_client_core::key_display::display_name;")
+        start = bindings.index("pub use horizon_client_core::key_display::{")
         end = bindings.index("/// Current bindings by mapping name.", start)
         bindings = bindings[:start] + bindings[end:]
         bindings = bindings.replace("use winit::{", "use crate::winit::{")
-        touch = (ROOT / "crates/horizon-client/src/game/touch.rs").read_text()
+        touch = (ROOT / "crates/horizon-client/src/game/interface/touch.rs").read_text()
         methods = "\n".join(method(touch, name) for name in ["touch_raw_key", "touch_key_held", "touch_raw_button", "touch_raw_holds_mouse_mapping"])
         program = r'''
 #![allow(dead_code)]
@@ -34,7 +34,10 @@ mod winit {
  pub mod keyboard {#[derive(Clone,Copy,Debug,Eq,PartialEq)] pub enum KeyCode {VARIANTS}}
  pub mod event {#[derive(Clone,Copy,Debug,Eq,PartialEq)] pub enum MouseButton {Left,Right,Middle,Back,Forward,Other(u16)}}
 }
-mod horizon_client {pub mod debug_keys {#[derive(Clone,Copy,Debug,PartialEq)]pub enum KeyAction{Press,Release}} pub mod keybinds {BINDINGS}}
+mod horizon_client {pub mod debug_keys {#[derive(Clone,Copy,Debug,PartialEq)]pub enum KeyAction{Press,Release}} pub mod keybinds {BINDINGS
+// Display-label publication is outside this input-dispatch fixture.
+fn replace_action_bindings<'a>(_:impl Iterator<Item=(&'a str,&'a str)>){panic!("display label publication is not an input event");}
+}}
 #[path="TOUCH_SOURCE"]mod actual_touch;
 use actual_touch::Control;
 use winit::{keyboard::KeyCode,event::MouseButton};

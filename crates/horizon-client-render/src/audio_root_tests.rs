@@ -97,7 +97,10 @@ fn delayed_decode_keeps_both_overlay_and_source_after_reload() {
         },
     ));
     ready.recv_timeout(Duration::from_secs(5)).unwrap();
-    audio.reload_with(&home.join("replacement"), SoundRegistry::default());
+    audio.reload_with(
+        &crate::resource_source::ResourceSource::directory(home.join("replacement")),
+        SoundRegistry::default(),
+    );
     old_cache.lock().unwrap().insert(
         "test:sounds/late.ogg".into(),
         Some((Arc::new(vec![1.0]), 8000, 1)),

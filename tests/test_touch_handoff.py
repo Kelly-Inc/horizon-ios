@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
 class TouchHandoffTests(unittest.TestCase):
     def test_real_dispatcher_recovers_and_cancels_without_ghost_clicks(self):
-        source = (ROOT / "crates/horizon-client/src/game/touch.rs").read_text()
+        source = (ROOT / "crates/horizon-client/src/game/interface/touch.rs").read_text()
 
         def method(name):
             start = source.index("    ", source.index("impl Game<'_> {"))
@@ -112,11 +112,11 @@ fn cancelled_menu_finger_releases_without_delayed_press() {
 }
 '''
         fixture = fixture.replace("TOUCH_SOURCE", str(ROOT / "crates/horizon-client/src/touch.rs"))
-        fixture = fixture.replace("MODE_SOURCE", str(ROOT / "crates/horizon-client/src/game/input_mode.rs"))
+        fixture = fixture.replace("MODE_SOURCE", str(ROOT / "crates/horizon-client/src/game/interface/input_mode.rs"))
         fixture = fixture.replace("METHODS", "\n".join(method(name) for name in (
             "touch_event", "touch_release_menu", "touch_keyboard_used", "visible_touch_layout")) + "\n" + production_method(
-                (ROOT / "crates/horizon-client/src/game/pad.rs").read_text(), "pad_yield_input") + "\n" + production_method(
-                (ROOT / "crates/horizon-client/src/game/cosmetics/emote_wheel.rs").read_text(), "cancel_emote_controller"))
+                (ROOT / "crates/horizon-client/src/game/interface/pad/mod.rs").read_text(), "pad_yield_input") + "\n" + production_method(
+                (ROOT / "crates/horizon-client/src/game/interface/cosmetics/emote_wheel.rs").read_text(), "cancel_emote_controller"))
         with tempfile.TemporaryDirectory(prefix="horizon-touch-handoff-") as folder:
             folder = Path(folder)
             (folder / "fixture.rs").write_text(fixture)

@@ -222,6 +222,8 @@ impl Integrated {
             thread: None,
             tasks,
             world_name: "Controlled reload test".into(),
+            save_folder: String::new(),
+            rule_registry: Arc::new(horizon_client::gamerules::RuleRegistry::vanilla()),
             emergency_save: None,
         };
         (

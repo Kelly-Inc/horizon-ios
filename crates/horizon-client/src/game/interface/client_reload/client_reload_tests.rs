@@ -793,10 +793,13 @@ fn refused_client_context_keeps_pack_and_listeners() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     with_client_game(|game| {
+        let (selection, catalog) = game.requested_mod_selection();
         let mut staged = stage_pack(
             &game.vanilla_root(),
             &[],
             &[],
+            &selection,
+            catalog,
             &game.mods,
             game.register_client_reload_listeners(),
             &[],
@@ -809,15 +812,7 @@ fn refused_client_context_keeps_pack_and_listeners() {
             &Progress::new(),
         )
         .unwrap();
-        let root =
-            std::env::temp_dir().join(format!("client-reload-refusal-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join(horizon_mod_package::enabled::MARKER),
-            b"invalid json",
-        )
-        .unwrap();
-        staged.root = root.clone();
+        super::refuse_reload_application(game);
         let applied = Arc::new(AtomicBool::new(false));
         let flag = applied.clone();
         staged.client_applies.push(PreparedStep::Mod {
@@ -835,7 +830,6 @@ fn refused_client_context_keeps_pack_and_listeners() {
         assert!(game.pack.source.same_generation(&old_pack));
         assert!(Arc::ptr_eq(&game.loop_context, &old_context));
         assert!(!applied.load(Ordering::SeqCst));
-        std::fs::remove_dir_all(root).unwrap();
     });
 }
 

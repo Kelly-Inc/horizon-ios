@@ -8,9 +8,9 @@ from test_mobile_command_keyboard import method
 ROOT = Path(__file__).resolve().parents[1]
 
 def program():
-    game = (ROOT / 'crates/horizon-client/src/game/play_input.rs').read_text()
-    pad = (ROOT / 'crates/horizon-client/src/game/pad.rs').read_text()
-    touch = (ROOT / 'crates/horizon-client/src/game/touch.rs').read_text()
+    game = (ROOT / 'crates/horizon-client/src/game/interface/play_input.rs').read_text()
+    pad = (ROOT / 'crates/horizon-client/src/game/interface/pad/mod.rs').read_text()
+    touch = (ROOT / 'crates/horizon-client/src/game/interface/touch.rs').read_text()
     buttons = (ROOT / 'crates/horizon-client-input/src/gamepad.rs').read_text()
     # Actual hardware state and edge/suppression reducer, without unrelated bindings.
     buttons = buttons[:buttons.index('/// Intentional activity')]
@@ -21,14 +21,14 @@ def program():
     end=pad.index('        for button in std::mem::take',start)
     sticks='fn apply_sticks(&mut self,state:&mut PadState){'+pad[start:end]+'}'
     methods = sticks + method(game,'reload_blocks_input') + '\n' + method(touch,'cancel_touch_for_reload')
-    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/presentation.rs').read_text(), 'menu_input_blocked')
-    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/presentation.rs').read_text(), 'presentation_stale')
+    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/interface/presentation.rs').read_text(), 'menu_input_blocked')
+    methods += '\n' + method((ROOT / 'crates/horizon-client/src/game/interface/presentation.rs').read_text(), 'presentation_stale')
     for name in ['pad_reload_sample','finish_reload_input_disarm','pad_cancel_inputs','pad_button']:
         methods += '\n' + method(pad,name)
     radial_state = (ROOT / 'crates/horizon-client-input/src/radial.rs').read_text().split('#[cfg(test)]\nmod tests')[0]
-    radial_hooks = (ROOT / 'crates/horizon-client/src/game/pad/radial_play.rs').read_text()
+    radial_hooks = (ROOT / 'crates/horizon-client/src/game/interface/pad/radial_play.rs').read_text()
     methods += '\n' + method(radial_hooks, 'pad_radial_button_up')
-    return 'mod radial {\n' + radial_state + '\n}\n' + STUBS.replace('#![allow(dead_code,unused_imports)]', '') + '\nmod gamepad {\n' + buttons + '\npub const RADIAL:&str="pad.radial";pub const HOTBAR_PREVIOUS:&str="pad.hotbar_previous";pub const HOTBAR_NEXT:&str="pad.hotbar_next";#[derive(Clone,Copy,Debug,PartialEq)]pub struct Pulse{pub strong:f32,pub weak:f32,pub millis:u16}\npub '+radial+'\n'+length+'\n}\n' + f'#[path="{ROOT / "crates/horizon-client/src/touch.rs"}"]mod touch;\n' + '\nimpl Game {\n'+methods+'\n}\n'+CASES
+    return f'#[path="{ROOT / "crates/horizon-client-input/src/mouse.rs"}"]mod mouse;\n' + 'mod radial {\n' + radial_state + '\n}\n' + STUBS.replace('#![allow(dead_code,unused_imports)]', '') + '\nmod gamepad {\n' + buttons + '\npub const RADIAL:&str="pad.radial";pub const HOTBAR_PREVIOUS:&str="pad.hotbar_previous";pub const HOTBAR_NEXT:&str="pad.hotbar_next";#[derive(Clone,Copy,Debug,PartialEq)]pub struct Pulse{pub strong:f32,pub weak:f32,pub millis:u16,pub triggers:[f32;2]}\npub '+radial+'\n'+length+'\n}\n' + f'#[path="{ROOT / "crates/horizon-client/src/touch.rs"}"]mod touch;\n' + '\nimpl Game {\n'+methods+'\n}\n'+CASES
 
 STUBS = r'''
 #![allow(dead_code,unused_imports)]

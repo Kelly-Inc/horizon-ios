@@ -4,17 +4,15 @@
 //! `item_parts` for the item hooks ([`answering`]), so every other test sees vanilla's answers.
 use super::NativeClientHooks;
 use crate::items::ItemStack;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use horizon_world::native_load_context::{
     DataLoadOrigin, LoadContext, LoadInputs, LoopContext, LoopSide,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// The server-side jumps the installed `living_jump` heard.
-pub(crate) static JUMPS: AtomicUsize = AtomicUsize::new(0);
-/// The asks the installed `menu_still_valid` heard.
-pub(crate) static STILL_VALID_ASKED: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
+    /// Calls made on the current test thread, independent of other hook users.
+    pub(crate) static JUMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static STILL_VALID_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The item hooks this thread asked: the hook, the stack's item, and the answer it arrived
     /// with.
     static ITEM_ASKS: std::cell::RefCell<Vec<(&'static str, String, bool)>> =
@@ -66,7 +64,7 @@ pub(crate) fn install() {
     ONCE.call_once(|| {
         let installed = super::install(NativeClientHooks {
             menu_still_valid: |context, player, menu, _, eye, valid| {
-                STILL_VALID_ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                STILL_VALID_ASKED.with(|count| count.set(count.get() + 1));
                 if menu == "test:rules" && player == 2 && eye[2] == 0.0 {
                     *valid = context.setting("rules_mod", "stack").is_some();
                 }
@@ -121,10 +119,9 @@ pub(crate) fn install() {
                 }
             },
             living_jump: |context, _, _| {
-                JUMPS.fetch_add(
-                    usize::from(context.side() == LoopSide::Server),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                JUMPS.with(|count| {
+                    count.set(count.get() + usize::from(context.side() == LoopSide::Server));
+                });
             },
             living_jump_power: |context, _, _, power| {
                 *power += context.setting("rules_mod", "stack").map_or(0.0, |_| 1.0);

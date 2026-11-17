@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def program():
     skins = (ROOT / 'crates/horizon-client-render/src/skins.rs').read_text()
-    remote = (ROOT / 'crates/horizon-client/src/game/remote.rs').read_text()
+    remote = (ROOT / 'crates/horizon-client/src/game/network/remote/mod.rs').read_text()
     a = skins.index('#[derive(Clone, Debug)]\npub struct ResolvedProfile')
     b = skins.index('impl ResolvedProfile', a)
     profile = skins[a:b] + 'impl ResolvedProfile {pub ' + method(skins, 'textures') + '}\n'

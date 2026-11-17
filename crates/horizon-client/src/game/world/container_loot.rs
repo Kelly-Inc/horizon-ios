@@ -64,22 +64,12 @@ impl Game<'_> {
     /// Consumes metadata before callbacks, so reentrant access cannot roll twice.
     /// A player context is captured from the admitted actor, also during as_guest.
     pub(super) fn unpack_loot(&mut self, target: LootTarget, player: Option<mod_api::PlayerRef>) {
-        let (pending, pos, occupied) = match target {
+        let (pending, pos) = match target {
             LootTarget::Block(key) => {
                 let Some(pending) = take_block_pending(&mut self.world, key) else {
                     return;
                 };
-                (
-                    pending,
-                    key,
-                    self.world
-                        .block_entities
-                        .get(&key)
-                        .unwrap()
-                        .slots()
-                        .iter()
-                        .any(Option::is_some),
-                )
+                (pending, key)
             }
             LootTarget::Cart(id) => {
                 let Some(i) = self.carts.iter().position(|c| c.id == id) else {
@@ -97,7 +87,6 @@ impl Game<'_> {
                         c.position.y.floor() as i32,
                         c.position.z.floor() as i32,
                     ),
-                    c.items.iter().any(Option::is_some),
                 )
             }
             LootTarget::Boat(id) => {
@@ -125,15 +114,11 @@ impl Game<'_> {
                         b.position.y.floor() as i32,
                         b.position.z.floor() as i32,
                     ),
-                    b.items.iter().any(Option::is_some),
                 )
             }
         };
-        // Horizon-only: an inventory with both items and a table drops the
-        // table on first access and never rolls, even if later emptied.
-        if occupied {
-            return;
-        }
+        // LootTable.fill keeps existing stacks and places generated loot only in
+        // available slots. Pending metadata was consumed above, before callbacks.
         let table = pending.table_id();
         if player.is_some() {
             self.trigger_loot_table(&table);
@@ -365,10 +350,6 @@ impl super::GameLevel<'_> {
             if let Some(BlockEntity::Chest(open)) = self.world.block_entities.get(&key) {
                 slots.clone_from(open);
             }
-            if slots.iter().any(Option::is_some) {
-                self.carts.update(i, |cart| cart.items = slots);
-                return;
-            }
             let loot = loot.clone();
             let mut random = self.world.random.clone();
             let mut sequences = std::mem::take(self.rand_sequences);
@@ -419,9 +400,6 @@ impl super::GameLevel<'_> {
         let Some(entity) = self.world.block_entities.get(&key) else {
             return;
         };
-        if entity.slots().iter().any(Option::is_some) {
-            return;
-        }
         let mut slots = entity.slots().to_vec();
         let loot = loot.clone();
         let mut random = self.world.random.clone();

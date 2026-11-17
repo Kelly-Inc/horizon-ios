@@ -467,6 +467,15 @@ impl ModsScreen {
     pub fn search_focused(&self) -> bool {
         self.search.focused
     }
+    /// The active search field in GUI pixels, for touch focus and IME positioning.
+    pub fn search_rect(&self) -> Option<[f32; 4]> {
+        self.search_focused().then_some([
+            self.search.x as f32,
+            self.search.y as f32,
+            self.search.width as f32,
+            self.search.height as f32,
+        ])
+    }
     /// Typed text, when the search box has the focus.
     pub fn type_text(&mut self, m: &Measure, s: &str) {
         if self.search.focused && self.search.insert_text(m, s) {

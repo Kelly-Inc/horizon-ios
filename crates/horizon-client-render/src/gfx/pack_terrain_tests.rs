@@ -444,7 +444,13 @@ impl Gpu {
         let color = world("diagnostic world", wgpu::TextureFormat::Rgba8Unorm);
         let depth = world("diagnostic world depth", wgpu::TextureFormat::Depth32Float);
         let screen = self.screen.create_view(&Default::default());
-        let hud = crate::hud::HudBatch::new([SIDE; 2]);
+        let hud = crate::hud::HudBatch::new(
+            [SIDE; 2],
+            crate::hud::GuiScale {
+                requested: 0,
+                unicode: false,
+            },
+        );
         let frame = empty_frame(&hud);
         let inputs = PackInputs::default();
         let handles: Vec<_> = pages

@@ -11,13 +11,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    source = (ROOT / 'crates/horizon-client/src/game/remote.rs').read_text()
-    return STUBS + '\nimpl Game {\n' + method(source, 'remote_clock_tick') + '\n}\n' + CASES
+    source = (ROOT / 'crates/horizon-client/src/game/network/remote/mod.rs').read_text()
+    clock = f'#[path="{ROOT / "crates/horizon-client/src/game/network/remote/client_clock.rs"}"]mod client_level_tick;\n'
+    return STUBS + clock + '\nimpl Remote {\n' + method(source, 'clock_time') + '\n}\nimpl Game {\n' + method(source, 'remote_clock_tick') + '\n}\n' + CASES
 
 
 STUBS = r'''
 struct World{game_time:i64,day_time:i64}
-struct Remote{clock_game_time:i64,clock_partial:f32,clock_rate:f32}
+extern crate self as horizon_protocol;
+use std::collections::HashMap;
+pub mod packets{pub mod play{pub struct ClockState{pub clock:i32,pub total_ticks:i64,pub partial_tick:f32,pub rate:f32}}}
+use packets::play::ClockState;
+struct Remote{clock_game_time:i64,clocks:HashMap<i32,ClockState>,default_clock:Option<i32>}
 struct Game{world:World,remote:Option<Remote>}
 '''
 
@@ -39,10 +44,10 @@ fn main(){
  ];
  let mut failures=0;
  for(i,(now,last,day,partial,rate,want_day,want_partial))in cases.into_iter().enumerate(){
-  let mut g=Game{world:World{game_time:now,day_time:day},remote:Some(Remote{clock_game_time:last,clock_partial:partial,clock_rate:rate})};
+  let mut g=Game{world:World{game_time:now,day_time:day},remote:Some(Remote{clock_game_time:last,clocks:HashMap::from([(0,ClockState{clock:0,total_ticks:day,partial_tick:partial,rate})]),default_clock:Some(0)})};
   if std::panic::catch_unwind(std::panic::AssertUnwindSafe(||g.remote_clock_tick())).is_err(){eprintln!("case {i} panicked");failures+=1;continue;}
   let r=g.remote.unwrap();
-  if (g.world.day_time,r.clock_partial.to_bits(),r.clock_game_time)!=(want_day,want_partial,now){eprintln!("case {i}: got ({},{:08x},{}), expected ({},{:08x},{})",g.world.day_time,r.clock_partial.to_bits(),r.clock_game_time,want_day,want_partial,now);failures+=1;}
+  if (g.world.day_time,r.clocks[&0].partial_tick.to_bits(),r.clock_game_time)!=(want_day,want_partial,now){eprintln!("case {i}: got ({},{:08x},{}), expected ({},{:08x},{})",g.world.day_time,r.clocks[&0].partial_tick.to_bits(),r.clock_game_time,want_day,want_partial,now);failures+=1;}
  }
  assert_eq!(failures,0,"clock differs from native 26.3");
  let mut g=Game{world:World{game_time:20,day_time:30},remote:None};g.remote_clock_tick();assert_eq!(g.world.day_time,30);

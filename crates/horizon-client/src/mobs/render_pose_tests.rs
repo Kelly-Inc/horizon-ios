@@ -195,11 +195,13 @@ fn posed_parts_are_the_poses_the_draw_made_and_change_nothing() {
         [0.0, 0.0, 1.0, 1.0],
         0xf0f0,
         0,
+        "entity/villager/villager".into(),
         false,
     )];
     for gpu_path in [false, true] {
-        let draw_armoured = |hidden, extra: &[(&Part, [f32; 4], u32, u32, bool)]| {
+        let draw_armoured = |hidden, extra: &[(&Part, [f32; 4], u32, u32, String, bool)]| {
             let mut out = Vec::new();
+            let mut items = Vec::new();
             let mut models = super::super::skin::SkinModels::default();
             let mut frame = crate::gfx::entity_skin::SkinFrame::default();
             let mut skin = super::super::skin::Skin::new(&mut models, &mut frame);
@@ -215,7 +217,9 @@ fn posed_parts_are_the_poses_the_draw_made_and_change_nothing() {
                 hidden,
                 None,
                 &mut out,
+                &mut items,
                 gpu_path.then_some(&mut skin),
+                false,
             );
             out.len() as u32 + frame.jobs.iter().map(|job| job.count).sum::<u32>()
         };

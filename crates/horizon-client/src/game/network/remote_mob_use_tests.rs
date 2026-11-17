@@ -9,7 +9,7 @@ fn remote_mob_takes_only_adult_piglin_currency_with_free_offhand() {
             g.build_registries();
             g.player = Some(
                 horizon_client::motion::PlayerMotion::new(
-                    g.motion,
+                    &g.motion,
                     horizon_core::geometry::Vec3::new(4.5, 100.0, 4.5),
                 )
                 .unwrap(),

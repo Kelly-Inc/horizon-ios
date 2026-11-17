@@ -2143,7 +2143,7 @@ mod stack_limit_tests {
         items
     }
 
-    /// Vanilla stores damage above the maximum; only writes refuse it. Reads see the stack.
+    /// Preserve stored damage on a read, while querying it clamps as Java's getDamageValue does.
     #[test]
     fn a_write_refuses_damage_over_the_maximum_a_read_takes() {
         let items = catalog();
@@ -2155,7 +2155,8 @@ mod stack_limit_tests {
         );
         let read = stack_value(&over).unwrap();
         let definition = items.items.get("minecraft:iron_sword");
-        assert_eq!(read.effective_damage(definition), 1000);
+        assert_eq!(read.damage, 1000);
+        assert_eq!(read.effective_damage(definition), 10);
         assert!(horizon_client::stations::is_damageable(&items, &read));
     }
 

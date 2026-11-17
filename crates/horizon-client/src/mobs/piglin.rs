@@ -3064,7 +3064,7 @@ mod guarded_memory_tick_tests {
     /// Pinned Java 26.3 MemorySlot keeps TTL zero until the following tick.
     /// Exercise actual species ticking and NBT export, including a stale base.
     #[test]
-    #[ignore = "needs prepared vanilla mob resources"]
+    #[ignore = "daily"]
     fn guarded_memory_keeps_zero_ttl_until_the_following_brain_tick() {
         let ran = crate::mobs::world::with_test_world(&[], |w, types| {
             let mut m = Mob::new(
@@ -3088,7 +3088,7 @@ mod guarded_memory_tick_tests {
                     )]),
                 )]),
             )]);
-            let mut random = LegacyRandom::new(7);
+            let mut random = crate::mobs::world::level_random(7);
             let mut events = Vec::new();
             let mut ticked = 0;
             for (tick, expected_ttl) in [

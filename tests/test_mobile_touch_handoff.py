@@ -15,13 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    touch = (ROOT / 'crates/horizon-client/src/game/touch.rs').read_text()
-    pad = (ROOT / 'crates/horizon-client/src/game/pad_menu.rs').read_text()
+    touch = (ROOT / 'crates/horizon-client/src/game/interface/touch.rs').read_text()
+    pad = (ROOT / 'crates/horizon-client/src/game/interface/pad_menu/keys.rs').read_text()
     methods = '\n'.join(method(touch, n) for n in ('touch_pointer', 'touch_button', 'touch_mouse_button', 'touch_wheel', 'touch_scroll', 'touch_window_event', 'touch_synthetic_input'))
     methods += '\n' + '\n'.join('pub(crate) ' + method(pad, n) for n in ('key_focus_mouse', 'key_focus_to_mouse'))
-    controller = (ROOT / 'crates/horizon-client/src/game/pad.rs').read_text()
+    controller = (ROOT / 'crates/horizon-client/src/game/interface/pad/mod.rs').read_text()
     methods += '\n' + method(controller, 'pad_yield_input')
-    emote = (ROOT / 'crates/horizon-client/src/game/cosmetics/emote_wheel.rs').read_text().replace('self.cosmetics.wheel', 'self.emote_wheel').replace('self.cosmetics.emotes', 'self.emotes').replace('pub(in crate::game)', 'pub(super)')
+    emote = (ROOT / 'crates/horizon-client/src/game/interface/cosmetics/emote_wheel.rs').read_text().replace('self.cosmetics.wheel', 'self.emote_wheel').replace('self.cosmetics.emotes', 'self.emotes').replace('pub(in crate::game)', 'pub(super)')
     methods += '\n' + method(emote, 'cancel_emote_controller')
     return STUBS + '\nmod production { use super::*; impl Game {\n' + methods + '\n}\n' + CASES + '\n}\n'
 

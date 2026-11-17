@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program(case):
-    pvp = (ROOT / 'crates/horizon-client/src/game/extras/pvp.rs').read_text()
-    options = (ROOT / 'crates/horizon-client/src/game/options.rs').read_text()
+    pvp = (ROOT / 'crates/horizon-client/src/game/entities/pvp.rs').read_text()
+    options = (ROOT / 'crates/horizon-client/src/game/interface/options.rs').read_text()
     hud = (ROOT / 'crates/horizon-client-render/src/pvp_hud.rs').read_text().split('#[cfg(test)]')[0]
     states = []
     for name in ('PvpState', 'Keystrokes'):
@@ -42,9 +42,10 @@ struct Options{resources:PathBuf}
 struct Chat;impl Chat{fn rescale(&mut self,_:&()){}}
 struct Ui{chat:Chat}struct Gui{atlas:()}
 struct Creative;impl Creative{fn forget_items(&mut self){}}
-struct Game{pvp:PvpState,options:Options,ui:Ui,gui:Gui,creative_screen:Creative,settings:Settings,corner_visible:bool}
+struct Pack{source:PathBuf}
+struct Game{pack:Pack,pvp:PvpState,options:Options,ui:Ui,gui:Gui,creative_screen:Creative,settings:Settings,corner_visible:bool}
 impl Game{
- fn new()->Self{Self{pvp:PvpState::default(),options:Options{resources:PathBuf::new()},ui:Ui{chat:Chat},gui:Gui{atlas:()},creative_screen:Creative,settings:Settings{extras:Extras{pvp:PvpOptions{hud:Hud{effects:true,effects_corner:Corner::TopRight}}}},corner_visible:true}}
+ fn new()->Self{Self{pack:Pack{source:PathBuf::new()},pvp:PvpState::default(),options:Options{resources:PathBuf::new()},ui:Ui{chat:Chat},gui:Gui{atlas:()},creative_screen:Creative,settings:Settings{extras:Extras{pvp:PvpOptions{hud:Hud{effects:true,effects_corner:Corner::TopRight}}}},corner_visible:true}}
  fn refresh_remote_language(&mut self){}
  fn native_corner_shown(&self,_:Corner)->bool{self.corner_visible}
 }

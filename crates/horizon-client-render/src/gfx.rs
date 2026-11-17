@@ -1464,7 +1464,8 @@ pub struct Renderer {
     mirror_group: wgpu::BindGroup,
     mirror: Option<MirrorTarget>,
     /// Native mods' world views' targets and pipelines, and the largest side the device gives one.
-    world_views: world_views::Kept,
+    // Retained view state stays off the fixed-size iOS event-loop stack.
+    world_views: Box<world_views::Kept>,
     world_view_side: u32,
     entity_pipeline: wgpu::RenderPipeline,
     static_entity_pipeline: wgpu::RenderPipeline,
@@ -1701,7 +1702,7 @@ pub struct Renderer {
     /// level's (`clear_sections`).
     layout: crate::chunk::ColumnLayout,
     /// Resolution scale, FXAA and TAA (Horizon settings).
-    world_post: world_post::Post,
+    world_post: Box<world_post::Post>,
     /// Frame generation (Horizon setting).
     frame_gen: Box<frame_gen::FrameGen>,
     /// The entities' texture atlas (`entity_group`'s), for frame generation's motion.
@@ -1851,6 +1852,12 @@ pub struct Renderer {
     /// Outcome of the last capture: its summary, or the error.
     pub capture_result: Option<std::result::Result<serde_json::Value, String>>,
 }
+
+// UIKit invokes reloads on its fixed-size main-thread stack. Keep this gate
+// in the actual iOS build as well as the host layout regression.
+#[cfg(target_os = "ios")]
+const _: () = assert!(std::mem::size_of::<Renderer>() <= 16 * 1024);
+
 /// `Device::create_shader_module` on a thread with a deep stack. naga's WGSL parser recurses per nested
 /// expression, and on an iPhone, whose main thread has 1 MB under `Renderer::new`'s own frame, it overflowed
 /// (a SIGSEGV in `naga::front::wgsl::parse` from `loading_renderer`). Not for a module made under an error
@@ -4958,7 +4965,7 @@ impl Renderer {
                 cull
             });
         let depth = Self::depth(&device, &config);
-        let world_post = world_post::Post::new(&device, frame_format);
+        let world_post = Box::new(world_post::Post::new(&device, frame_format));
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
         let stars = stars::Stars::new(&device, (frame_format, linear_light));
@@ -4998,7 +5005,11 @@ impl Renderer {
             world_primitives::DEFAULT_CAPACITY,
             world_primitives::DEFAULT_CAPACITY,
         );
-        let views = world_views::Kept::new(flipped, translucent_flipped, entity_pipeline_with);
+        let views = Box::new(world_views::Kept::new(
+            flipped,
+            translucent_flipped,
+            entity_pipeline_with,
+        ));
         Ok(Self {
             display: None,
             reading: display,

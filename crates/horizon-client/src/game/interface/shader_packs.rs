@@ -589,6 +589,17 @@ impl Game<'_> {
 
     /// Settle shader jobs without rendering, including while the launcher covers the game.
     pub(super) fn poll_shader_workers(&mut self) {
+        let selected = picked_pack(&self.settings).to_owned();
+        let selected_path = self.native_shaders.resolve_path(
+            &Self::shader_packs_dir(),
+            &selected,
+            dev_pack().is_some(),
+        );
+        let selection_changed = if selected.is_empty() {
+            !self.native_shaders.picked.is_empty()
+        } else {
+            std::path::Path::new(&self.native_shaders.picked) != selected_path
+        };
         let dimension = match self.dim {
             Dim::Overworld | Dim::Extra(_) => 0,
             Dim::Nether => -1,
@@ -596,17 +607,18 @@ impl Game<'_> {
         };
         let mut failed = None;
         if let Some(renderer) = &mut self.renderer {
-            // A dimension transition must stop both active and in-flight old programs
-            // before accepting any worker result or forming the next parser key.
-            if renderer
-                .shader_pack_dimension()
-                .is_some_and(|old| old != dimension)
+            // A selection or dimension transition stops old programs before consuming
+            // their report. Otherwise an old failure can quarantine the new selection,
+            // including while the launcher covers the game before its next world frame.
+            if selection_changed
+                || renderer
+                    .shader_pack_dimension()
+                    .is_some_and(|old| old != dimension)
             {
                 renderer.drop_shader_packs();
                 self.pack_ids = None;
             }
             if let Some((dimension, programs, notes)) = renderer.take_shader_report() {
-                let selected = picked_pack(&self.settings).to_owned();
                 let path = Self::shader_packs_dir().join(&self.native_shaders.picked);
                 remember(&path, fingerprint(&path), !programs.is_empty());
                 if programs.is_empty() {
@@ -619,7 +631,7 @@ impl Game<'_> {
                 }
             }
             let desired = LoadKey {
-                path: Self::shader_packs_dir().join(picked_pack(&self.settings)),
+                path: selected_path,
                 resources: self.options.resources.clone(),
                 options_revision: OPTIONS_REVISION.with(Cell::get),
                 dimension,
@@ -1555,7 +1567,8 @@ mod integration_tests {
     }
     #[test]
     fn block_materials_use_exact_states_and_waterlogged_fluid_identity() {
-        use horizon_world::{chunk::BlockState, nbt::Tag, registry::BlockRegistry};
+        use horizon_core::nbt::Tag;
+        use horizon_world::{chunk::BlockState, registry::BlockRegistry};
         use std::collections::BTreeMap;
         let mut states = Vec::new();
         let mut defaults = BTreeMap::new();

@@ -1159,8 +1159,8 @@ fn recovery_does_not_replace_data_of_a_locked_world() {
     f.title.attempt_restore(world);
     assert_eq!(fs::read(dir.join("level.dat")).unwrap(), b"broken");
     assert!(matches!(
-        f.title.toast,
-        Some((_, WorldToast::AccessFailure(_)))
+        f.title.pending_toast,
+        Some(WorldToast::AccessFailure(_))
     ));
 }
 
@@ -3351,7 +3351,8 @@ fn recreate_rules_load_saved_values_and_default_new_rules() {
             .unwrap(),
     );
     let options =
-        WorldOptions::of_world(&crate::save::Level::default(), false, &dir, current.clone());
+        WorldOptions::of_world(&crate::save::Level::default(), false, &dir, current.clone())
+            .unwrap();
     assert!(Arc::ptr_eq(options.rules.registry(), &current));
     assert_eq!(options.rules.get("example:old"), Some(Value::Bool(false)));
     assert_eq!(options.rules.get("example:new"), Some(Value::Bool(true)));

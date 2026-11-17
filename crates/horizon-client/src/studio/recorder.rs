@@ -757,17 +757,8 @@ mod tests {
     fn queue_failure_stops_both_packet_entry_points() {
         for timestamped in [false, true] {
             for disconnected in [false, true] {
-                let (sender, receiver) = sync_channel(1);
-                let recorder = StudioRecorder {
-                    active: Arc::new(AtomicBool::new(true)),
-                    packet_count: Arc::new(AtomicU64::new(0)),
-                    bytes_written: Arc::new(AtomicU64::new(0)),
-                    sender,
-                    failure: Arc::new(std::sync::Mutex::new(None)),
-                    worker: None,
-                    start_time: Instant::now(),
-                    dest_path: PathBuf::from("unused.mcpr"),
-                };
+                let (recorder, receiver) =
+                    recorder_with_worker(1, Arc::new(AtomicBool::new(true)), None);
                 // Disconnect before the recorder's blocking Drop, including on assertion failure.
                 let mut receiver = Some(receiver);
                 if disconnected {

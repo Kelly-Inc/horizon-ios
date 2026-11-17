@@ -205,9 +205,9 @@ mod tests {
             remote.profile = 42;
             game.player =
                 Some(horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap());
-            game.spawn_entity(15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:pig", [2.0, 0.0, 0.0], [0.0; 3]);
             // The server tracks the dragon alone; the client places its parts around it.
-            game.spawn_entity(20, "minecraft:ender_dragon", [0.0, 80.0, 0.0], [0.0; 3]);
+            game.spawn_entity(20, 20, "minecraft:ender_dragon", [0.0, 80.0, 0.0], [0.0; 3]);
             // The dragon's own box moves to y 200 (a move whose part placement has not run
             // yet), so a box near y 80 holds only parts.
             game.dragon.as_mut().unwrap().position = Vec3::new(0.0, 200.0, 0.0);

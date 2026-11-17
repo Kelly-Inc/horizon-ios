@@ -1811,7 +1811,10 @@ mod preview_tests {
             {"texture":"minecraft:overlay","use_player_texture":true}]}}"#,
         )
         .unwrap();
-        let assets = super::super::armor_stands::ArmorStandAssets::load(&root, None);
+        let assets = super::super::armor_stands::ArmorStandAssets::load(
+            &horizon_client::resource_source::ResourceSource::directory(root.clone()),
+            None,
+        );
         let layers = &assets.equipment["minecraft:fixture"]["wings"];
         let flags = &assets.wing_player_textures["minecraft:fixture"];
         assert_eq!(flags, &[false, true]);

@@ -251,10 +251,12 @@ fn a_failed_reload_fires_no_model_baking_completed() {
             game.native_model_baking_completed();
             let first = kept.lock().unwrap().part[0].unwrap();
             kept.lock().unwrap().heard.clear();
-            let mut staged = stage_pack(
+            let staged = stage_pack(
                 &game.vanilla_root(),
                 &[],
                 &[],
+                &game.requested_mod_selection().0,
+                game.requested_mod_selection().1,
                 &game.mods,
                 game.register_client_reload_listeners(),
                 &[],
@@ -267,18 +269,9 @@ fn a_failed_reload_fires_no_model_baking_completed() {
                 &Progress::new(),
             )
             .unwrap();
-            // An unreadable enabled-mods marker refuses the staged pack's application.
-            let root =
-                std::env::temp_dir().join(format!("model-baking-refusal-{}", std::process::id()));
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::write(
-                root.join(horizon_mod_package::enabled::MARKER),
-                b"invalid json",
-            )
-            .unwrap();
-            staged.root = root.clone();
+            // Application prepares the client profession table before publishing the pack.
+            super::client_reload::refuse_reload_application(game);
             assert!(game.apply_staged_pack(staged).is_err());
-            std::fs::remove_dir_all(root).unwrap();
             assert!(kept.lock().unwrap().heard.is_empty(), "nothing fired");
             assert!(
                 game.pack.render.resolve_model(first).is_ok(),

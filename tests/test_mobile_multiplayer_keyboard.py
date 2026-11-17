@@ -26,11 +26,11 @@ def block(source, start):
 def program(game=None, control=None):
     game = game or '\n'.join((ROOT / path).read_text() for path in [
         'crates/horizon-client/src/game.rs',
-        'crates/horizon-client/src/game/play_input.rs',
+        'crates/horizon-client/src/game/interface/play_input.rs',
     ])
-    control = control or (ROOT / 'crates/horizon-client/src/game/control.rs').read_text()
-    hooks = (ROOT / 'crates/horizon-client/src/game/native_hooks.rs').read_text()
-    clip = (ROOT / 'crates/horizon-client/src/game/clipboard.rs').read_text()
+    control = control or (ROOT / 'crates/horizon-client/src/game/runtime/control.rs').read_text()
+    hooks = (ROOT / 'crates/horizon-client/src/game/native_hooks/shared.rs').read_text()
+    clip = (ROOT / 'crates/horizon-client/src/game/interface/clipboard.rs').read_text()
     uikit = (ROOT / 'third_party/winit/src/platform_impl/ios/hardware_keyboard.rs').read_text()
     # UIKit characters use this earlier no-physical-key branch before reaching
     # the ordinary key dispatcher. Omitting it would test an unreachable path.
@@ -41,17 +41,17 @@ def program(game=None, control=None):
     body = game.index('{', game.index('=>', start))
     arm = game[start:body] + block(game, body)
     callbacks = '\n'.join(method(uikit,n) for n in ['key_text','insert_text_keys','text_key_code','logical_key'])
-    methods = '\n'.join(method(hooks,n) for n in ['screen_chars_typed','screen_text_typed'])
-    methods += '\n'+method(control,'type_chars_into_screen')+'\n'+method(control,'type_chars_unhooked')+'\n'+method(clip,'title_edit')
-    ime = (ROOT / 'crates/horizon-client/src/game/ime.rs').read_text()
+    methods = '\n'.join(method(hooks,n) for n in ['screen_chars_typed','screen_text_typed','screen_text_each','screen_char_canceled'])
+    methods += '\n'+method(control,'type_chars_into_screen')+'\n'+'\n'+method(clip,'title_edit')
+    ime = (ROOT / 'crates/horizon-client/src/game/interface/ime.rs').read_text()
     methods += '\n'+method(game,'title_input_active')
-    methods += '\n'+method(ime,'ime_commit')
+    methods += '\n'+method(ime,'ime_commit')+'\n'+method(ime,'ime_type')
     methods += '\n'+method(game,'reload_blocks_input')
-    presentation = (ROOT / 'crates/horizon-client/src/game/presentation.rs').read_text()
+    presentation = (ROOT / 'crates/horizon-client/src/game/interface/presentation.rs').read_text()
     methods += '\n'+method(presentation,'menu_input_blocked')+'\n'+method(presentation,'presentation_stale')
-    transaction = (ROOT / 'crates/horizon-client/src/game/packs/transaction.rs').read_text()
+    transaction = (ROOT / 'crates/horizon-client/src/game/world/packs/transaction.rs').read_text()
     methods += '\n'+method(transaction,'content_reload_busy')
-    helpers = '\n'.join(method(hooks,n) for n in ['screen_text_hooked','chars_to_type'])
+    helpers = method(hooks, 'screen_text_hooked')+'\n'+method((ROOT/'crates/horizon-client/src/game/native_hooks/screen_chars.rs').read_text(), 'chars_to_type')
     owns = method(control,'title_owns_text') if 'fn title_owns_text(' in control else 'fn title_owns_text(_: &Screen,_:bool)->bool{false}'
     keys = sorted(set(re.findall(r'KeyCode::(\w+)', callbacks+arm)) | {'KeyA'})
     names = sorted(set(re.findall(r'NamedKey::(\w+)', callbacks)))
@@ -64,6 +64,7 @@ def program(game=None, control=None):
 
 STUBS = r'''
 #![allow(dead_code)]
+mod mod_api{pub enum HookId{ScreenCharTypedPre}pub mod __private{pub fn listened(_:super::HookId)->bool{true}}}
 #[macro_export] macro_rules! warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 mod log { pub(crate) use crate::warn; }
 use std::cell::RefCell;
@@ -92,6 +93,7 @@ impl Title {
  fn list_focused(&self)->bool{false}
  fn confirm_key_size(&mut self,_:(u32,u32))->(Action,bool){(Action::None,false)}
  fn field_key(&mut self,key:KeyCode,_:bool,_:bool){if key==KeyCode::Backspace{self.backspace()}}
+ fn page_missing_mods(&mut self,_:KeyCode,_:(u32,u32))->bool{false}
  fn arrow_key(&mut self,_:KeyCode,_:(u32,u32),_:bool){}
  fn tab_dir(&mut self,_:bool,_:(u32,u32)){}
  fn escape(&mut self){} fn refresh_servers(&mut self){}
@@ -107,21 +109,23 @@ struct Renderer{current:bool}impl Renderer{fn presentation_current(&self)->bool{
 #[derive(Default)]struct Pad{reload_pending:bool}
 enum Transaction{Preparing,Committing}
 #[derive(Default)]struct Mods{transaction:Option<Transaction>}
-struct Game{renderer:Option<Renderer>,creative_ignore_text:bool,pad:Pad,pack_reload:Option<()>,mods:Mods,screen:Screen,title:Option<Title>,modifiers:u32,book:Option<()>,sign_edit:Option<()>,ui:UI,gui:GUI,creative_screen:Creative,text_selection:Selection,audio:Audio,cancel:bool,cancel_key:bool,blocked:bool,dialog:bool,dialog_value:String,command:String,hooked:RefCell<String>}
+struct Game{renderer:Option<Renderer>,creative_ignore_text:bool,pad:Pad,pack_reload:Option<()>,mods:Mods,mod_transaction:Option<Transaction>,screen:Screen,title:Option<Title>,modifiers:u32,book:Option<()>,sign_edit:Option<()>,ui:UI,gui:GUI,creative_screen:Creative,text_selection:Selection,audio:Audio,cancel:bool,cancel_key:bool,blocked:bool,dialog:bool,dialog_value:String,command:String,hooked:RefCell<String>}
 fn glfw_modifiers(m:u32)->u32{m}
 impl Game {
+ fn with_focused_text_edit(&mut self,read:impl FnOnce(&mut Self,Option<()>)->bool)->bool{read(self,None)}
+ fn screen_chars_post(&self,_:&str){panic!("focused fixture field must consume its characters");}
  fn dialog_open(&self)->bool{self.dialog}
  fn prompt_open(&self)->bool{self.dialog_open()}
  // No native mod text-field extension is installed in this fixture.
  fn type_text_field_input(&mut self,_:&str)->Option<Result<()>>{None}
  fn report_text_input_result(result:Result<()>){result.unwrap();}
- fn new()->Self{Self{renderer:None,creative_ignore_text:false,pad:Pad::default(),pack_reload:None,mods:Mods::default(),screen:Screen::Playing,title:Some(Title{value:String::new(),focused_button:None}),modifiers:0,book:None,sign_edit:None,ui:UI{options:Options},gui:GUI{atlas:()},creative_screen:Creative{search:false,value:String::new()},text_selection:Selection,audio:Audio,cancel:false,cancel_key:false,blocked:false,dialog:false,dialog_value:String::new(),command:String::new(),hooked:RefCell::new(String::new())}}
+ fn new()->Self{Self{renderer:None,creative_ignore_text:false,pad:Pad::default(),pack_reload:None,mods:Mods::default(),mod_transaction:None,screen:Screen::Playing,title:Some(Title{value:String::new(),focused_button:None}),modifiers:0,book:None,sign_edit:None,ui:UI{options:Options},gui:GUI{atlas:()},creative_screen:Creative{search:false,value:String::new()},text_selection:Selection,audio:Audio,cancel:false,cancel_key:false,blocked:false,dialog:false,dialog_value:String::new(),command:String::new(),hooked:RefCell::new(String::new())}}
  fn screen_hooks_open(&self)->bool{true}fn screen_view_now(&self)->Option<()>{Some(())}
  fn types_text(&self)->bool{!self.blocked}
  fn text_field_focused(&mut self)->bool{true}
  fn dialog_type(&mut self,s:&str)->bool{if self.dialog{self.dialog_value.push_str(s);true}else{false}}
  fn screen_key_pressed(&self,_:KeyCode,_:bool)->bool{self.cancel_key}
- fn native_screen_char_typed_pre(&self,_:&(),c:char,_:u32,cancel:&mut bool){self.hooked.borrow_mut().push(c);*cancel=self.cancel;}
+ fn native_screen_char_typed_pre(&self,_:&(),c:char,_:u32,_:Option<()>,cancel:&mut bool){self.hooked.borrow_mut().push(c);*cancel=self.cancel;}
  fn edit_shortcut(&self,_:&KeyEvent)->Option<()>{None}fn title_shortcut(&mut self,_:()){}
  fn has_control_down_with_quirk(&self)->bool{false}fn has_control_down(&self)->bool{false}fn has_shift_down(&self)->bool{false}
  fn gui_size(&self)->(u32,u32){(400,300)}fn save_title_options(&mut self){}
@@ -143,10 +147,10 @@ fn type_uikit(g:&mut Game,text:&str){for (physical_key,logical) in insert_text_k
 #[test]fn names_unicode_and_hook_cancellation(){let mut g=Game::new();type_uikit(&mut g,"日本 🦀");assert_eq!(g.title.as_ref().unwrap().value,"日本 🦀");assert_eq!(*g.hooked.borrow(),"日本 🦀");g.cancel=true;type_uikit(&mut g,"blocked");assert_eq!(g.title.as_ref().unwrap().value,"日本 🦀");}
 #[test]fn ime_uses_the_shared_reload_boundary_before_hooks_or_fields(){
  for mask in 1..8 {for committing in [false,true] {for field in 0..3 {
-  let mut g=Game::new();g.pad.reload_pending=mask&1!=0;g.pack_reload=(mask&2!=0).then_some(());g.mods.transaction=(mask&4!=0).then_some(if committing{Transaction::Committing}else{Transaction::Preparing});
+  let mut g=Game::new();g.pad.reload_pending=mask&1!=0;g.pack_reload=(mask&2!=0).then_some(());g.mod_transaction=(mask&4!=0).then_some(if committing{Transaction::Committing}else{Transaction::Preparing});
   if field==1{g.dialog=true;}if field==2{g.title=None;g.screen=Screen::CommandBlock;}
   g.ime_commit("blocked");assert!(g.hooked.borrow().is_empty());assert!(g.dialog_value.is_empty()&&g.command.is_empty());if let Some(t)=&g.title{assert!(t.value.is_empty());}
-  g.pad.reload_pending=false;g.pack_reload=None;g.mods.transaction=None;g.ime_commit("ready");assert_eq!(*g.hooked.borrow(),"ready");
+  g.pad.reload_pending=false;g.pack_reload=None;g.mod_transaction=None;g.ime_commit("ready");assert_eq!(*g.hooked.borrow(),"ready");
   match field{0=>assert_eq!(g.title.as_ref().unwrap().value,"ready"),1=>assert_eq!(g.dialog_value,"ready"),_=>assert_eq!(g.command,"ready")}
  }}}
 }

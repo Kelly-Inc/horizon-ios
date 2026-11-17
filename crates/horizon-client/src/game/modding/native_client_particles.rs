@@ -161,7 +161,7 @@ mod tests {
                     let level = ParticleLevel {
                         world: &game.world,
                         facts: game.res.facts(),
-                        collision: game.collision,
+                        collision: &game.collision,
                         player: None,
                         cached_chunk: std::cell::Cell::new(None),
                     };

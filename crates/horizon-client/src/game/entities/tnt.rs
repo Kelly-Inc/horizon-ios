@@ -1197,13 +1197,27 @@ mod tests {
             return;
         }
         let assets = horizon_client::assets::Assets::load(&root).unwrap();
-        let render = assets.reload(&root).unwrap();
+        let render = assets
+            .reload(&horizon_client::resource_source::ResourceRoot::directory(
+                root.clone(),
+            ))
+            .unwrap();
         let facts = horizon_client::blocks::BlockFacts::load(&root, assets.registry).unwrap();
         let fluids = horizon_client::motion::FluidResources::new(&assets, &facts).unwrap();
         let collision = horizon_client::collisions::load(&root, assets.registry).unwrap();
         let world = horizon_client::world::World::test_scene(&assets, &render, 3).unwrap();
         let at = Vec3::new(20.5, 20.0, 20.5);
+        let context = horizon_world::native_load_context::LoadContext::new(
+            horizon_world::native_load_context::DataLoadOrigin::ServerDataLoad,
+            std::sync::Arc::new(horizon_world::native_load_context::LoadInputs::new(
+                Default::default(),
+                root.clone(),
+            )),
+            [],
+        )
+        .captured_loop_context(horizon_world::native_load_context::LoopSide::Server);
         let mut tnt = PrimedTnt {
+            attachment_lifetime: Default::default(),
             used_portal: false,
             rotation: [0.0; 2],
             block_state: None,
@@ -1231,8 +1245,10 @@ mod tests {
             (19.76318399697876, -0.115263684456482),
         ] {
             let before = tnt.position;
-            tnt.tick(&world, &collision, &assets, &facts, &fluids, None, None)
-                .unwrap();
+            tnt.tick(
+                &world, &collision, &assets, &facts, &fluids, &context, None, None,
+            )
+            .unwrap();
             assert_eq!(tnt.previous, before);
             assert_eq!(tnt.position.y, y);
             assert_eq!(tnt.velocity.y, vy);

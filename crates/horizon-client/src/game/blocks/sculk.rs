@@ -2963,7 +2963,7 @@ mod cached_listener_teleport_tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires prepared resources"]
+    #[ignore = "daily"]
     fn cached_listener_uses_live_position_after_native_teleport() {
         super::super::lan_actions::vehicle_loot_tests::with_fixture(|game| {
             game.boats.clear();
@@ -2992,7 +2992,8 @@ mod cached_listener_teleport_tests {
                 // API37 is callable by native_game_event before the listener scan.
                 // It moves this existing entity without invalidating id/slot/next_entity.
                 let next_entity = game.next_entity;
-                assert!(game.native_teleport_mob(game.dim.id(), 991, to));
+                let entity = game.entity(991).expect("existing allay");
+                assert!(game.entity_teleport_to(entity, to, None));
                 assert_eq!(game.next_entity, next_entity);
                 game.post_game_event("minecraft:note_block_play", near, Context::default());
                 let heard = game.mobs[0]

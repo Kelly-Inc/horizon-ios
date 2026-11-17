@@ -3351,7 +3351,7 @@ mod native_move_threshold_tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires prepared resources"]
+    #[ignore = "daily"]
     fn cart_position_threshold_preserves_collision_state_and_tiny_free_motion() {
         super::super::lan_actions::vehicle_loot_tests::with_fixture(|game| {
             game.boats.clear();

@@ -540,7 +540,7 @@ mod tests {
             remote.profile = 42;
             game.player =
                 Some(horizon_client::motion::PlayerMotion::new(&game.motion, Vec3::ZERO).unwrap());
-            game.spawn_entity(15, "minecraft:ender_dragon", [0.0; 3], [0.0; 3]);
+            game.spawn_entity(15, 15, "minecraft:ender_dragon", [0.0; 3], [0.0; 3]);
             place_parts(game);
             // The server tells this client of the dragon alone; the parts are its copies of it.
             let dragon = game.entity(15).unwrap();

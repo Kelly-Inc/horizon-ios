@@ -15,20 +15,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    source = Path(os.environ.get('HORIZON_PREPARED_WRITER_SOURCE', ROOT / 'crates/horizon-client/src/game/world_loading.rs')).read_text()
+    source = Path(os.environ.get('HORIZON_PREPARED_WRITER_SOURCE', ROOT / 'crates/horizon-client/src/game/world/world_loading.rs')).read_text()
     imports = (ROOT / 'crates/horizon-client/src/import.rs').read_text()
     a = imports.rfind('#[derive', 0, imports.index('struct HomeGate {'))
     b = imports.rfind('#[derive', a, imports.index('pub enum Kind'))
     access = imports[a:b]
-    a = source.index('static PREPARED_WRITERS:')
-    b = source.index(';\n', a) + 2
-    state = source[a:b]
+    owners = (ROOT / 'crates/horizon-client/src/game/world/world_loading/owned_workers.rs').read_text()
+    a = owners.index('static PREPARED_WRITERS:')
+    b = owners.index(';\n', a) + 2
+    state = owners[a:b]
     write = method(source, 'write_prepared_files')
-    shutdown = method(source, 'shutdown_prepared_files')
+    shutdown = method(owners, 'shutdown_prepared_files')
     owned = 'home_access:' in write
     calls = 'write_prepared_files(root.clone(),Some(access));' if owned else 'let _access=access;write_prepared_files(root.clone());'
     cached = 'write_prepared_files(root.clone(),Some(access));' if owned else 'let _access=access;write_prepared_files(root.clone());'
-    return STUBS.replace('HOME_ACCESS_API', access) + state + write + shutdown + CASES.replace('FIRST_WRITE_CALL', calls).replace('CACHED_WRITE_CALL', cached)
+    lease = f'#[path="{ROOT / "crates/horizon-assets/src/root_lease.rs"}"]mod root_lease;\n'
+    return STUBS.replace('ROOT_LEASE_MODULE', lease).replace('HOME_ACCESS_API', access) + state + write + shutdown + CASES.replace('FIRST_WRITE_CALL', calls).replace('CACHED_WRITE_CALL', cached)
 
 
 STUBS = r'''
@@ -36,6 +38,11 @@ STUBS = r'''
 extern crate self as horizon_client;
 extern crate self as horizon_core;
 extern crate self as horizon_threads;
+extern crate self as horizon_assets;
+extern crate self as horizon_guest_stack;
+ROOT_LEASE_MODULE
+pub fn builder()->std::thread::Builder{std::thread::Builder::new()}
+use std::thread::JoinHandle;
 extern crate self as log;
 #[macro_export]macro_rules! info{($($t:tt)*)=>{{}}}
 use std::{collections::BTreeMap,fs,path::{Path,PathBuf},sync::{Arc,Mutex,OnceLock,PoisonError,Weak,Condvar,mpsc,atomic::{AtomicBool,Ordering}},time::{Instant,Duration}};

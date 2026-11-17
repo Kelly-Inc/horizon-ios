@@ -1,18 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  The game bundle's Info.plist, for the .ipa whose executable is the cross-compiled `horizon-client` binary.
-  Unlike packaging/ios/Info.plist this one carries no `$(MARKETING_VERSION)` placeholders: the game's bundle is
-  assembled by hand in .github/workflows/ios.yml (rustc emits an executable, and Xcode is never asked to), so
-  nothing substitutes for Xcode and the versions are written here. Keep them beside project.yml's.
+  The game bundle's Info.plist, for the .ipa whose executable is the cross-compiled `horizon-official` binary.
+  HorizonGame's Xcode build bundles the Cargo executable with HorizonLauncherKit. The release workflow
+  then stamps the version, build and source revision with tools/ci/ios_release.py; these literal versions
+  are development defaults, not the published release identity.
 
   There is no principal class, no nib and no storyboard, on purpose: winit 0.30's iOS backend passes its own
   `UIApplicationDelegate` class to `UIApplicationMain`, and a delegate named here would replace the one the
   game's window comes from.
 
-  UIFileSharingEnabled is the decided way assets arrive, prepared off-device and copied in by hand. It puts the
-  game's Documents folder (saves, `options.txt`, `.horizon-cache`) in the Files app on the phone, so the copy is
-  something a player can do with no developer tool attached.
+  UIFileSharingEnabled exposes the game's Documents folder (saves, options.txt and .horizon-cache) in Files.
+  Prepared game files can arrive through the launcher's downloader, Files importer or a manual transfer.
 -->
 <plist version="1.0">
 <dict>

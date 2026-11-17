@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 def program():
-    game=(ROOT/'crates/horizon-client/src/game/render_tick.rs').read_text()
+    game=(ROOT/'crates/horizon-client/src/game/interface/render_tick.rs').read_text()
     return r'''
 use std::time::Instant;
 struct Clock{still:bool}impl Clock{fn still(&self)->bool{self.still}}

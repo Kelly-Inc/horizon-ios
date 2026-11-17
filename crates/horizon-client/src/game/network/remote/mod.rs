@@ -15642,10 +15642,9 @@ pub(crate) mod tests {
         assert!(tracked_team(&board, &entity, &players).is_none());
         // Non-player entities use the AddEntity UUID, never a profile name.
         let mob = Tracked {
-            uuid: 0,
+            uuid,
             player_name: None,
             kind: "minecraft:zombie".into(),
-            player_name: None,
             ..entity
         };
         packet(

@@ -22,6 +22,13 @@ const KEY: (i32, i32, i32) = (i32::MAX - 15, super::super::minecarts::CART_KEY_Y
 pub(in crate::game) fn with_fixture(test: impl FnOnce(&mut Game<'_>)) {
     crate::game::native_entity_refs::tests::with_game(|game| {
         game.options.dedicated = Some(Vec::new());
+        // The lightweight Game fixture has not entered a world. Real world entry
+        // loads the server's loot snapshot before any container can open.
+        game.load_server_loot();
+        assert!(
+            game.server_loot.get().is_some(),
+            "prepared loot tables required"
+        );
         game.world
             .chunks
             .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
@@ -90,6 +97,7 @@ pub(in crate::game) fn with_fixture(test: impl FnOnce(&mut Game<'_>)) {
                 levels: game.level_shapes,
                 level_seeds: game.levels.runtime.seeds(),
             },
+            game.loop_context.clone(),
         );
         for conn in [1, 2] {
             let (tx, _rx) = std::sync::mpsc::channel();
@@ -149,7 +157,7 @@ fn contents(game: &Game<'_>, conn: u32) -> Vec<Option<ItemStack>> {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn boat_loot_is_visible_to_its_opener_and_survives_close_reopen() {
     with_fixture(|game| {
         pending(game);
@@ -208,7 +216,7 @@ fn boat_loot_is_visible_to_its_opener_and_survives_close_reopen() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn pending_boat_loot_cannot_be_consumed_by_a_spectator() {
     with_fixture(|game| {
         pending(game);
@@ -286,7 +294,7 @@ fn pending_boat_loot_cannot_be_consumed_by_a_spectator() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn rolling_into_a_live_boat_preserves_other_viewers_edited_slots() {
     with_fixture(|game| {
         open(game, 1);
@@ -331,11 +339,13 @@ fn rolling_into_a_live_boat_preserves_other_viewers_edited_slots() {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn owner_and_guest_vehicle_viewers_keep_the_same_live_inventory_until_last_close() {
     for owner_closes_first in [false, true] {
         with_fixture(|game| {
-            game.boats[0].items[3] = Some(ItemStack::new("minecraft:diamond", 7));
+            game.boats.update(0, |boat| {
+                boat.items[3] = Some(ItemStack::new("minecraft:diamond", 7))
+            });
             game.open_chest_boat_container(0);
             assert_eq!(game.container, Some(KEY));
             open(game, 1);
@@ -383,11 +393,13 @@ fn owner_and_guest_vehicle_viewers_keep_the_same_live_inventory_until_last_close
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn foreign_or_unplaced_vehicle_menus_cannot_pin_this_levels_live_inventory() {
     for foreign_dimension in [false, true] {
         with_fixture(|game| {
-            game.boats[0].items[3] = Some(ItemStack::new("minecraft:diamond", 7));
+            game.boats.update(0, |boat| {
+                boat.items[3] = Some(ItemStack::new("minecraft:diamond", 7))
+            });
             game.open_chest_boat_container(0);
             open(game, 1);
             let live = contents(game, 1);
@@ -450,7 +462,7 @@ fn placement_cubes(game: &mut Game<'_>) -> (bool, bool) {
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn player_building_obstruction_follows_presence_through_guest_outside_and_nested_turns() {
     with_fixture(|game| {
         game.lan
@@ -710,7 +722,7 @@ fn player_building_obstruction_follows_presence_through_guest_outside_and_nested
 }
 
 #[test]
-#[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+#[ignore = "daily"]
 fn pending_cart_loot_refuses_a_spectator_but_generated_loot_can_be_viewed() {
     use crate::game::minecarts::{CartKind, Minecart};
     for kind in [CartKind::Chest, CartKind::Hopper] {

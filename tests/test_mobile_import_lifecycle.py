@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def program():
-    source = (ROOT / 'crates/horizon-client/src/game/launcher.rs').read_text()
+    source = (ROOT / 'crates/horizon-client/src/game/runtime/launcher.rs').read_text()
     start = source.index('enum Waiting {')
     end = source.index('fn deliver()', start)
     state = source[start:end]

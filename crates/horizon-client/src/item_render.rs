@@ -1796,7 +1796,7 @@ mod tests {
             .write_header()?
             .write_image_data(&[255; 4 * 4 * 4])?;
         let sprites = FileSprites {
-            root: root.clone(),
+            root: horizon_assets::resource_source::ResourceSource::directory(root.clone()),
             permutations: Vec::new(),
             cache: Mutex::default(),
             translucent: Mutex::default(),

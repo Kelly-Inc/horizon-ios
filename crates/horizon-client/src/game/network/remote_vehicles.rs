@@ -1062,7 +1062,7 @@ mod native_rider_motion_tests {
     use horizon_client::motion::{MotionWorld, PlayerMotion};
 
     #[test]
-    #[ignore = "requires prepared resources"]
+    #[ignore = "daily"]
     fn seated_player_travels_before_reseating_and_keeps_its_own_collision() {
         super::super::lan_actions::vehicle_loot_tests::with_fixture(|game| {
             game.boats.clear();
@@ -1105,6 +1105,10 @@ mod native_rider_motion_tests {
                     collision_binding: &game.collision,
                     resources: &game.motion,
                     health: &game.health_resources,
+                    tag_items: None,
+                    loop_context: &game.loop_context,
+                    damage_hooks: &game.damage_hooks,
+                    block_registries: Some(&game.ui.registries),
                 }
                 .passenger_movement_tick(keys, start, 0.0)
                 .unwrap();
@@ -1160,6 +1164,10 @@ mod native_rider_motion_tests {
                 collision_binding: &game.collision,
                 resources: &game.motion,
                 health: &game.health_resources,
+                tag_items: None,
+                loop_context: &game.loop_context,
+                damage_hooks: &game.damage_hooks,
+                block_registries: Some(&game.ui.registries),
             }
             .controlled_simulation_tick(Keys {
                 forward: true,

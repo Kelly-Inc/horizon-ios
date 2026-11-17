@@ -1792,7 +1792,10 @@ var<private> params: ReferenceParams;
         queue: &wgpu::Queue,
         world: [f32; 3],
     ) -> [f32; 4] {
-        let [r, g, b] = world.map(f64::from);
+        // fs_keep reads the half-float frame when it makes the 8-bit backdrop.
+        // Using the original f32 here can cross an 8-bit rounding boundary
+        // and invent a HUD contribution in a screenshot with no HUD.
+        let [r, g, b] = world.map(|v| f64::from(half::f16::from_f32(v).to_f32()));
         let frame = hdr.frame(device, [1, 1]);
         let t = hdr.targets.as_ref().unwrap();
         let mut encoder = device.create_command_encoder(&Default::default());

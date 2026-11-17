@@ -1,3 +1,5 @@
+import contextlib
+from pathlib import Path
 import shutil
 import subprocess
 import unittest
@@ -76,7 +78,12 @@ class SelectionTests(unittest.TestCase):
 class RealWorkspaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workspace = Workspace(cargo_metadata())
+        with contextlib.chdir(Path(__file__).resolve().parents[1]):
+            cls.workspace = Workspace(cargo_metadata())
+
+    def setUp(self):
+        # These methods inspect this repository's tracked files, not the caller's directory.
+        self.enterContext(contextlib.chdir(Path(__file__).resolve().parents[1]))
 
     def test_horizon_client_lib_is_built_from_horizon_clients_files(self):
         chosen = self.workspace.scope(["crates/horizon-client/src/game/x.rs"])

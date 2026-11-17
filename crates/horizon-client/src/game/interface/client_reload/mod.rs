@@ -22,6 +22,24 @@ use mod_api::{
     ClientHost, ClientReloadContext, ClientReloadListener, HookId, Host,
 };
 
+/// Exercise application refusal before any prepared listener or resource is published.
+#[cfg(test)]
+pub(in crate::game) fn refuse_reload_application(game: &mut Game<'_>) {
+    let invalid = mod_api::ProfessionDefinition {
+        key: mod_api::ProfessionKey(mod_api::Identifier::parse("minecraft:reserved").unwrap()),
+        workstations: vec![],
+        held_poi: vec![],
+        acquirable_poi: vec![],
+        requested_items: vec![],
+        secondary_blocks: vec![],
+        work_sound: None,
+        trades: vec![],
+    };
+    game.mods.profession_declarations =
+        std::sync::Arc::new(std::sync::OnceLock::from(vec![("test".into(), invalid)]));
+    assert!(game.prepare_client_professions().is_err());
+}
+
 /// One client reload step to run later on the game-owning thread: a mod
 /// listener's prepared apply.
 pub(super) type PreparedClientReload = PreparedStep<()>;

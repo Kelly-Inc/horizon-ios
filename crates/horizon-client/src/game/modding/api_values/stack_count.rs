@@ -86,10 +86,16 @@ impl TryIntoEngine for ApiStack {
         };
         let damage = self.damage_component().map_or_else(
             || {
-                u32::try_from(stack.effective_damage(Some(definition))).map_err(|_| {
-                    StackWriteError::InvalidComponents {
-                        reason: mod_api::StackError::InvalidDamage,
-                    }
+                // Admission checks the stored component, not getDamageValue's
+                // clamped query: lowering MAX_DAMAGE must not hide an inherited
+                // DAMAGE that is already above the new maximum.
+                let inherited = if stack.carries_component(Some(definition), "minecraft:damage") {
+                    definition.damage
+                } else {
+                    0
+                };
+                u32::try_from(inherited).map_err(|_| StackWriteError::InvalidComponents {
+                    reason: mod_api::StackError::InvalidDamage,
                 })
             },
             Ok,

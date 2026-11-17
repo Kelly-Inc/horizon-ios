@@ -27,6 +27,12 @@ if [ -n "${HORIZON_TEST_RUSTC_WRAPPER:-}" ]; then
 fi
 if $test_unit && { [ "$crate_name" = horizon_client ] || [ "$crate_name" = horizon_client_lib ]; }; then
   # Keep the lock in flock's parent, not in compiler/cache daemon descendants.
-  exec flock -x -o "${RUNNER_TEMP:?}/horizon-lib-test-compile.lock" "${command[@]}"
+  lock="${RUNNER_TEMP:?}/horizon-lib-test-compile.lock"
+  if command -v flock >/dev/null 2>&1; then
+    exec flock -x -o "$lock" "${command[@]}"
+  fi
+  # macOS has fcntl locks but no flock command. The supervisor owns the lock,
+  # and never lends it to compiler/cache-daemon descendants.
+  exec python3 "$(dirname "$0")/test_compile_lock.py" "$lock" "${command[@]}"
 fi
 exec "${command[@]}"

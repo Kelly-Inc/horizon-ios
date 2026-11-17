@@ -2168,7 +2168,7 @@ mod steering_native_component_tests {
     use std::sync::Arc;
 
     #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    #[ignore = "daily"]
     fn boosting_uses_the_used_hands_effective_components_and_native_break_slot() {
         crate::game::lan_actions::vehicle_loot_tests::with_fixture(|game| {
             let mut tree = Tree::default();
@@ -2241,7 +2241,7 @@ mod steering_native_component_tests {
                         ));
                     }
                     let mut pig = Mob::new(700, pig_type.clone(), Vec3::new(8.5, 65.0, 8.5), 0.0);
-                    pig.extra.saddled = true;
+                    pig.extra.set_saddled(true);
                     game.mobs.clear();
                     game.mobs.push(pig);
                     game.lan.as_mut().unwrap().hub.guests.update(0, |driver| {
@@ -2263,7 +2263,7 @@ mod steering_native_component_tests {
                             let before = g.stats.get("broken", "minecraft:carrot_on_a_stick");
                             g.guest_use = Some(crate::game::GuestUse::Item(hand));
                             g.forced_hit = None;
-                            g.tick_hit = None;
+                            g.tick_hit.set(None);
                             g.use_failed = false;
                             g.use_delay = 0;
                             let used = g.use_item().unwrap();
@@ -2279,11 +2279,8 @@ mod steering_native_component_tests {
                                 g.inventory[0].clone()
                             }
                             .unwrap();
-                            let events = g
-                                .guest_equipment_breaks
-                                .iter()
-                                .map(|(event, _)| *event)
-                                .collect::<Vec<_>>();
+                            let events =
+                                g.guest_equipment_breaks.iter().copied().collect::<Vec<_>>();
                             (
                                 left,
                                 other,

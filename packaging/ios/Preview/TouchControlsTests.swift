@@ -257,6 +257,42 @@ final class TouchControlsTests: XCTestCase {
         toggle.sendActions(for:.touchUpOutside);XCTAssertEqual(edges,[true])
         toggle.sendActions(for:.touchCancel);XCTAssertEqual(edges,[true,false]);XCTAssertFalse(toggle.isSelected)
     }
+    @MainActor func testMenuCursorBindingOnlyFiresOnIntentionalActivation() throws {
+        var definition = CustomTouchButton()
+        definition.bindings = [-5, 340, 0, 0]
+        var config = TouchConfiguration()
+        config.customButtons = [definition]
+        var cursorChanges = 0
+        let bridge = TouchGestureBridge(configuration: { config }, toggleMenuCursor: { cursorChanges += 1 })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll(screen: UInt64 = 1, flags: UInt32 = 0) -> [[Double]] {
+            bridge.poll(screen: screen, flags: flags, width: 600, height: 300, scale: 1, capacity: 64)
+        }
+        _ = poll()
+        let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        button.sendActions(for: .touchDown)
+        XCTAssertEqual(bridge.customModifierBits, 1)
+        button.sendActions(for: .touchCancel)
+        XCTAssertEqual(bridge.customModifierBits, 0)
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 1, 340], [7, 3, 340]])
+        button.sendActions(for: .touchDown)
+        button.sendActions(for: .touchUpOutside)
+        button.sendActions(for: .touchDown)
+        _ = poll(screen: 2)
+        XCTAssertEqual(bridge.customModifierBits, 0)
+        XCTAssertEqual(cursorChanges, 0)
+
+        button.sendActions(for: .touchDown)
+        button.sendActions(for: .touchUpInside)
+        XCTAssertEqual(cursorChanges, 1)
+        XCTAssertTrue(button.accessibilityActivate())
+        XCTAssertEqual(cursorChanges, 2)
+        _ = poll(screen: 3, flags: 1)
+        XCTAssertTrue(button.accessibilityActivate())
+        XCTAssertEqual(cursorChanges, 2)
+    }
+
     func testCustomControlsPersistBeyondSixAndKeepOrderedChords() throws {
         var config = TouchConfiguration()
         for index in 0..<40 {

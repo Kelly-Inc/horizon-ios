@@ -514,6 +514,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private var keyboardShown = false
     private var hideCustomPaint = false
     private let configuration: () -> TouchConfiguration
+    private let toggleMenuCursor: () -> Void
     private var gui = CGSize.zero
     private var guiScale: Double = 1
     private var pending: [(Double, [Double], UInt64, UInt32, UInt64)] = []
@@ -524,8 +525,15 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private var hotbarSlot = -1
     private var suppressTap = false
 
-    init(configuration: @escaping () -> TouchConfiguration = { TouchPreferences.shared.configuration }) {
+    init(configuration: @escaping () -> TouchConfiguration = { TouchPreferences.shared.configuration },
+         toggleMenuCursor: @escaping () -> Void = {
+             let preferences = TouchPreferences.shared
+             var config = preferences.configuration
+             config.virtualMouse.toggle()
+             preferences.save(config)
+         }) {
         self.configuration = configuration
+        self.toggleMenuCursor = toggleMenuCursor
         super.init()
     }
 
@@ -591,16 +599,14 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         for definition in config.customButtons {
             if let old=customViews[definition.id],old.definition != definition {old.release();old.removeFromSuperview();customViews.removeValue(forKey:definition.id)}
             if customViews[definition.id] == nil {
-                let button=CustomTouchView(definition) { [weak self] id,keys,down,flags in
+                let button = CustomTouchView(definition, activate: { [weak self] in
+                    guard let self, self.active, !self.playing, definition.keys.contains(-5) else { return }
+                    self.toggleMenuCursor()
+                }) { [weak self] id,keys,down,flags in
                     guard let self else{return}
-                    for (code,pressed) in self.customHolds.set(id,keys:keys,down:down) {
+                    // Menu cursor mode changes on activation, never on hold cleanup.
+                    for (code,pressed) in self.customHolds.set(id,keys:keys.filter { $0 != -5 },down:down) {
                         if pressed {self.customPressed.insert(code)} else {self.customPressed.remove(code)}
-                        if code == -5 {
-                            if !pressed && !self.playing {
-                                var config=TouchPreferences.shared.configuration;config.virtualMouse.toggle();TouchPreferences.shared.save(config)
-                            }
-                            continue
-                        }
                         self.emit(7,phase:pressed ? 1 : 3,location:CGPoint(x:code,y:0),modifiers:flags)
                     }
                 }

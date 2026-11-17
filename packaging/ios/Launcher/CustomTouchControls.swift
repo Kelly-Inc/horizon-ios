@@ -71,9 +71,11 @@ final class CustomTouchHolds {
 final class CustomTouchView: UIButton {
     var definition: CustomTouchButton
     var send: (UUID,[Int],Bool,UIKeyModifierFlags)->Void
+    private let activate: () -> Void
     private var buttonHeld = false
-    init(_ definition: CustomTouchButton, send: @escaping (UUID,[Int],Bool,UIKeyModifierFlags)->Void) {
-        self.definition=definition; self.send=send;super.init(frame:.zero)
+    init(_ definition: CustomTouchButton, activate: @escaping () -> Void = {},
+         send: @escaping (UUID,[Int],Bool,UIKeyModifierFlags)->Void) {
+        self.definition=definition; self.send=send; self.activate=activate; super.init(frame:.zero)
         setTitle(definition.name,for:.normal);setTitleColor(.systemYellow,for:.selected);backgroundColor=UIColor.black.withAlphaComponent(0.4)
         layer.borderColor=UIColor.white.withAlphaComponent(0.6).cgColor;layer.borderWidth=1;layer.cornerRadius=6
         titleLabel?.adjustsFontSizeToFitWidth=true;titleLabel?.minimumScaleFactor=0.4
@@ -96,11 +98,13 @@ final class CustomTouchView: UIButton {
         if definition.toggle {
             buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,event?.modifierFlags ?? [])
         } else {release(event?.modifierFlags ?? [])}
+        activate()
     }
     @objc private func outside(_ sender:UIButton,event:UIEvent?){if !definition.toggle {release(event?.modifierFlags ?? [])}}
     override func accessibilityActivate() -> Bool {
         if definition.toggle {buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,[])}
         else {send(definition.id,definition.keys,true,[]);send(definition.id,definition.keys,false,[])}
+        activate()
         return true
     }
     @objc private func cancelled(){release()}

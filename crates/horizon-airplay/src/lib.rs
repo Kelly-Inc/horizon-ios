@@ -19,7 +19,7 @@ use raw_window_handle::{
 
 /// A view on the AirPlay display, while one is connected: what a player's renderer draws to instead of the
 /// phone's window.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Screen {
     /// Unique to the view, so a display that went and came back, or a half that was made again, is a new
     /// surface.
@@ -27,21 +27,57 @@ pub struct Screen {
     /// The view's size in pixels.
     pub size: (u32, u32),
     #[cfg(target_os = "ios")]
-    view: std::ptr::NonNull<std::ffi::c_void>,
+    view: std::sync::Arc<MainThreadRelease<objc2::rc::Retained<objc2_ui_kit::UIView>>>,
 }
 
-// SAFETY: the view is only handed to wgpu, which reads it on the main thread when it makes the surface, and
-// `ios::STATE` keeps it alive while the display is connected.
+impl PartialEq for Screen {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.size == other.size
+    }
+}
+
+impl Eq for Screen {}
+
+/// UIKit objects may outlive their scene because render workers own the surface.
+/// Release on the main queue without waiting for it from a render worker.
 #[cfg(target_os = "ios")]
-unsafe impl Send for Screen {}
+#[derive(Debug)]
+struct MainThreadRelease<T: 'static>(Option<dispatch2::MainThreadBound<T>>);
+
 #[cfg(target_os = "ios")]
-unsafe impl Sync for Screen {}
+impl<T> MainThreadRelease<T> {
+    fn new(value: T, mtm: objc2::MainThreadMarker) -> Self {
+        Self(Some(dispatch2::MainThreadBound::new(value, mtm)))
+    }
+
+    fn get(&self, mtm: objc2::MainThreadMarker) -> &T {
+        self.0.as_ref().expect("value owned until drop").get(mtm)
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl<T> Drop for MainThreadRelease<T> {
+    fn drop(&mut self) {
+        let value = self.0.take();
+        if objc2::MainThreadMarker::new().is_some() {
+            drop(value);
+        } else {
+            dispatch2::DispatchQueue::main().exec_async(move || drop(value));
+        }
+    }
+}
 
 impl HasWindowHandle for Screen {
     #[cfg(target_os = "ios")]
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let handle = raw_window_handle::UiKitWindowHandle::new(self.view);
-        // SAFETY: the view is alive for as long as this display is connected (see `Screen`).
+        let mtm = objc2::MainThreadMarker::new().ok_or(HandleError::Unavailable)?;
+        let view = self.view.get(mtm);
+        if view.window().is_none() {
+            return Err(HandleError::Unavailable);
+        }
+        let handle =
+            raw_window_handle::UiKitWindowHandle::new(std::ptr::NonNull::from(&**view).cast());
+        // SAFETY: self owns a retain for this view for the lifetime of the handle.
         Ok(unsafe { WindowHandle::borrow_raw(handle.into()) })
     }
     #[cfg(not(target_os = "ios"))]
@@ -124,7 +160,7 @@ pub fn phone_controls(buttons: Option<&[Button]>) {
 
 #[cfg(target_os = "ios")]
 mod ios {
-    use super::{Button, Screen};
+    use super::{Button, MainThreadRelease, Screen};
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class};
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -136,12 +172,23 @@ mod ios {
         UIWindowSceneSessionRoleApplication,
     };
     use std::cell::{Cell, RefCell};
-    use std::ptr::NonNull;
+    use std::sync::Arc;
 
     /// A view with the id its surfaces know it by.
     struct View {
         id: u64,
         view: Retained<UIView>,
+        handle: Arc<MainThreadRelease<Retained<UIView>>>,
+    }
+
+    impl View {
+        fn new(view: Retained<UIView>, mtm: MainThreadMarker) -> Self {
+            Self {
+                id: next_id(),
+                handle: Arc::new(MainThreadRelease::new(view.clone(), mtm)),
+                view,
+            }
+        }
     }
 
     struct Cover {
@@ -234,10 +281,7 @@ mod ios {
         install_state(State {
             scene: scene.retain(),
             _window: window,
-            view: View {
-                id: next_id(),
-                view,
-            },
+            view: View::new(view, mtm),
             halves: None,
             cover: None,
             idle,
@@ -330,7 +374,7 @@ mod ios {
                 (bounds.size.width * scale).round().max(1.0) as u32,
                 (bounds.size.height * scale).round().max(1.0) as u32,
             ),
-            view: NonNull::from(&*view.view).cast(),
+            view: view.handle.clone(),
         }
     }
 
@@ -348,10 +392,7 @@ mod ios {
             );
             view.setBackgroundColor(Some(&UIColor::blackColor()));
             state.view.view.addSubview(&view);
-            View {
-                id: next_id(),
-                view,
-            }
+            View::new(view, mtm)
         };
         (
             make(0.0, UIViewAutoresizing::FlexibleBottomMargin),

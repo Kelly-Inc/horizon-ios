@@ -129,19 +129,23 @@ impl Download {
                     i.store(1, Ordering::Relaxed);
                     let downloaded = archive.file_name() == Some(DOWNLOADED.as_ref());
                     let opened = Pack::open(&archive).and_then(Pack::require_game_files);
-                    if opened.is_err() && downloaded {
-                        // A download that ends as no archive is downloaded again from the start next time.
+                    let invalid_archive = opened.is_err();
+                    let result = opened.and_then(|pack| {
+                        pack.install_guarded(&home, || !stop.load(Ordering::Acquire))
+                    });
+                    let invalid_contents = result.as_ref().err().is_some_and(|error| {
+                        error
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::InvalidData)
+                    });
+                    if downloaded && (invalid_archive || invalid_contents) {
+                        // A known-invalid archive cannot be fixed by retrying its installation.
                         let _ = fs::remove_file(&archive);
                     }
-                    let result = opened
-                        .and_then(|pack| {
-                            pack.install_guarded(&home, || !stop.load(Ordering::Acquire))
-                        })
-                        .map_err(|e| e.to_string());
                     if downloaded && !archive.exists() {
                         let _ = fs::remove_file(home.join(DOWNLOADED_SOURCE));
                     }
-                    result
+                    result.map_err(|e| e.to_string())
                 });
                 drop(lease);
                 let _ = sender.send(result);
@@ -852,6 +856,32 @@ mod tests {
         // The archive is consumed, and no partial file is left.
         assert!(!home.join("horizon-download.zip").exists());
         assert!(!home.join("horizon-download.zip.part").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn retry_refetches_a_download_with_damaged_prepared_files() {
+        let good = prepared();
+        let size = good.len();
+        let url = serve(good, size);
+        let home = home("damaged-cache");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(DOWNLOADED), prepared_with_facts("")).unwrap();
+        fs::write(home.join(DOWNLOADED_SOURCE), source_hash(&url)).unwrap();
+
+        let download = Download::start(url.clone(), home.clone()).unwrap();
+        let error = wait(&download).unwrap_err();
+        assert!(error.contains("facts.json is empty"), "{error}");
+        assert!(!home.join(DOWNLOADED).exists());
+        assert!(!home.join(DOWNLOADED_SOURCE).exists());
+        assert!(!home.join("resources").exists());
+
+        let retry = Download::start(url, home.clone()).unwrap();
+        assert_eq!(wait(&retry).unwrap().kind, super::super::Kind::Resources);
+        assert_eq!(
+            fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+            "{}"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

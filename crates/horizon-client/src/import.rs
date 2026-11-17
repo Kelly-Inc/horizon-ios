@@ -186,6 +186,50 @@ pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
         .filter(|dir| has(dir))
 }
 
+/// Which top-level prepared file a killed preparation or an interrupted copy
+/// left unusable. The loader parses these before it can start; naming one
+/// beats serde's bare "expected value at line 1 column 1".
+pub fn damaged_prepared(root: &Path) -> Option<String> {
+    let manifest = root.join("horizon-resources.json");
+    let bytes = match std::fs::read(&manifest) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(format!("cannot read horizon-resources.json: {error}")),
+    };
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Some("horizon-resources.json is empty".into());
+    }
+    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+        return Some("horizon-resources.json is not valid JSON".into());
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => return Some(format!("cannot list prepared resources: {error}")),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Some(format!("cannot read a prepared-resource entry: {error}")),
+        };
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Some(format!(
+                    "cannot inspect {}: {error}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        };
+        if metadata.len() == 0 {
+            return Some(format!("{} is empty", entry.file_name().to_string_lossy()));
+        }
+    }
+    None
+}
+
 /// Whether a game that found nothing to load should wait on screen instead of giving up. On a phone,
 /// always: there is nothing else on the device to say what is missing, and a silent exit teaches a
 /// player nothing. Anywhere else it has to be asked for (`HORIZON_IMPORT_SCREEN`), which is how the
@@ -523,6 +567,14 @@ impl Pack {
                     let scratch = home.join("resources.unpacking");
                     let _ = fs::remove_dir_all(&scratch);
                     let (files, bytes) = self.unpack(&scratch)?;
+                    if let Some(problem) = damaged_prepared(&scratch) {
+                        let _ = fs::remove_dir_all(&scratch);
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Horizon's prepared game files are damaged: {problem}"),
+                        )
+                        .into());
+                    }
                     if !wanted() {
                         let _ = fs::remove_dir_all(&scratch);
                         return Err("the import was cancelled".into());
@@ -997,13 +1049,49 @@ mod tests {
     }
 
     #[test]
+    fn damaged_prepared_archives_cannot_replace_installed_resources() {
+        let home = temp_home("damaged-prepared");
+        let original = home.join("original.zip");
+        write_archive(&original, PREPARED);
+        Pack::open(&original).unwrap().install(&home).unwrap();
+
+        for (manifest, facts, message) in [
+            ("{", "{}", "horizon-resources.json is not valid JSON"),
+            ("{}", "", "facts.json is empty"),
+        ] {
+            let archive = home.join("damaged.zip");
+            write_archive(
+                &archive,
+                &[("horizon-resources.json", manifest), ("facts.json", facts)],
+            );
+            let error = Pack::open(&archive)
+                .unwrap()
+                .install(&home)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(message), "{error}");
+            assert_eq!(
+                fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+                "{}"
+            );
+            assert!(archive.is_file());
+            assert!(!home.join("resources.unpacking").exists());
+            assert!(!home.join("resources.staged").exists());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn concurrent_resource_imports_publish_one_complete_archive() {
         let home = temp_home("concurrent-resources");
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let mut workers = Vec::new();
         for owner in ["a", "b"] {
             let archive = home.join(format!("{owner}.zip"));
-            let mut entries = vec![("horizon-resources.json".to_owned(), owner.to_owned())];
+            let mut entries = vec![(
+                "horizon-resources.json".to_owned(),
+                serde_json::json!({"fixture": owner}).to_string(),
+            )];
             for index in 0..1500 {
                 entries.push((format!("assets/shared/{index:04}.dat"), owner.repeat(128)));
             }
@@ -1020,8 +1108,12 @@ mod tests {
             let installed = worker.join().unwrap().unwrap();
             assert_eq!(installed.files, 1501);
         }
-        let owner = fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap();
-        assert!(matches!(owner.as_str(), "a" | "b"));
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(home.join("resources/horizon-resources.json")).unwrap(),
+        )
+        .unwrap();
+        let owner = manifest["fixture"].as_str().unwrap();
+        assert!(matches!(owner, "a" | "b"));
         for index in 0..1500 {
             assert_eq!(
                 fs::read_to_string(home.join(format!("resources/assets/shared/{index:04}.dat")))
@@ -1164,7 +1256,7 @@ mod tests {
         write_archive(
             &archive,
             &[
-                ("horizon-resources.json", "new"),
+                ("horizon-resources.json", r#"{"fixture":"new"}"#),
                 ("payload.txt", "new payload"),
             ],
         );
@@ -1241,7 +1333,7 @@ mod tests {
         recovery.join().unwrap();
         assert_eq!(
             fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap(),
-            "new"
+            r#"{"fixture":"new"}"#
         );
         assert_eq!(
             fs::read_to_string(home.join("resources/payload.txt")).unwrap(),
@@ -1257,7 +1349,10 @@ mod tests {
         for panic in [false, true] {
             let home = temp_home(&format!("owned-transaction-error-{panic}"));
             let archive = home.join("new.zip");
-            write_archive(&archive, &[("horizon-resources.json", "new")]);
+            write_archive(
+                &archive,
+                &[("horizon-resources.json", r#"{"fixture":"new"}"#)],
+            );
             let pack = Pack::open(&archive).unwrap();
             let access = acquire_home_access(&home).unwrap();
             let (started, started_rx) = mpsc::channel();
@@ -1295,7 +1390,7 @@ mod tests {
             writer.join().unwrap();
             assert_eq!(
                 fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap(),
-                "new"
+                r#"{"fixture":"new"}"#
             );
             fs::remove_dir_all(home).unwrap();
         }
@@ -1313,7 +1408,7 @@ mod tests {
         write_archive(
             &archive,
             &[
-                ("horizon-resources.json", "new"),
+                ("horizon-resources.json", r#"{"fixture":"new"}"#),
                 ("payload.txt", "new payload"),
             ],
         );
@@ -1356,7 +1451,7 @@ mod tests {
         assert_eq!(installed.path, home.join("resources"));
         assert_eq!(
             fs::read_to_string(installed.path.join("horizon-resources.json")).unwrap(),
-            "new"
+            r#"{"fixture":"new"}"#
         );
         assert_eq!(
             fs::read_to_string(installed.path.join("payload.txt")).unwrap(),

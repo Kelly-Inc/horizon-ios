@@ -615,57 +615,13 @@ pub(super) fn missing_resources(
             shown.display(),
         ));
     }
-    damaged_prepared(root).map(|problem| {
+    horizon_client::import::damaged_prepared(root).map(|problem| {
         format!(
             "Horizon's prepared game files are damaged: {problem} in {}\n\
              Prepare them again with the launcher, or: horizon-prepare --prepare",
             shown.display()
         )
     })
-}
-
-/// Which top-level prepared file a killed preparation or an interrupted copy
-/// left unusable. The loader parses these before it can start; naming one
-/// beats serde's bare "expected value at line 1 column 1".
-pub(super) fn damaged_prepared(root: &std::path::Path) -> Option<String> {
-    let manifest = root.join("horizon-resources.json");
-    let bytes = match std::fs::read(&manifest) {
-        Ok(bytes) => bytes,
-        Err(error) => return Some(format!("cannot read horizon-resources.json: {error}")),
-    };
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Some("horizon-resources.json is empty".into());
-    }
-    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
-        return Some("horizon-resources.json is not valid JSON".into());
-    }
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) => return Some(format!("cannot list prepared resources: {error}")),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => return Some(format!("cannot read a prepared-resource entry: {error}")),
-        };
-        let path = entry.path();
-        if path.extension() != Some(std::ffi::OsStr::new("json")) {
-            continue;
-        }
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return Some(format!(
-                    "cannot inspect {}: {error}",
-                    entry.file_name().to_string_lossy()
-                ));
-            }
-        };
-        if metadata.len() == 0 {
-            return Some(format!("{} is empty", entry.file_name().to_string_lossy()));
-        }
-    }
-    None
 }
 
 /// `Minecraft.<init>`: `startedCleanly` left false means the previous start

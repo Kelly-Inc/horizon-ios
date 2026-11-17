@@ -198,6 +198,35 @@ final class AccountTests: XCTestCase {
         XCTAssertNotNil(vault.values[bob.uuid]); XCTAssertEqual(account.accounts, [bob])
         XCTAssertEqual(bridgeCommands, ["launcher-session off"])
     }
+
+    func testFailedRemovalDoesNotDiscardAnInFlightTokenRotation() async throws {
+        try seed()
+        network()
+        let account = model()
+        let requested = expectation(description: "refresh reached Microsoft")
+        let release = DispatchSemaphore(value: 0)
+        let response = AuthURLProtocol.response
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/token") {
+                requested.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return response(request)
+        }
+        let refresh = Task { try await account.handOver() }
+        await fulfillment(of: [requested], timeout: 3)
+        vault.refusedRemovals = [alice.uuid]
+        await account.remove(alice)
+        XCTAssertEqual(account.state, .failed("Fixture removal failure"))
+        XCTAssertEqual(account.profile, alice)
+        release.signal()
+
+        try await refresh.value
+        XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-rotated")
+        XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-new-access")
+        XCTAssertEqual(bridgeCommands.count, 1)
+        XCTAssertTrue(bridgeCommands.last?.contains("fixture-new-access") == true)
+    }
     func testFailedAddKeepsExistingSelection() async throws {
         try seed(expired: false); network(downstreamError: true)
         let response = AuthURLProtocol.response

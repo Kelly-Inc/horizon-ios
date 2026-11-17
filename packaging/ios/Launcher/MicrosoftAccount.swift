@@ -88,7 +88,6 @@ final class MicrosoftAccount: ObservableObject {
     }
     func remove(_ account: Profile) async {
         cancel()
-        renewals.removeValue(forKey: account.uuid)?.cancel()
         do {
             let hasLegacyRecord = legacyProfile?.uuid == account.uuid
             if hasLegacyRecord {
@@ -97,6 +96,9 @@ final class MicrosoftAccount: ObservableObject {
                 try vault.remove("account")
             }
             try vault.remove(account.uuid)
+            // A failed removal leaves the account in use. Let any pending
+            // refresh persist a Microsoft token that may already have rotated.
+            renewals.removeValue(forKey: account.uuid)?.cancel()
             if hasLegacyRecord {
                 defaults.removeObject(forKey: "microsoftProfile")
                 legacyProfile = nil; migrationPending = false
@@ -179,7 +181,11 @@ final class MicrosoftAccount: ObservableObject {
             return result
         }
         renewals[account.uuid] = task
-        defer { renewals[account.uuid] = nil }
+        defer {
+            // The same account may have been removed and added again while
+            // this cancelled task was waiting for a network callback.
+            if renewals[account.uuid] == task { renewals[account.uuid] = nil }
+        }
         return try await task.value
     }
     func signIn() {

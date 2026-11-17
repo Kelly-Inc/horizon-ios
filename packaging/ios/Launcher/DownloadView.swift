@@ -79,6 +79,15 @@ final class DownloadModel: ObservableObject {
     private var samples: [(at: Date, bytes: Int64)] = []
     /// A retry is on its way to the game.
     private var retrying = false
+    private var retryGeneration = 0
+    private let request: @MainActor (String) async -> [String: Any]
+    private let diagnostic: @MainActor (String) -> Void
+
+    init(request: @escaping @MainActor (String) async -> [String: Any] = { await Bridge.send($0) },
+         diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) }) {
+        self.request = request
+        self.diagnostic = diagnostic
+    }
 
     var fraction: Double {
         switch phase {
@@ -94,7 +103,8 @@ final class DownloadModel: ObservableObject {
 
     func run() async {
         while !Task.isCancelled {
-            apply(await Bridge.send("download-state"))
+            await refresh()
+            guard !Task.isCancelled else { return }
             if phase == .done {
                 close()
                 return
@@ -104,15 +114,27 @@ final class DownloadModel: ObservableObject {
     }
 
     func retry() async {
+        guard !retrying, case .failed = phase else { return }
+        retryGeneration += 1
+        retrying = true
         phase = .starting
+        received = 0
+        total = 0
         speed = 0
         samples = []
-        retrying = true
-        let answer = await Bridge.send("download-retry")
+        let answer = await request("download-retry")
         retrying = false
         if let error = answer.error {
-            phase = .failed(error)
+            fail(error)
         }
+    }
+
+    func refresh() async {
+        guard !retrying, !Task.isCancelled else { return }
+        let generation = retryGeneration
+        let state = await request("download-state")
+        guard generation == retryGeneration, !retrying, !Task.isCancelled else { return }
+        apply(state)
     }
 
     /// Let the game's own screen show the other ways in (over Wi-Fi, or a cable to a computer).
@@ -135,17 +157,21 @@ final class DownloadModel: ObservableObject {
             phase = .installing
             speed = 0
         case "failed":
-            // A state asked before the retry reached the game still says the last failure.
-            guard !retrying else { return }
-            phase = .failed(state["error"] as? String ?? "The download stopped.")
-            speed = 0
-            samples = []
+            fail(state.error ?? "The download stopped.")
         case "done":
             phase = .done
         default:
-            // No answer (an error, or no game under the screen): keep what is shown and ask again.
-            break
+            if let error = state.error { fail(error) }
         }
+    }
+
+    private func fail(_ error: String) {
+        let failure = Phase.failed(error)
+        guard phase != failure else { return }
+        diagnostic("Game files (game download) failed: \(Diagnostics.redact(error))")
+        phase = failure
+        speed = 0
+        samples = []
     }
 
     /// The speed over the last four seconds, eased so the number doesn't jump with every read.

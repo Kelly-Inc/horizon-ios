@@ -18,12 +18,16 @@ enum Bridge {
     @MainActor
     static func send(_ line: String) async -> [String: Any] {
         let verb = String(line.prefix(while: { !$0.isWhitespace }))
-        if verb != "launcher-state" {Diagnostics.record("Launcher request: \(verb)")}
+        // The download screen records failures when its state changes, not on every poll.
+        let logReplyError = verb != "download-state"
+        if verb != "launcher-state", logReplyError {
+            Diagnostics.record("Launcher request: \(verb)")
+        }
         guard let submit else {
             return ["error": "no game is running under the launcher"]
         }
         return await withCheckedContinuation { continuation in
-            let context = Unmanaged.passRetained(Reply(continuation)).toOpaque()
+            let context = Unmanaged.passRetained(Reply(continuation, logError: logReplyError)).toOpaque()
             line.withCString { submit($0, context, replied) }
         }
     }
@@ -44,9 +48,11 @@ enum Bridge {
 
 private final class Reply {
     let continuation: CheckedContinuation<[String: Any], Never>
+    let logError: Bool
 
-    init(_ continuation: CheckedContinuation<[String: Any], Never>) {
+    init(_ continuation: CheckedContinuation<[String: Any], Never>, logError: Bool) {
         self.continuation = continuation
+        self.logError = logError
     }
 }
 
@@ -57,7 +63,9 @@ private let replied: HorizonDone = { context, text in
     let answer = text
         .flatMap { String(cString: $0).data(using: .utf8) }
         .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
-    if let error = answer?["error"] as? String { Diagnostics.record("Launcher error: \(error)") }
+    if reply.logError, let error = answer?["error"] as? String {
+        Diagnostics.record("Launcher error: \(error)")
+    }
     reply.continuation.resume(returning: answer ?? ["error": "the game's answer was not JSON"])
 }
 

@@ -444,6 +444,47 @@ final class PackMutationTests: XCTestCase {
 }
 
 @MainActor
+final class DownloadScreenTests: XCTestCase {
+    func testBridgeFailureShowsRecoveryActionsAndIsLoggedOnce() async {
+        var messages: [String] = []
+        let model = DownloadModel(request: { _ in ["error": "Game connection unavailable"] },
+                                  diagnostic: { messages.append($0) })
+        await model.refresh()
+        XCTAssertEqual(model.phase, .failed("Game connection unavailable"))
+        await model.refresh()
+        XCTAssertEqual(messages.count, 1)
+    }
+
+    func testPreRetryPollCannotReplaceTheCurrentDownloadState() async {
+        var oldPoll: CheckedContinuation<[String: Any], Never>?
+        let polling = expectation(description: "old status request is in flight")
+        var polls = 0
+        let model = DownloadModel(request: { command in
+            if command == "download-retry" { return ["ok": true] }
+            polls += 1
+            switch polls {
+            case 1: return ["phase": "failed", "error": "Old download failed"]
+            case 2: return await withCheckedContinuation {
+                oldPoll = $0
+                polling.fulfill()
+            }
+            default: return ["phase": "downloading", "received": 20, "total": 50]
+            }
+        }, diagnostic: { _ in })
+        await model.refresh()
+        let stale = Task { await model.refresh() }
+        await fulfillment(of: [polling], timeout: 2)
+        await model.retry()
+        await model.refresh()
+        oldPoll?.resume(returning: ["phase": "failed", "error": "Old download failed"])
+        await stale.value
+        XCTAssertEqual(model.phase, .downloading)
+        XCTAssertEqual(model.received, 20)
+        XCTAssertEqual(model.total, 50)
+    }
+}
+
+@MainActor
 final class AutomaticGameFilesTests: XCTestCase {
     func testChangingDownloadOriginClearsThePreviousToken() {
         let model = GameFilesDownload(diagnostic: { _ in })

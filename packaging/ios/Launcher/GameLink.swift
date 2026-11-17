@@ -149,7 +149,7 @@ final class GameLink: ObservableObject {
         let was = phase
         switch state["phase"] as? String {
         case "waiting":
-            if phase != .waiting { GameAudio.stop() }
+            if phase != .waiting { GameAudio.shared.stop() }
             phase = .waiting
         case "loading": phase = .loading(state["progress"] as? Double ?? 0)
         case "needs_files": phase = .needsFiles(state["reason"] as? String)
@@ -351,7 +351,7 @@ final class GameLink: ObservableObject {
             self.phaseEpoch = UUID()
             self.launching = nil
             if status == "stopped" {
-                if self.phase != .waiting { GameAudio.stop() }
+                if self.phase != .waiting { GameAudio.shared.stop() }
                 self.phase = .waiting
             }
             if let failure = attempt.failure {

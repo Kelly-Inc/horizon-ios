@@ -37,7 +37,7 @@ private func present(attempts: Int) {
     host.rootView = AnyView(
         HomeView(onPlay: { [weak host] in
             guard let host else { return }
-            GameAudio.start()
+            GameAudio.shared.start()
             let scene = host.view.window?.windowScene
             host.dismiss(animated: true) {
                 Task { @MainActor in

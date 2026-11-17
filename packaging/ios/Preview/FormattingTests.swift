@@ -1,6 +1,57 @@
+import AVFoundation
+import os
 import XCTest
 import UIKit
 @testable import LauncherPreview
+
+final class GameAudioTests: XCTestCase {
+    func testAudioTransitionsAreSerializedAndQuitIgnoresAnOlderInterruption() async {
+        let queue = DispatchQueue(label: "horizon.audio.test")
+        let notifications = NotificationCenter()
+        let transitions = OSAllocatedUnfairLock(initialState: [Bool]())
+        let audio = GameAudio(queue: queue, notifications: notifications) { active in
+            XCTAssertFalse(Thread.isMainThread)
+            transitions.withLock { $0.append(active) }
+        }
+        func endInterruption() {
+            notifications.post(
+                name: AVAudioSession.interruptionNotification,
+                object: nil,
+                userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
+            )
+        }
+        func drain() async {
+            await withCheckedContinuation { continuation in
+                queue.async { continuation.resume() }
+            }
+        }
+
+        audio.stop()
+        await drain()
+        XCTAssertEqual(transitions.withLock { $0 }, [false])
+
+        audio.start()
+        await drain()
+        endInterruption()
+        await drain()
+        XCTAssertEqual(transitions.withLock { $0 }, [false, true, true])
+
+        // Capture the old observer's event before the queued Quit removes it.
+        queue.suspend()
+        audio.stop()
+        audio.start()
+        endInterruption()
+        queue.resume()
+        await drain()
+        XCTAssertEqual(transitions.withLock { $0 }, [false, true, true, false, true])
+
+        audio.stop()
+        await drain()
+        endInterruption()
+        await drain()
+        XCTAssertEqual(transitions.withLock { $0 }, [false, true, true, false, true, false])
+    }
+}
 
 @MainActor
 final class GameLinkRefreshTests: XCTestCase {

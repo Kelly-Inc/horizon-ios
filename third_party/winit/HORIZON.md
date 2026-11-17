@@ -16,7 +16,9 @@ and CI builds use the same input backend; Cargo.lock removes only winit's regist
 UIKit UIKey physical HID usages produce ordinary winit keyboard events, with layout text,
 modifiers, release/cancel events, and tracked key releases on responder loss. The view remains a
 first responder without showing a software keyboard during gameplay; set_ime_allowed switches
-its input view. UIKit text insertion/deletion still handles the software keyboard.
+its input view. UIKit text insertion/deletion handles the software keyboard. A view
+can receive late UIKit callbacks during window changes. The iOS backend drops
+view events when the view has no owning winit window.
 
 UIViewController.prefersPointerLocked and setNeedsUpdateOfPrefersPointerLocked request capture;
 a nil scene pointerLockState reports unsupported. GameController GCMouse handlers provide

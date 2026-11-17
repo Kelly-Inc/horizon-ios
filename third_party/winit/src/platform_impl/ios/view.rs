@@ -58,15 +58,15 @@ declare_class!(
     unsafe impl WinitView {
         #[method(drawRect:)]
         fn draw_rect(&self, rect: CGRect) {
-            let mtm = MainThreadMarker::new().unwrap();
-            let window = self.window().unwrap();
-            app_state::handle_nonuser_event(
-                mtm,
-                EventWrapper::StaticEvent(Event::WindowEvent {
-                    window_id: RootWindowId(window.id()),
-                    event: WindowEvent::RedrawRequested,
-                }),
-            );
+            if let Some(window) = self.window() {
+                app_state::handle_nonuser_event(
+                    MainThreadMarker::from(self),
+                    EventWrapper::StaticEvent(Event::WindowEvent {
+                        window_id: RootWindowId(window.id()),
+                        event: WindowEvent::RedrawRequested,
+                    }),
+                );
+            }
             let _: () = unsafe { msg_send![super(self), drawRect: rect] };
         }
 
@@ -75,7 +75,7 @@ declare_class!(
             let mtm = MainThreadMarker::new().unwrap();
             let _: () = unsafe { msg_send![super(self), layoutSubviews] };
 
-            let window = self.window().unwrap();
+            let Some(window) = self.window() else { return };
             let window_bounds = window.bounds();
             // If the app is started in landscape, the view frame and window bounds can be mismatched.
             // The view frame will be in portrait and the window bounds in landscape. So apply the
@@ -174,7 +174,7 @@ declare_class!(
 
         #[method(pinchGesture:)]
         fn pinch_gesture(&self, recognizer: &UIPinchGestureRecognizer) {
-            let window = self.window().unwrap();
+            let Some(window) = self.window() else { return };
 
             let (phase, delta) = match recognizer.state() {
                 UIGestureRecognizerState::Began => {
@@ -212,7 +212,7 @@ declare_class!(
 
         #[method(doubleTapGesture:)]
         fn double_tap_gesture(&self, recognizer: &UITapGestureRecognizer) {
-            let window = self.window().unwrap();
+            let Some(window) = self.window() else { return };
 
             if recognizer.state() == UIGestureRecognizerState::Ended {
                 let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
@@ -229,7 +229,7 @@ declare_class!(
 
         #[method(rotationGesture:)]
         fn rotation_gesture(&self, recognizer: &UIRotationGestureRecognizer) {
-            let window = self.window().unwrap();
+            let Some(window) = self.window() else { return };
 
             let (phase, delta) = match recognizer.state() {
                 UIGestureRecognizerState::Began => {
@@ -272,7 +272,7 @@ declare_class!(
 
         #[method(panGesture:)]
         fn pan_gesture(&self, recognizer: &UIPanGestureRecognizer) {
-            let window = self.window().unwrap();
+            let Some(window) = self.window() else { return };
 
             let translation = recognizer.translationInView(Some(self));
 
@@ -448,10 +448,13 @@ impl WinitView {
     }
 
     fn window(&self) -> Option<Retained<WinitUIWindow>> {
-        // SAFETY: `WinitView`s are always installed in a `WinitUIWindow`
-        (**self)
-            .window()
-            .map(|window| unsafe { Retained::cast(window) })
+        // UIKit may call the view while it is detached or between windows.
+        let window = (**self).window()?;
+        if !window.isKindOfClass(WinitUIWindow::class()) {
+            return None;
+        }
+        // SAFETY: isKindOfClass proved the runtime class is WinitUIWindow.
+        Some(unsafe { Retained::cast(window) })
     }
 
     pub(crate) fn recognize_pinch_gesture(&self, should_recognize: bool) {
@@ -546,7 +549,7 @@ impl WinitView {
     }
 
     fn handle_touches(&self, touches: &NSSet<UITouch>) {
-        let window = self.window().unwrap();
+        let Some(window) = self.window() else { return };
         let mut touch_events = Vec::new();
         let os_supports_force = app_state::os_capabilities().force_touch;
         for touch in touches {
@@ -751,9 +754,9 @@ impl WinitView {
     }
 
     fn handle_insert_text(&self, text: &NSString) {
-        let window = self.window().unwrap();
+        let Some(window) = self.window() else { return };
         let window_id = RootWindowId(window.id());
-        let mtm = MainThreadMarker::new().unwrap();
+        let mtm = MainThreadMarker::from(self);
         // Both software typing and hardware navigation can arrive via insertText:.
         // Decode navigation tokens before expanding genuine text into characters.
         app_state::handle_nonuser_events(
@@ -792,9 +795,9 @@ impl WinitView {
     }
 
     fn handle_delete_backward(&self) {
-        let window = self.window().unwrap();
+        let Some(window) = self.window() else { return };
         let window_id = RootWindowId(window.id());
-        let mtm = MainThreadMarker::new().unwrap();
+        let mtm = MainThreadMarker::from(self);
         app_state::handle_nonuser_events(
             mtm,
             [ElementState::Pressed, ElementState::Released].map(|state| {

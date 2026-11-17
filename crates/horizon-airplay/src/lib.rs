@@ -101,7 +101,7 @@ impl HasDisplayHandle for Screen {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Button {
     pub label: String,
-    /// `[x, y, width, height]` in the phone window's pixels.
+    /// `[x, y, width, height]` in the phone window's points.
     pub rect: [f32; 4],
     /// A finger holds it.
     pub held: bool,
@@ -495,12 +495,9 @@ mod ios {
             for old in cover.pad.subviews().iter() {
                 old.removeFromSuperview();
             }
-            let scale = cover.view.contentScaleFactor().max(1.0);
             for b in buttons {
-                let frame = CGRect::new(
-                    CGPoint::new(f64::from(b.rect[0]) / scale, f64::from(b.rect[1]) / scale),
-                    CGSize::new(f64::from(b.rect[2]) / scale, f64::from(b.rect[3]) / scale),
-                );
+                let [x, y, width, height] = b.rect.map(f64::from);
+                let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(width, height));
                 let view = UIView::initWithFrame(UIView::alloc(mtm), frame);
                 let alpha = if b.held { 0.55 } else { 0.25 };
                 view.setBackgroundColor(Some(&UIColor::colorWithWhite_alpha(1.0, alpha)));

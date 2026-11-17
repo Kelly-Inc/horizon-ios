@@ -1134,17 +1134,18 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
-    /// What the phone shows when it is splitscreen's controller (`touch_on_phone`): the buttons that are
-    /// otherwise drawn over the game, in the phone window's pixels.
+    /// What the phone shows when it is splitscreen's controller (`touch_on_phone`):
+    /// position the buttons in points using the same window that receives touches.
     pub(super) fn phone_buttons(&mut self) -> Vec<horizon_airplay::Button> {
         let Some(batch) = self.touch_batch().filter(|_| self.touch_shown()) else {
             return Vec::new();
         };
-        if !touch::controls_visible() {
+        let Some(window) = self.window.as_ref().filter(|_| touch::controls_visible()) else {
             return Vec::new();
-        }
+        };
+        let point_scale = (f64::from(batch.scale) / window.scale_factor()) as f32;
+        let points = |rect: touch::Rect| rect.map(|value| value * point_scale);
         let focused = self.field_focused();
-        let px = |r: touch::Rect| r.map(|v| v * batch.scale);
         let mut buttons = Vec::new();
         if self.touch_playing() {
             for (control, r) in self.visible_touch_layout(batch.width, batch.height) {
@@ -1167,7 +1168,7 @@ impl Game<'_> {
                 };
                 buttons.push(horizon_airplay::Button {
                     label,
-                    rect: px(r),
+                    rect: points(r),
                     held: self.touch.fingers.held(control),
                 });
             }
@@ -1175,7 +1176,7 @@ impl Game<'_> {
             if self.touch_close_shown() {
                 buttons.push(horizon_airplay::Button {
                     label: "✕".to_owned(),
-                    rect: px(touch::close_rect(batch.width, batch.height)),
+                    rect: points(touch::close_rect(batch.width, batch.height)),
                     held: self
                         .touch
                         .menu
@@ -1186,7 +1187,7 @@ impl Game<'_> {
             if focused {
                 buttons.push(horizon_airplay::Button {
                     label: "⌨".to_owned(),
-                    rect: px(touch::keyboard_rect(batch.width, batch.height)),
+                    rect: points(touch::keyboard_rect(batch.width, batch.height)),
                     held: self
                         .touch
                         .menu

@@ -609,7 +609,9 @@ mod tests {
         let _ = fs::remove_dir_all(&work);
         let root = work.join("Horizon-26.3");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("horizon-resources.json"), r#"{"schema":7}"#).unwrap();
+        for (name, body) in super::super::tests::prepared_entries() {
+            fs::write(root.join(name), body).unwrap();
+        }
         fs::create_dir_all(root.join("assets")).unwrap();
         fs::write(root.join("assets/grass.png"), "png").unwrap();
         let out = work.join("Horizon-26.3.zip");

@@ -32,8 +32,20 @@ fn home(tag: &str) -> PathBuf {
 fn prepared(dir: &Path) -> PathBuf {
     let folder = dir.join("Horizon-26.3");
     fs::create_dir_all(folder.join("assets/minecraft/models")).unwrap();
-    fs::write(folder.join("horizon-resources.json"), r#"{"schema":7}"#).unwrap();
-    fs::write(folder.join("facts.json"), "{}").unwrap();
+    fs::write(
+        folder.join("horizon-resources.json"),
+        serde_json::json!({"data_version": horizon_core::version::DATA_VERSION}).to_string(),
+    )
+    .unwrap();
+    for name in [
+        "facts.json",
+        "block-tags.json",
+        "block-behaviours.json",
+        "gameplay-facts.json",
+        "items.json",
+    ] {
+        fs::write(folder.join(name), "{}").unwrap();
+    }
     fs::write(folder.join("assets/minecraft/models/block.json"), "{}").unwrap();
     fs::write(folder.join("session.lock"), "someone is inside").unwrap();
     folder
@@ -76,7 +88,7 @@ fn the_command_writes_an_archive_the_phone_installs() {
     fs::create_dir_all(&documents).unwrap();
     let installed = Pack::open(&out).unwrap().install(&documents).unwrap();
     assert_eq!(installed.kind, Kind::Resources);
-    assert_eq!(installed.files, 3);
+    assert_eq!(installed.files, 7);
     assert_eq!(
         resources_root(&dir.join("Horizon.app/resources"), Some(&documents)),
         Some(documents.join("resources"))

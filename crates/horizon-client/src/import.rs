@@ -186,6 +186,15 @@ pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
         .filter(|dir| has(dir))
 }
 
+// These files are read unconditionally by Assets, item defaults and gameplay tables.
+const REQUIRED_PREPARED_TABLES: &[&str] = &[
+    "facts.json",
+    "block-tags.json",
+    "block-behaviours.json",
+    "gameplay-facts.json",
+    "items.json",
+];
+
 /// Which top-level prepared file a killed preparation or an interrupted copy
 /// left unusable. The loader parses these before it can start; naming one
 /// beats serde's bare "expected value at line 1 column 1".
@@ -198,8 +207,18 @@ pub fn damaged_prepared(root: &Path) -> Option<String> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Some("horizon-resources.json is empty".into());
     }
-    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Some("horizon-resources.json is not valid JSON".into());
+    };
+    let expected = horizon_core::version::DATA_VERSION;
+    match manifest["data_version"].as_i64() {
+        Some(actual) if actual == i64::from(expected) => {}
+        Some(actual) => {
+            return Some(format!(
+                "horizon-resources.json names data version {actual}; this build needs {expected}"
+            ));
+        }
+        None => return Some("horizon-resources.json is missing its data_version".into()),
     }
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -225,6 +244,11 @@ pub fn damaged_prepared(root: &Path) -> Option<String> {
         };
         if metadata.len() == 0 {
             return Some(format!("{} is empty", entry.file_name().to_string_lossy()));
+        }
+    }
+    for name in REQUIRED_PREPARED_TABLES {
+        if !root.join(name).is_file() {
+            return Some(format!("{name} is missing or is not a regular file"));
         }
     }
     None
@@ -1023,20 +1047,33 @@ mod tests {
         zip.finish().unwrap();
     }
 
-    const PREPARED: &[(&str, &str)] = &[
-        ("horizon-resources.json", r#"{"schema":7}"#),
-        ("facts.json", "{}"),
-        ("assets/minecraft/textures/block/grass.png", "png"),
-    ];
+    pub(super) fn prepared_entries() -> Vec<(&'static str, String)> {
+        std::iter::once((
+            "horizon-resources.json",
+            serde_json::json!({"data_version": horizon_core::version::DATA_VERSION}).to_string(),
+        ))
+        .chain(
+            REQUIRED_PREPARED_TABLES
+                .iter()
+                .map(|&name| (name, "{}".into())),
+        )
+        .collect()
+    }
+
+    fn prepared() -> Vec<(&'static str, String)> {
+        let mut entries = prepared_entries();
+        entries.push(("assets/minecraft/textures/block/grass.png", "png".into()));
+        entries
+    }
 
     #[test]
     fn prepared_files_unpack_into_the_folder_the_game_reads() {
         let home = temp_home("prepared");
         let archive = home.join("horizon.zip");
-        write_archive(&archive, PREPARED);
+        write_archive(&archive, &prepared());
         let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
         assert_eq!(installed.kind, Kind::Resources);
-        assert_eq!(installed.files, 3);
+        assert_eq!(installed.files, prepared().len());
         assert!(home.join("resources/horizon-resources.json").is_file());
         assert!(
             home.join("resources/assets/minecraft/textures/block/grass.png")
@@ -1052,18 +1089,31 @@ mod tests {
     fn damaged_prepared_archives_cannot_replace_installed_resources() {
         let home = temp_home("damaged-prepared");
         let original = home.join("original.zip");
-        write_archive(&original, PREPARED);
+        write_archive(&original, &prepared());
         Pack::open(&original).unwrap().install(&home).unwrap();
 
-        for (manifest, facts, message) in [
-            ("{", "{}", "horizon-resources.json is not valid JSON"),
-            ("{}", "", "facts.json is empty"),
+        let version = horizon_core::version::DATA_VERSION;
+        for (name, body, message) in [
+            (
+                "horizon-resources.json",
+                Some("{".into()),
+                "horizon-resources.json is not valid JSON",
+            ),
+            (
+                "horizon-resources.json",
+                Some(serde_json::json!({"data_version": version - 1}).to_string()),
+                "names data version",
+            ),
+            ("facts.json", Some(String::new()), "facts.json is empty"),
+            ("facts.json", None, "facts.json is missing"),
         ] {
             let archive = home.join("damaged.zip");
-            write_archive(
-                &archive,
-                &[("horizon-resources.json", manifest), ("facts.json", facts)],
-            );
+            let mut entries = prepared_entries();
+            entries.retain(|(entry, _)| *entry != name);
+            if let Some(body) = body {
+                entries.push((name, body));
+            }
+            write_archive(&archive, &entries);
             let error = Pack::open(&archive)
                 .unwrap()
                 .install(&home)
@@ -1088,10 +1138,11 @@ mod tests {
         let mut workers = Vec::new();
         for owner in ["a", "b"] {
             let archive = home.join(format!("{owner}.zip"));
-            let mut entries = vec![(
-                "horizon-resources.json".to_owned(),
-                serde_json::json!({"fixture": owner}).to_string(),
-            )];
+            let mut entries: Vec<_> = prepared_entries()
+                .into_iter()
+                .map(|(name, body)| (name.to_owned(), body))
+                .collect();
+            entries.push(("owner.txt".into(), owner.to_owned()));
             for index in 0..1500 {
                 entries.push((format!("assets/shared/{index:04}.dat"), owner.repeat(128)));
             }
@@ -1106,14 +1157,10 @@ mod tests {
         }
         for worker in workers {
             let installed = worker.join().unwrap().unwrap();
-            assert_eq!(installed.files, 1501);
+            assert_eq!(installed.files, 1501 + prepared_entries().len());
         }
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(home.join("resources/horizon-resources.json")).unwrap(),
-        )
-        .unwrap();
-        let owner = manifest["fixture"].as_str().unwrap();
-        assert!(matches!(owner, "a" | "b"));
+        let owner = fs::read_to_string(home.join("resources/owner.txt")).unwrap();
+        assert!(matches!(owner.as_str(), "a" | "b"));
         for index in 0..1500 {
             assert_eq!(
                 fs::read_to_string(home.join(format!("resources/assets/shared/{index:04}.dat")))
@@ -1253,13 +1300,9 @@ mod tests {
         fs::write(home.join("resources/horizon-resources.json"), "old").unwrap();
         fs::write(home.join("resources/payload.txt"), "old payload").unwrap();
         let archive = home.join("new.zip");
-        write_archive(
-            &archive,
-            &[
-                ("horizon-resources.json", r#"{"fixture":"new"}"#),
-                ("payload.txt", "new payload"),
-            ],
-        );
+        let mut entries = prepared_entries();
+        entries.push(("payload.txt", "new payload".into()));
+        write_archive(&archive, &entries);
         let pack = Pack::open(&archive).unwrap();
         let original = acquire_home_access(&home).unwrap();
         let handoff = original.clone();
@@ -1333,7 +1376,7 @@ mod tests {
         recovery.join().unwrap();
         assert_eq!(
             fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap(),
-            r#"{"fixture":"new"}"#
+            prepared_entries()[0].1
         );
         assert_eq!(
             fs::read_to_string(home.join("resources/payload.txt")).unwrap(),
@@ -1349,10 +1392,7 @@ mod tests {
         for panic in [false, true] {
             let home = temp_home(&format!("owned-transaction-error-{panic}"));
             let archive = home.join("new.zip");
-            write_archive(
-                &archive,
-                &[("horizon-resources.json", r#"{"fixture":"new"}"#)],
-            );
+            write_archive(&archive, &prepared_entries());
             let pack = Pack::open(&archive).unwrap();
             let access = acquire_home_access(&home).unwrap();
             let (started, started_rx) = mpsc::channel();
@@ -1390,7 +1430,7 @@ mod tests {
             writer.join().unwrap();
             assert_eq!(
                 fs::read_to_string(home.join("resources/horizon-resources.json")).unwrap(),
-                r#"{"fixture":"new"}"#
+                prepared_entries()[0].1
             );
             fs::remove_dir_all(home).unwrap();
         }
@@ -1405,13 +1445,9 @@ mod tests {
         fs::write(home.join("resources/horizon-resources.json"), "old").unwrap();
         fs::write(home.join("resources/payload.txt"), "old payload").unwrap();
         let archive = home.join("new.zip");
-        write_archive(
-            &archive,
-            &[
-                ("horizon-resources.json", r#"{"fixture":"new"}"#),
-                ("payload.txt", "new payload"),
-            ],
-        );
+        let mut entries = prepared_entries();
+        entries.push(("payload.txt", "new payload".into()));
+        write_archive(&archive, &entries);
         let pack = Pack::open(&archive).unwrap();
         let (read_first, read_first_rx) = mpsc::channel();
         let (continue_reading, continue_reading_rx) = mpsc::channel();
@@ -1451,7 +1487,7 @@ mod tests {
         assert_eq!(installed.path, home.join("resources"));
         assert_eq!(
             fs::read_to_string(installed.path.join("horizon-resources.json")).unwrap(),
-            r#"{"fixture":"new"}"#
+            prepared_entries()[0].1
         );
         assert_eq!(
             fs::read_to_string(installed.path.join("payload.txt")).unwrap(),
@@ -1512,7 +1548,7 @@ mod tests {
         horizon_core::prepared_files::write(&root).unwrap();
         let previous = horizon_core::prepared_files::open(&root).unwrap();
         let archive = home.join("new.zip");
-        write_archive(&archive, PREPARED);
+        write_archive(&archive, &prepared());
         Pack::open(&archive).unwrap().install(&home).unwrap();
         assert_eq!(
             horizon_core::prepared_files::read(&root.join(member)).unwrap(),
@@ -1528,7 +1564,9 @@ mod tests {
         let home = temp_home("desktop-prepared-cache");
         let desktop = home.join("desktop");
         fs::create_dir_all(desktop.join("assets/minecraft/textures/block")).unwrap();
-        fs::write(desktop.join("horizon-resources.json"), r#"{"schema":7}"#).unwrap();
+        for (name, body) in prepared_entries() {
+            fs::write(desktop.join(name), body).unwrap();
+        }
         let member = "assets/minecraft/textures/block/grass.png";
         fs::write(desktop.join(member), b"portable pixels").unwrap();
         horizon_core::prepared_files::write(&desktop).unwrap();
@@ -1556,9 +1594,9 @@ mod tests {
         // Compressing a folder on a desktop puts the folder's name in front of every entry.
         let home = temp_home("wrapped");
         let archive = home.join("Horizon-26.3.zip");
-        let entries: Vec<(String, &str)> = PREPARED
-            .iter()
-            .map(|(name, body)| (format!("Horizon-26.3/{name}"), *body))
+        let entries: Vec<(String, String)> = prepared()
+            .into_iter()
+            .map(|(name, body)| (format!("Horizon-26.3/{name}"), body))
             .collect();
         write_archive(&archive, &entries);
         let (kind, item) = classify(&archive).unwrap();
@@ -1574,9 +1612,9 @@ mod tests {
         // Compressing `.local/horizon-client` instead of `26.3` puts the manifest two levels down.
         let home = temp_home("double");
         let archive = home.join("horizon-client.zip");
-        let entries: Vec<(String, &str)> = PREPARED
-            .iter()
-            .map(|(name, body)| (format!("horizon-client/26.3/{name}"), *body))
+        let entries: Vec<(String, String)> = prepared()
+            .into_iter()
+            .map(|(name, body)| (format!("horizon-client/26.3/{name}"), body))
             .collect();
         write_archive(&archive, &entries);
         let (kind, item) = classify(&archive).unwrap();
@@ -2011,7 +2049,7 @@ mod tests {
         fs::create_dir(&scratch).unwrap();
         fs::write(scratch.join("existing"), "keep").unwrap();
         let archive = home.join("game.zip");
-        write_archive(&archive, PREPARED);
+        write_archive(&archive, &prepared());
 
         assert!(Pack::open(&archive).unwrap().unpack(&scratch).is_err());
         assert_eq!(fs::read(scratch.join("existing")).unwrap(), b"keep");
@@ -2027,7 +2065,7 @@ mod tests {
         fs::create_dir(&resources).unwrap();
         fs::write(resources.join("horizon-resources.json"), b"installed").unwrap();
         let archive = home.join("game.zip");
-        write_archive(&archive, PREPARED);
+        write_archive(&archive, &prepared());
         let checks = std::cell::Cell::new(0);
         let result = Pack::open(&archive).unwrap().install_guarded(&home, || {
             checks.set(checks.get() + 1);
@@ -2135,7 +2173,7 @@ mod tests {
         fs::create_dir_all(home.join("resources")).unwrap();
         fs::write(home.join("resources/old.json"), "old").unwrap();
         let archive = home.join("horizon.zip");
-        write_archive(&archive, PREPARED);
+        write_archive(&archive, &prepared());
         Pack::open(&archive).unwrap().install(&home).unwrap();
         assert!(home.join("resources/horizon-resources.json").is_file());
         assert!(!home.join("resources/old.json").exists());
@@ -2312,16 +2350,18 @@ mod tests {
         let home = temp_home("round");
         let source = home.join("Horizon-26.3");
         fs::create_dir_all(source.join("assets/minecraft/models")).unwrap();
-        fs::write(source.join("horizon-resources.json"), r#"{"schema":7}"#).unwrap();
+        for (name, body) in prepared_entries() {
+            fs::write(source.join(name), body).unwrap();
+        }
         fs::write(source.join("assets/minecraft/models/block.json"), "{}").unwrap();
         fs::write(source.join("session.lock"), "someone is inside").unwrap();
         let archive = home.join("out.zip");
         let packed = pack(&source, &archive, |_, _| {}).unwrap();
         assert_eq!(packed.kind, Kind::Resources);
-        assert_eq!(packed.files, 2);
+        assert_eq!(packed.files, prepared_entries().len() + 1);
         fs::remove_dir_all(&source).unwrap();
         let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
-        assert_eq!(installed.files, 2);
+        assert_eq!(installed.files, prepared_entries().len() + 1);
         assert!(home.join("resources/horizon-resources.json").is_file());
         assert!(
             home.join("resources/assets/minecraft/models/block.json")
@@ -2397,7 +2437,7 @@ mod tests {
         let dir = temp_home("usb");
         let home = dir.join("Documents");
         fs::create_dir_all(&home).unwrap();
-        write_archive(&home.join("Horizon-26.3.zip"), PREPARED);
+        write_archive(&home.join("Horizon-26.3.zip"), &prepared());
         assert_eq!(scan(&home).len(), 1);
         assert_eq!(
             resources_root(&dir.join("Horizon.app/resources"), Some(&home)).unwrap(),

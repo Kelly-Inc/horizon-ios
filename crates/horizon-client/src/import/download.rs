@@ -722,10 +722,10 @@ mod tests {
         use zip::{CompressionMethod, write::SimpleFileOptions, write::ZipWriter};
         let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        for (name, body) in [
-            ("horizon-resources.json", r#"{"schema":7}"#),
-            ("facts.json", facts),
-        ] {
+        for (name, mut body) in super::super::tests::prepared_entries() {
+            if name == "facts.json" {
+                body = facts.into();
+            }
             zip.start_file(name, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }
@@ -1163,10 +1163,10 @@ mod tests {
         let old = prepared();
         let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-        for (name, body) in [
-            ("horizon-resources.json", r#"{"schema":7}"#),
-            ("facts.json", r#"{"new":true}"#),
-        ] {
+        for (name, mut body) in super::super::tests::prepared_entries() {
+            if name == "facts.json" {
+                body = r#"{"new":true}"#.into();
+            }
             zip.start_file(name, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }

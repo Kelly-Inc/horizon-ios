@@ -1,11 +1,29 @@
 use super::*;
 
+fn write_preflight_fixture(root: &std::path::Path) {
+    std::fs::write(
+        root.join("horizon-resources.json"),
+        serde_json::json!({"data_version": horizon_core::version::DATA_VERSION}).to_string(),
+    )
+    .unwrap();
+    for name in [
+        "facts.json",
+        "block-tags.json",
+        "block-behaviours.json",
+        "gameplay-facts.json",
+        "items.json",
+    ] {
+        std::fs::write(root.join(name), "{}").unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn prepared_preflight_names_a_broken_json_table_link() {
     let root = std::env::temp_dir().join(format!("horizon-preflight-link-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("horizon-resources.json"), "{}").unwrap();
+    write_preflight_fixture(&root);
+    std::fs::remove_file(root.join("gameplay-facts.json")).unwrap();
     std::os::unix::fs::symlink("missing.json", root.join("gameplay-facts.json")).unwrap();
     let problem = missing_resources(&root, None);
     std::fs::remove_dir_all(&root).unwrap();
@@ -26,7 +44,7 @@ fn prepared_preflight_reports_denied_manifest_and_directory_access() {
         std::env::temp_dir().join(format!("horizon-preflight-access-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let manifest = root.join("horizon-resources.json");
-    std::fs::write(&manifest, "{}").unwrap();
+    write_preflight_fixture(&root);
     std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
     let read_denied = std::fs::read(&manifest).is_err();
     let unreadable = missing_resources(&root, None);
@@ -76,7 +94,7 @@ fn a_folder_without_prepared_files_is_named_before_loading() {
         "{missing}"
     );
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("horizon-resources.json"), "{}").unwrap();
+    write_preflight_fixture(&root);
     assert_eq!(missing_resources(&root, None), None);
 
     // A killed export leaves an empty file behind; the error names it

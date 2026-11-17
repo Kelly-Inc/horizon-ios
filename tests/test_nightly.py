@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from tests.test_ci_concurrency import yaml
 from tools.ci import nightly
 from tools.ci import nightly_set as ns
 
@@ -249,11 +250,12 @@ class MobileForkWorkflowTests(unittest.TestCase):
     def test_mobile_builds_verify_pull_requests_without_discord_delivery(self):
         ios = (WORKFLOWS / "ios.yml").read_text()
         self.assertIn("  pull_request:\n    branches: [main]", ios)
-        self.assertIn("if: github.event_name != 'pull_request' && env.DISCORD_IPA_WEBHOOK != ''", ios)
-        delivery = ios.split("      - name: Send the .ipa to Discord", 1)[1]
-        self.assertIn("continue-on-error: true", delivery)
-        self.assertIn("--connect-timeout 15 --max-time 120", delivery)
-        self.assertNotIn("::error::", delivery)
+        steps = yaml.safe_load(ios)["jobs"]["ipa"]["steps"]
+        delivery = next(step for step in steps if step.get("name") == "Send the .ipa to Discord")
+        self.assertEqual(delivery["if"], "github.event_name != 'pull_request' && env.DISCORD_IPA_WEBHOOK != ''")
+        self.assertIs(delivery["continue-on-error"], True)
+        self.assertIn("--connect-timeout 15 --max-time 120", delivery["run"])
+        self.assertNotIn("::error::", delivery["run"])
 
     def test_prepared_asset_guard_is_mandatory_before_artifact_upload(self):
         ios = (WORKFLOWS / "ios.yml").read_text()

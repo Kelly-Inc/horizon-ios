@@ -1,12 +1,15 @@
 import hashlib
 import importlib.util
 import io
+import os
 import plistlib
 import struct
+import subprocess
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from tests.test_ci_concurrency import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("ios_release", ROOT / "tools/ci/ios_release.py")
@@ -91,6 +94,50 @@ class IOSReleaseTests(unittest.TestCase):
         for run, attempt in [(0, 1), (88, 0), ("88\nkey=value", 1), ("x", 1)]:
             with self.assertRaises(ValueError):
                 release.release_version(run, attempt)
+
+    def test_release_rerun_checks_the_artifact_from_the_successful_build_attempt(self):
+        jobs = yaml.safe_load((ROOT / ".github/workflows/ios.yml").read_text())["jobs"]
+        build = jobs["ipa"]
+        self.assertEqual(build["outputs"]["build-attempt"], "${{ github.run_attempt }}")
+        self.assertEqual(build["outputs"]["artifact-id"], "${{ steps.upload-ipa.outputs.artifact-id }}")
+        upload = next(step for step in build["steps"] if step.get("id") == "upload-ipa")
+        self.assertIn("${{ github.run_attempt }}", upload["with"]["name"])
+        steps = jobs["release"]["steps"]
+        preflight = next(step for step in steps if step.get("name") == "Check the build artifact reference")
+        download = next(step for step in steps if step.get("uses", "").startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"]["artifact-ids"], "${{ needs.ipa.outputs.artifact-id }}")
+        self.assertTrue(download["with"]["merge-multiple"])
+        prepare = next(step for step in steps if step.get("id") == "asset")
+        self.assertEqual(prepare["env"]["IPA_BUILD_ATTEMPT"], "${{ needs.ipa.outputs.build-attempt }}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tools").symlink_to(ROOT / "tools", target_is_directory=True)
+            (root / "ipa-artifact").mkdir()
+            ipa = root / "ipa-artifact/Horizon-game-unsigned.ipa"
+            env = dict(os.environ, GITHUB_SHA=SHA, GITHUB_RUN_NUMBER="91", GITHUB_RUN_ATTEMPT="3",
+                       GITHUB_OUTPUT=str(root / "outputs"), IPA_ARTIFACT_ID="987654",
+                       IPA_BUILD_ATTEMPT="1")
+            for overrides in ({"IPA_ARTIFACT_ID": ""}, {"IPA_BUILD_ATTEMPT": ""},
+                              {"IPA_BUILD_ATTEMPT": "4"}):
+                result = subprocess.run(["bash", "-ec", preflight["run"]],
+                                        env=dict(env, **overrides), capture_output=True)
+                self.assertNotEqual(result.returncode, 0, overrides)
+            subprocess.run(["bash", "-ec", preflight["run"]], env=env, check=True)
+            for artifact_attempt, build_attempt, accepted in [("1", "1", True), ("3", "3", True),
+                                                               ("1", "3", False)]:
+                with self.subTest(artifact=artifact_attempt, build=build_attempt):
+                    version, number = release.release_version("91", artifact_attempt)
+                    self.archive(ipa, info={"CFBundleShortVersionString": version, "CFBundleVersion": number})
+                    result = subprocess.run(["bash", "-ec", prepare["run"]], cwd=root,
+                                            env=dict(env, IPA_BUILD_ATTEMPT=build_attempt),
+                                            capture_output=True, text=True)
+                    if accepted:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn(f"build={number}", (root / "outputs").read_text().splitlines())
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("IPA version does not match", result.stderr)
 
     def test_stamp_updates_app_and_framework_preserving_other_fields(self):
         with tempfile.TemporaryDirectory() as directory:

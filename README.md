@@ -31,7 +31,7 @@ Lighting and appearance vary with shader packs and settings.
 The deployment target is **iOS/iPadOS 16.0 or later** on ARM64 devices. That is a minimum build target, not a guarantee that every supported device can run every world or shader pack. Available memory and GPU capabilities matter.
 
 1. Check [Releases](https://github.com/heyskylo/horizon-ios/releases) for published IPAs, or open a successful run of the [iOS build workflow](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml).
-2. For a workflow build, download the **`horizon-ios-game`** artifact and extract **`Horizon-game-unsigned.ipa`**. GitHub may require sign-in to download artifacts, and older artifacts expire.
+2. For a workflow build, download the **`horizon-ios-game-<attempt>`** artifact for the build you want and extract **`Horizon-game-unsigned.ipa`**. GitHub may require sign-in to download artifacts, and older artifacts expire.
 3. Sign the IPA with your own compatible signing setup, then install it on your iPhone or iPad.
 
 ## First launch

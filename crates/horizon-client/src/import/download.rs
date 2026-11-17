@@ -5,12 +5,13 @@
 //! screen reads its progress; if it fails, the other doors are still there.
 
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -47,12 +48,50 @@ pub enum Stage {
     Installing,
 }
 
-/// A download under way. Dropping it does not stop the thread; the result is simply not read.
+/// The cache files are shared by all sources in one home. Keep the lease on
+/// the worker, including while a cancelled request is unwinding.
+static ACTIVE_DOWNLOADS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+struct DownloadLease(PathBuf);
+
+impl DownloadLease {
+    fn acquire(home: &Path) -> io::Result<Self> {
+        let home = fs::canonicalize(home)?;
+        let mut active = ACTIVE_DOWNLOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !active.insert(home.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a game-file download is still running",
+            ));
+        }
+        Ok(Self(home))
+    }
+}
+
+impl Drop for DownloadLease {
+    fn drop(&mut self) {
+        ACTIVE_DOWNLOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// A download under way. Dropping it requests cancellation without waiting on network I/O.
 pub struct Download {
     received: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
     installing: Arc<AtomicU64>,
     done: mpsc::Receiver<Result<Installed, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
 }
 
 impl Download {
@@ -60,11 +99,16 @@ impl Download {
     /// Worlds and resource packs are rejected before installation. A finished archive already in
     /// `home` (an earlier download, or `<version>.zip` copied in by hand) is installed without one.
     pub fn start(url: String, home: PathBuf) -> io::Result<Self> {
+        fs::create_dir_all(&home)?;
+        let lease = DownloadLease::acquire(&home)?;
+        let home = lease.0.clone();
         let received = Arc::new(AtomicU64::new(0));
         let total = Arc::new(AtomicU64::new(0));
         let installing = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, done) = mpsc::channel();
         let (r, t, i) = (received.clone(), total.clone(), installing.clone());
+        let stop = cancelled.clone();
         thread::Builder::new()
             .name("horizon-download".into())
             .spawn(move || {
@@ -76,9 +120,12 @@ impl Download {
                         );
                         Ok(archive)
                     }
-                    None => fetch(&url, &home, &r, &t),
+                    None => fetch_cancellable(&url, &home, &r, &t, &stop),
                 };
                 let result = archive.and_then(|archive| {
+                    if stop.load(Ordering::Acquire) {
+                        return Err("the download was cancelled".into());
+                    }
                     i.store(1, Ordering::Relaxed);
                     let downloaded = archive.file_name() == Some(DOWNLOADED.as_ref());
                     let opened = Pack::open(&archive).and_then(Pack::require_game_files);
@@ -87,13 +134,16 @@ impl Download {
                         let _ = fs::remove_file(&archive);
                     }
                     let result = opened
-                        .and_then(|pack| pack.install(&home))
+                        .and_then(|pack| {
+                            pack.install_guarded(&home, || !stop.load(Ordering::Acquire))
+                        })
                         .map_err(|e| e.to_string());
                     if downloaded && !archive.exists() {
                         let _ = fs::remove_file(home.join(DOWNLOADED_SOURCE));
                     }
                     result
                 });
+                drop(lease);
                 let _ = sender.send(result);
             })?;
         Ok(Self {
@@ -101,6 +151,7 @@ impl Download {
             total,
             installing,
             done,
+            cancelled,
         })
     }
 
@@ -210,6 +261,7 @@ const PAUSE: Duration = Duration::from_millis(10);
 
 /// What stopped one request.
 enum Stop {
+    Cancelled,
     /// The connection broke: try again from where it stopped.
     Broke(String),
     /// The server refused, or the file can't be kept: trying again won't help.
@@ -220,11 +272,12 @@ enum Stop {
 /// never taken for an archive. A connection that breaks (on a phone: the screen locked, the network
 /// changed) is picked up where it stopped with a `Range` request; the `.part` file stays between runs
 /// for the same reason.
-fn fetch(
+fn fetch_cancellable(
     url: &str,
     home: &Path,
     received: &AtomicU64,
     total: &AtomicU64,
+    cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
@@ -235,8 +288,9 @@ fn fetch(
     let archive = home.join(DOWNLOADED);
     let mut tries = 0;
     loop {
-        match fetch_once(&agent, url, &part, received, total) {
+        match fetch_once_cancellable(&agent, url, &part, received, total, cancelled) {
             Ok(()) => break,
+            Err(Stop::Cancelled) => return Err("the download was cancelled".into()),
             Err(Stop::Failed(e)) => {
                 let _ = fs::remove_file(&part);
                 let _ = fs::remove_file(home.join(PARTIAL_TAG));
@@ -254,6 +308,9 @@ fn fetch(
             }
         }
     }
+    if cancelled.load(Ordering::Acquire) {
+        return Err("the download was cancelled".into());
+    }
     // Invalidate the old cache's identity before replacing its bytes. A crash
     // between the rename and recording the new source leaves an unidentified
     // cache, never new bytes falsely labelled as an older source.
@@ -269,13 +326,17 @@ fn fetch(
 }
 
 /// One request: the rest of `part`, or all of it when there is none or the server can't send a part.
-fn fetch_once(
+fn fetch_once_cancellable(
     agent: &ureq::Agent,
     url: &str,
     part: &Path,
     received: &AtomicU64,
     total: &AtomicU64,
+    cancelled: &AtomicBool,
 ) -> Result<(), Stop> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Stop::Cancelled);
+    }
     let tag_file = part.with_file_name(PARTIAL_TAG);
     let source = source_hash(url);
     let saved = fs::read(&tag_file)
@@ -301,7 +362,11 @@ fn fetch_once(
         let _ = fs::remove_file(part);
         Stop::Broke("the server could not resume this archive; restarting".into())
     };
-    let response = match request.call() {
+    let response = request.call();
+    if cancelled.load(Ordering::Acquire) {
+        return Err(Stop::Cancelled);
+    }
+    let response = match response {
         Ok(response) => response,
         // A 416 can also mean the remote file shrank or the local part is stale.
         // It is not proof that our partial archive is complete.
@@ -397,6 +462,9 @@ fn fetch_once(
     let mut so_far = start;
     received.store(so_far, Ordering::Relaxed);
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Stop::Cancelled);
+        }
         // Stop at the size the server announced: on iOS a read past the end of a connection the server
         // closed fails ("Socket is not connected", os error 57) instead of saying the body ended.
         if size != 0 && so_far >= size {
@@ -407,7 +475,11 @@ fn fetch_once(
         } else {
             (size - so_far).min(buffer.len() as u64) as usize
         };
-        let n = match reader.read(&mut buffer[..capacity]) {
+        let next = reader.read(&mut buffer[..capacity]);
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Stop::Cancelled);
+        }
+        let n = match next {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -440,6 +512,25 @@ fn fetch_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fetch(
+        url: &str,
+        home: &Path,
+        received: &AtomicU64,
+        total: &AtomicU64,
+    ) -> Result<PathBuf, String> {
+        fetch_cancellable(url, home, received, total, &AtomicBool::new(false))
+    }
+
+    fn fetch_once(
+        agent: &ureq::Agent,
+        url: &str,
+        part: &Path,
+        received: &AtomicU64,
+        total: &AtomicU64,
+    ) -> Result<(), Stop> {
+        fetch_once_cancellable(agent, url, part, received, total, &AtomicBool::new(false))
+    }
 
     #[test]
     fn the_archive_is_named_for_the_version() {
@@ -806,6 +897,61 @@ mod tests {
             (size / 2) as u64
         );
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn dropping_a_download_keeps_its_partial_and_blocks_retry_until_the_worker_stops() {
+        let body = prepared();
+        let half = body.len() / 2;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send_tail, resume) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"one\"\r\nConnection: close\r\n\r\n",
+                body.len()
+            ).unwrap();
+            stream.write_all(&body[..half]).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            let _ = stream.write_all(&body[half..]);
+        });
+        let home = home("cancel-active");
+        let url = format!("http://{address}/game.zip");
+        let download = Download::start(url.clone(), home.clone()).unwrap();
+        for _ in 0..500 {
+            if matches!(download.stage(), Stage::Downloading { received, .. } if received == half as u64)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fs::metadata(home.join(PARTIAL)).unwrap().len(), half as u64);
+        drop(download);
+        assert!(
+            matches!(Download::start(url, home.clone()), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        send_tail.send(()).unwrap();
+        server.join().unwrap();
+        let lease = (0..500)
+            .find_map(|_| match DownloadLease::acquire(&home) {
+                Ok(lease) => Some(lease),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                Err(error) => panic!("{error}"),
+            })
+            .expect("the cancelled worker should release its cache");
+        assert_eq!(fs::metadata(home.join(PARTIAL)).unwrap().len(), half as u64);
+        assert!(home.join(PARTIAL_TAG).is_file());
+        assert!(!home.join(DOWNLOADED).exists());
+        assert!(!home.join("resources").exists());
+        drop(lease);
+        fs::remove_dir_all(home).unwrap();
     }
 
     /// ETags can collide across resources: switching URL starts a whole new download.

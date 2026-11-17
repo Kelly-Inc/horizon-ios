@@ -473,9 +473,16 @@ impl Pack {
     /// Put the archive where the game reads it, under `home` (`Documents` on a phone), and consume
     /// it: a phone does not have 589 MB to spend twice, and what arrives is a copy of something that
     /// is still on the computer that sent it.
-    pub fn install(mut self, home: &Path) -> Result<Installed> {
+    pub fn install(self, home: &Path) -> Result<Installed> {
+        self.install_guarded(home, || true)
+    }
+
+    fn install_guarded(mut self, home: &Path, wanted: impl Fn() -> bool) -> Result<Installed> {
         fs::create_dir_all(home)?;
         with_home_access(home, || {
+            if !wanted() {
+                return Err("the import was cancelled".into());
+            }
             let archive = self.path.clone();
             let folder = Path::new(self.kind.folder());
             let (path, files, bytes) = match self.kind {
@@ -516,6 +523,10 @@ impl Pack {
                     let scratch = home.join("resources.unpacking");
                     let _ = fs::remove_dir_all(&scratch);
                     let (files, bytes) = self.unpack(&scratch)?;
+                    if !wanted() {
+                        let _ = fs::remove_dir_all(&scratch);
+                        return Err("the import was cancelled".into());
+                    }
                     // Only this rename proves extraction finished. A marker inside
                     // `resources.unpacking` may have been the very first ZIP entry.
                     let staged = home.join("resources.staged");
@@ -1911,6 +1922,31 @@ mod tests {
         assert_eq!(fs::read(scratch.join("existing")).unwrap(), b"keep");
         assert!(!scratch.join("horizon-resources.json").exists());
         assert!(archive.is_file());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_prepared_import_before_publication_leaves_the_installed_files() {
+        let home = temp_home("cancelled-import");
+        let resources = home.join("resources");
+        fs::create_dir(&resources).unwrap();
+        fs::write(resources.join("horizon-resources.json"), b"installed").unwrap();
+        let archive = home.join("game.zip");
+        write_archive(&archive, PREPARED);
+        let checks = std::cell::Cell::new(0);
+        let result = Pack::open(&archive).unwrap().install_guarded(&home, || {
+            checks.set(checks.get() + 1);
+            checks.get() == 1
+        });
+        assert!(result.is_err());
+        assert_eq!(checks.get(), 2);
+        assert_eq!(
+            fs::read(resources.join("horizon-resources.json")).unwrap(),
+            b"installed"
+        );
+        assert!(archive.is_file());
+        assert!(!home.join("resources.unpacking").exists());
+        assert!(!home.join("resources.staged").exists());
         fs::remove_dir_all(home).unwrap();
     }
 

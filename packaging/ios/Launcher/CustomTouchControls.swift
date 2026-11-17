@@ -30,6 +30,7 @@ struct CustomTouchButton: Codable, Equatable, Identifiable {
         result.centre = TouchCentre(x: x / canvas.width, y: y / canvas.height)
         return result
     }
+    var hasHeldKeys: Bool { keys.contains { !TouchBinding.isActivationAction($0) } }
     var keys: [Int] {
         bindings.prefix(4).reduce(into:[]) { result, code in
             if code != 0 && TouchBinding.choices.contains(where:{$0.code == code}) && !result.contains(code) {result.append(code)}
@@ -99,6 +100,7 @@ final class CustomTouchView: UIButton {
     private let activate: (UIKeyModifierFlags) -> Void
     private var buttonHeld = false
     private var touchStarted = false
+    private var togglesHeldKeys: Bool { definition.toggle && definition.hasHeldKeys }
     init(_ definition: CustomTouchButton, activate: @escaping (UIKeyModifierFlags) -> Void = { _ in },
          send: @escaping (UUID,[Int],Bool,UIKeyModifierFlags)->Void) {
         self.definition=definition; self.send=send; self.activate=activate; super.init(frame:.zero)
@@ -117,32 +119,50 @@ final class CustomTouchView: UIButton {
         if event?.allTouches?.contains(where:{$0.type == .indirectPointer}) == true {return false}
         return super.point(inside:point,with:event)
     }
-    @objc private func down(_ sender:UIButton,event:UIEvent?){
+    private func press(_ flags: UIKeyModifierFlags) {
+        guard !buttonHeld, definition.hasHeldKeys else { return }
+        buttonHeld = true
+        send(definition.id, definition.keys, true, flags)
+    }
+
+    private func performAction(_ flags: UIKeyModifierFlags) {
+        if togglesHeldKeys && !buttonHeld {
+            press(flags)
+            isSelected = buttonHeld
+            activate(flags)
+            return
+        }
+        // One-shot actions in a chord use the held modifiers before release.
+        activate(flags)
+        release(flags)
+    }
+
+    @objc private func down(_ sender: UIButton, event: UIEvent?) {
         guard isEnabled, !isHidden else { return }
         touchStarted = true
-        if !definition.toggle {buttonHeld=true;send(definition.id,definition.keys,true,event?.modifierFlags ?? [])}
+        if !togglesHeldKeys { press(event?.modifierFlags ?? []) }
     }
-    @objc private func up(_ sender:UIButton,event:UIEvent?){
+
+    @objc private func up(_ sender: UIButton, event: UIEvent?) {
         guard touchStarted else { return }
         touchStarted = false
         let flags = event?.modifierFlags ?? []
         guard isEnabled, !isHidden else { release(flags); return }
-        if definition.toggle {
-            buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,flags)
-        } else {release(flags)}
-        activate(flags)
+        performAction(flags)
     }
+
     @objc private func outside(_ sender: UIButton, event: UIEvent?) {
         touchStarted = false
-        if !definition.toggle { release(event?.modifierFlags ?? []) }
+        if !togglesHeldKeys { release(event?.modifierFlags ?? []) }
     }
+
     override func accessibilityActivate() -> Bool {
         guard isEnabled, !isHidden else { return false }
-        if definition.toggle {buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,[])}
-        else {send(definition.id,definition.keys,true,[]);send(definition.id,definition.keys,false,[])}
-        activate([])
+        if !togglesHeldKeys { press([]) }
+        performAction([])
         return true
     }
+
     @objc private func cancelled(){release()}
     func release(_ flags: UIKeyModifierFlags = [], notify: Bool = true) {
         touchStarted = false
@@ -173,6 +193,7 @@ struct CustomTouchEditor: View {
             Toggle("Show in game",isOn:$button.inGame)
             Toggle("Show in menus",isOn:$button.inMenu)
             Toggle("Toggle instead of hold",isOn:$button.toggle)
+                .disabled(!button.hasHeldKeys)
             Text("Hold is the default. Minecraft’s own toggle settings still apply.").font(.footnote)
         }.navigationTitle("Custom button")
     }

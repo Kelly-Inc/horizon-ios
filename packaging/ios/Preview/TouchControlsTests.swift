@@ -635,6 +635,52 @@ final class TouchControlsTests: XCTestCase {
                        [[7, 1, 341], [7, 1, 86], [7, 3, 86], [7, 3, 341]])
     }
 
+    @MainActor func testOneShotOnlyButtonNeverLatchesEvenWithAnOldToggleSetting() {
+        var definition = CustomTouchButton()
+        definition.bindings = [-7, 0, 0, 0]
+        definition.toggle = true
+        var activations = 0
+        var holds = 0
+        let button = CustomTouchView(definition, activate: { _ in activations += 1 }) { _, _, _, _ in
+            holds += 1
+        }
+        button.sendActions(for: .touchDown)
+        XCTAssertEqual(activations, 0)
+        button.sendActions(for: .touchUpInside)
+        XCTAssertFalse(button.isSelected)
+        XCTAssertTrue(button.accessibilityActivate())
+        XCTAssertFalse(button.isSelected)
+        XCTAssertEqual(activations, 2)
+        XCTAssertEqual(holds, 0)
+    }
+
+    @MainActor func testOneShotActionKeepsItsChordModifiersThroughActivation() throws {
+        var definition = CustomTouchButton()
+        definition.bindings = [341, -7, 0, 0]
+        var config = TouchConfiguration()
+        config.customButtons = [definition]
+        let bridge = TouchGestureBridge(configuration: { config })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll() -> [[Double]] {
+            bridge.poll(screen: 1, flags: 0, width: 600, height: 300, scale: 1,
+                        capacity: 64, withContext: true)
+        }
+        _ = poll()
+        let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        button.sendActions(for: .touchDown)
+        button.sendActions(for: .touchUpInside)
+        let events = poll()
+        XCTAssertEqual(events.map { Array($0.prefix(3)) }, [[7, 1, 341], [7, 3, -7], [7, 3, 341]])
+        XCTAssertEqual(events.map { $0[8] }, [2, 2, 0])
+        XCTAssertEqual(bridge.customModifierBits, 0)
+
+        XCTAssertTrue(button.accessibilityActivate())
+        let accessible = poll()
+        XCTAssertEqual(accessible.map { Array($0.prefix(3)) }, events.map { Array($0.prefix(3)) })
+        XCTAssertEqual(accessible.map { $0[8] }, [2, 2, 0])
+    }
+
     @MainActor func testOneShotCustomActionsCannotFireFromCancelledOrOutsideTouches() throws {
         var definition = CustomTouchButton()
         definition.bindings = [-1, -2, -7, -8]

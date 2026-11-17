@@ -231,34 +231,46 @@ mod ios {
         idle.setAutoresizingMask(flexible());
         idle.setBackgroundColor(Some(&UIColor::blackColor()));
         view.addSubview(&idle);
-        STATE.with(|s| {
-            *s.borrow_mut() = Some(State {
-                scene: scene.retain(),
-                _window: window,
-                view: View {
-                    id: next_id(),
-                    view,
-                },
-                halves: None,
-                cover: None,
-                idle,
-                playing: false,
-                rendering: false,
-            })
+        install_state(State {
+            scene: scene.retain(),
+            _window: window,
+            view: View {
+                id: next_id(),
+                view,
+            },
+            halves: None,
+            cover: None,
+            idle,
+            playing: false,
+            rendering: false,
         });
     }
 
+    fn remove_cover(state: Option<State>) {
+        if let Some(cover) = state.and_then(|state| state.cover) {
+            cover.view.removeFromSuperview();
+        }
+    }
+
+    fn install_state(state: State) {
+        let previous = STATE.with(|slot| slot.borrow_mut().replace(state));
+        // A new scene can connect before the old scene's disconnect arrives.
+        // The phone window still retains the old cover until it is removed.
+        remove_cover(previous);
+    }
+
     fn disconnect(scene: &UIScene) {
-        STATE.with(|s| {
+        let disconnected = STATE.with(|s| {
             let mut state = s.borrow_mut();
             if state.as_ref().is_some_and(|st| {
                 std::ptr::eq(&*st.scene as *const UIWindowScene as *const UIScene, scene)
-            }) && let Some(st) = state.take()
-                && let Some(cover) = st.cover
-            {
-                cover.view.removeFromSuperview();
+            }) {
+                state.take()
+            } else {
+                None
             }
         });
+        remove_cover(disconnected);
     }
 
     /// The phone's own window: the one in the scene with the application role.

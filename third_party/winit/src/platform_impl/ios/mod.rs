@@ -3,6 +3,7 @@
 mod app_state;
 mod display_link;
 mod event_loop;
+mod gesture_delta;
 mod hardware_keyboard;
 mod hardware_mouse;
 mod monitor;

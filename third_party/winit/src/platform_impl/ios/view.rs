@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
-use objc2_foundation::{CGFloat, CGPoint, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
+use objc2_foundation::{CGFloat, CGRect, MainThreadMarker, NSObject, NSSet, NSString};
 use objc2_ui_kit::{
     UICoordinateSpace, UIEvent, UIForceTouchCapability, UIGestureRecognizer,
     UIGestureRecognizerDelegate, UIGestureRecognizerState, UIHoverGestureRecognizer, UIKeyInput,
@@ -15,6 +15,7 @@ use objc2_ui_kit::{
 };
 
 use super::app_state::{self, EventWrapper};
+use super::gesture_delta::GestureDelta;
 use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
 use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
@@ -31,14 +32,23 @@ pub struct WinitViewState {
     rotation_gesture_recognizer: RefCell<Option<Retained<UIRotationGestureRecognizer>>>,
     pan_gesture_recognizer: RefCell<Option<Retained<UIPanGestureRecognizer>>>,
 
-    // for iOS delta references the start of the Gesture
-    rotation_last_delta: Cell<CGFloat>,
-    pinch_last_delta: Cell<CGFloat>,
-    pan_last_delta: Cell<CGPoint>,
+    rotation_delta: GestureDelta<1>,
+    pinch_delta: GestureDelta<1>,
+    pan_delta: GestureDelta<2>,
     ime_allowed: Cell<bool>,
     hidden_input: Retained<UIView>,
     held_keys: RefCell<HashMap<usize, KeyEvent>>,
     mouse: super::hardware_mouse::Mouse,
+}
+
+fn gesture_phase(state: UIGestureRecognizerState) -> Option<TouchPhase> {
+    Some(match state {
+        UIGestureRecognizerState::Began => TouchPhase::Started,
+        UIGestureRecognizerState::Changed => TouchPhase::Moved,
+        UIGestureRecognizerState::Ended => TouchPhase::Ended,
+        UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => TouchPhase::Cancelled,
+        _ => return None,
+    })
 }
 
 declare_class!(
@@ -176,32 +186,14 @@ declare_class!(
         fn pinch_gesture(&self, recognizer: &UIPinchGestureRecognizer) {
             let Some(window) = self.window() else { return };
 
-            let (phase, delta) = match recognizer.state() {
-                UIGestureRecognizerState::Began => {
-                    self.ivars().pinch_last_delta.set(recognizer.scale());
-                    (TouchPhase::Started, 0.0)
-                }
-                UIGestureRecognizerState::Changed => {
-                    let last_scale: f64 = self.ivars().pinch_last_delta.replace(recognizer.scale());
-                    (TouchPhase::Moved, recognizer.scale() - last_scale)
-                }
-                UIGestureRecognizerState::Ended => {
-                    let last_scale: f64 = self.ivars().pinch_last_delta.replace(0.0);
-                    (TouchPhase::Moved, recognizer.scale() - last_scale)
-                }
-                UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
-                    self.ivars().rotation_last_delta.set(0.0);
-                    // Pass -delta so that action is reversed
-                    (TouchPhase::Cancelled, -recognizer.scale())
-                }
-                state => panic!("unexpected recognizer state: {state:?}"),
-            };
+            let Some(phase) = gesture_phase(recognizer.state()) else { return };
+            let Some([delta]) = self.ivars().pinch_delta.update(phase, [recognizer.scale()]) else { return };
 
             let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
                 window_id: RootWindowId(window.id()),
                 event: WindowEvent::PinchGesture {
                     device_id: DEVICE_ID,
-                    delta: delta as f64,
+                    delta,
                     phase,
                 },
             });
@@ -231,30 +223,8 @@ declare_class!(
         fn rotation_gesture(&self, recognizer: &UIRotationGestureRecognizer) {
             let Some(window) = self.window() else { return };
 
-            let (phase, delta) = match recognizer.state() {
-                UIGestureRecognizerState::Began => {
-                    self.ivars().rotation_last_delta.set(0.0);
-
-                    (TouchPhase::Started, 0.0)
-                }
-                UIGestureRecognizerState::Changed => {
-                    let last_rotation = self.ivars().rotation_last_delta.replace(recognizer.rotation());
-
-                    (TouchPhase::Moved, recognizer.rotation() - last_rotation)
-                }
-                UIGestureRecognizerState::Ended => {
-                    let last_rotation = self.ivars().rotation_last_delta.replace(0.0);
-
-                    (TouchPhase::Ended, recognizer.rotation() - last_rotation)
-                }
-                UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
-                    self.ivars().rotation_last_delta.set(0.0);
-
-                    // Pass -delta so that action is reversed
-                    (TouchPhase::Cancelled, -recognizer.rotation())
-                }
-                state => panic!("unexpected recognizer state: {state:?}"),
-            };
+            let Some(phase) = gesture_phase(recognizer.state()) else { return };
+            let Some([delta]) = self.ivars().rotation_delta.update(phase, [recognizer.rotation()]) else { return };
 
             // Make delta negative to match macos, convert to degrees
             let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
@@ -276,37 +246,8 @@ declare_class!(
 
             let translation = recognizer.translationInView(Some(self));
 
-            let (phase, dx, dy) = match recognizer.state() {
-                UIGestureRecognizerState::Began => {
-                    self.ivars().pan_last_delta.set(translation);
-
-                    (TouchPhase::Started, 0.0, 0.0)
-                }
-                UIGestureRecognizerState::Changed => {
-                    let last_pan: CGPoint = self.ivars().pan_last_delta.replace(translation);
-
-                    let dx = translation.x - last_pan.x;
-                    let dy = translation.y - last_pan.y;
-
-                    (TouchPhase::Moved, dx, dy)
-                }
-                UIGestureRecognizerState::Ended => {
-                    let last_pan: CGPoint = self.ivars().pan_last_delta.replace(CGPoint{x:0.0, y:0.0});
-
-                    let dx = translation.x - last_pan.x;
-                    let dy = translation.y - last_pan.y;
-
-                    (TouchPhase::Ended, dx, dy)
-                }
-                UIGestureRecognizerState::Cancelled | UIGestureRecognizerState::Failed => {
-                    let last_pan: CGPoint = self.ivars().pan_last_delta.replace(CGPoint{x:0.0, y:0.0});
-
-                    // Pass -delta so that action is reversed
-                    (TouchPhase::Cancelled, -last_pan.x, -last_pan.y)
-                }
-                state => panic!("unexpected recognizer state: {state:?}"),
-            };
-
+            let Some(phase) = gesture_phase(recognizer.state()) else { return };
+            let Some([dx, dy]) = self.ivars().pan_delta.update(phase, [translation.x, translation.y]) else { return };
 
             let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
                 window_id: RootWindowId(window.id()),
@@ -330,7 +271,13 @@ declare_class!(
         #[method(didMoveToWindow)]
         fn did_move_to_window(&self) {
             let _: () = unsafe { msg_send![super(self), didMoveToWindow] };
-            if self.window().is_some() { unsafe { self.becomeFirstResponder(); } }
+            if self.window().is_some() {
+                unsafe { self.becomeFirstResponder(); }
+            } else {
+                self.ivars().pinch_delta.reset();
+                self.ivars().rotation_delta.reset();
+                self.ivars().pan_delta.reset();
+            }
         }
 
         #[method(resignFirstResponder)]
@@ -420,9 +367,9 @@ impl WinitView {
             rotation_gesture_recognizer: RefCell::new(None),
             pan_gesture_recognizer: RefCell::new(None),
 
-            rotation_last_delta: Cell::new(0.0),
-            pinch_last_delta: Cell::new(0.0),
-            pan_last_delta: Cell::new(CGPoint { x: 0.0, y: 0.0 }),
+            rotation_delta: GestureDelta::default(),
+            pinch_delta: GestureDelta::default(),
+            pan_delta: GestureDelta::default(),
             ime_allowed: Cell::new(false),
             hidden_input: unsafe { UIView::new(mtm) },
             held_keys: RefCell::new(HashMap::new()),

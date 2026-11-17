@@ -9,7 +9,7 @@ Upstream revision: `e9809ef54b18499bb4f2cac945719ecc2a61061b`.
 The upstream Apache-2.0 license and copyright notices are retained in LICENSE.
 
 The patch is confined to Cargo.toml (UIKit binding features), src/lib.rs (host mapping and refresh-policy tests), src/platform/ios.rs (refresh hints),
-and src/platform_impl/ios/{mod,app_state,display_link,display_link_policy,view,view_controller,window,event_loop,scene,hardware_keyboard,hardware_mouse}.rs.
+and src/platform_impl/ios/{mod,app_state,display_link,display_link_policy,gesture_delta,view,view_controller,window,event_loop,scene,hardware_keyboard,hardware_mouse}.rs.
 `src/event.rs` also provides the iOS-only virtual-key constructor described below. All other files are the unmodified published crate. Root Cargo.toml patches crates.io so local
 and CI builds use the same input backend; Cargo.lock removes only winit's registry source/checksum.
 

@@ -4889,6 +4889,11 @@ impl Renderer {
         if self.offscreen.is_some() {
             return Ok(());
         }
+        if target.is_some()
+            && !drawable_size(width, height, self.device.limits().max_texture_dimension_2d)
+        {
+            return Err(format!("external display size {width}x{height} is unsupported").into());
+        }
         self.spare_surface
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4913,6 +4918,9 @@ impl Renderer {
         }
         // Configures the surface at the new size.
         self.resize(width, height);
+        if self.target.is_some() && self.surface_unconfigured {
+            return Err("could not configure the external display surface".into());
+        }
         Ok(())
     }
     /// It draws on a `set_target` display rather than the window.
@@ -6236,23 +6244,25 @@ impl Renderer {
         }
         Ok(())
     }
-    /// Configures the window surface again. One that fails is still the one
-    /// wgpu configured before, which acquisition reports as a validation error.
+    /// Configures the window surface again. A failure leaves acquisition
+    /// suspended until configuration succeeds.
     fn configure_surface(&mut self) {
         self.frame_gen.stop_to_configure();
         // The submit thread may still present to the old swapchain.
         self.queue.wait();
-        if let Some(surface) = &self.surface
-            && let Err(e) = Self::configure(
+        if let Some(surface) = &self.surface {
+            let configured = Self::configure(
                 &self.device,
                 surface,
                 &self.surface_config(),
                 self.hdr.as_ref(),
                 &self.device_lost,
-            )
-        {
-            log::warn!("Horizon renderer: the window surface did not configure ({e})");
-            self.frame_gen.refused = true;
+            );
+            self.surface_unconfigured = configured.is_err();
+            if let Err(error) = configured {
+                log::warn!("Horizon renderer: the window surface did not configure ({error})");
+                self.frame_gen.refused = true;
+            }
         }
     }
     /// HDR calibration's test picture (`crate::hdr_calibration`) while it runs, else None.

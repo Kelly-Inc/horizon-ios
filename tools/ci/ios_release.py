@@ -55,7 +55,7 @@ def unsigned_macho(stream):
     if magic in OTHER_MACHO:
         raise ValueError("Expected a thin ARM64 iOS binary")
     if magic != MACHO64:
-        return False
+        return None
     header = magic + stream.read(28)
     if len(header) != 32:
         raise ValueError("Truncated Mach-O header")
@@ -66,7 +66,7 @@ def unsigned_macho(stream):
     if len(commands) != size:
         raise ValueError("Truncated Mach-O load commands")
     offset = 0
-    ios_device = False
+    minimum = None
     for _ in range(count):
         if offset + 8 > size:
             raise ValueError("Invalid Mach-O command count")
@@ -78,53 +78,81 @@ def unsigned_macho(stream):
         if command == 0x32:  # LC_BUILD_VERSION: arm64 is shared by devices, simulators and Macs.
             if length < 24:
                 raise ValueError("Invalid Mach-O build-version command")
-            platform, _, _, tools = struct.unpack_from("<IIII", commands, offset + 8)
+            platform, required, _, tools = struct.unpack_from("<IIII", commands, offset + 8)
             if 24 + tools * 8 > length:
                 raise ValueError("Truncated Mach-O build-version tools")
             if platform != 2:  # PLATFORM_IOS, not PLATFORM_IOSSIMULATOR (7).
                 raise ValueError("Expected an iOS device Mach-O platform")
-            ios_device = True
+            minimum = max(minimum or 0, required)
         elif command == 0x25:  # LC_VERSION_MIN_IPHONEOS, emitted by older device toolchains.
             if length < 16:
                 raise ValueError("Invalid iOS device minimum-version command")
-            ios_device = True
+            required, = struct.unpack_from("<I", commands, offset + 8)
+            minimum = max(minimum or 0, required)
         elif command in (0x24, 0x2F, 0x30):  # macOS, tvOS and watchOS legacy minimum versions.
             raise ValueError("Expected an iOS device Mach-O platform")
         offset += length
     if offset != size:
         raise ValueError("Unexpected Mach-O load-command data")
-    if not ios_device:
+    if minimum is None:
         raise ValueError("Missing iOS device Mach-O build target")
-    return file_type
+    return file_type, (minimum >> 16, (minimum >> 8) & 0xff, minimum & 0xff)
+
+
+def minimum_os(info):
+    if "MinimumOSVersion" not in info:
+        return None
+    value = info["MinimumOSVersion"]
+    if not isinstance(value, str) or not VERSION.fullmatch(value):
+        raise ValueError("Invalid bundle MinimumOSVersion")
+    components = tuple(map(int, value.split(".")))
+    return components + (0,) * (3 - len(components))
+
+
+def bundle_executable(bundle, info, binaries, file_type, label):
+    executable = info.get("CFBundleExecutable")
+    if (not isinstance(executable, str) or not executable or "/" in executable
+            or "\\" in executable or executable in (".", "..")):
+        raise ValueError(f"Invalid {label} executable name")
+    binary = binaries.get(bundle / executable)
+    if binary is None or binary[0] != file_type:
+        raise ValueError(f"Missing unsigned ARM64 {label} executable")
+    return binary[1]
 
 
 def audit(ipa, expected_commit=None):
     with zipfile.ZipFile(ipa) as archive:
-        names = archive.namelist()
-        if len(names) != len(set(names)):
-            raise ValueError("Duplicate IPA entries")
+        paths = set()
         binaries = {}
         infos = []
-        frameworks = []
+        framework_paths = set()
+        frameworks = {}
         for entry in archive.infolist():
             path = PurePosixPath(entry.filename)
             parts = {p.lower() for p in path.parts}
             name = path.name.lower()
             if (path.is_absolute() or ".." in parts or "\\" in entry.filename
-                    or not path.parts or path.parts[0] != "Payload"):
+                    or not path.parts or path.parts[0] != "Payload"
+                    or entry.orig_filename != path.as_posix() + ("/" if entry.is_dir() else "")):
                 raise ValueError("Unexpected IPA path")
+            if path in paths:
+                raise ValueError("Duplicate IPA entries")
+            paths.add(path)
             if (name in PRIVATE_NAMES or path.suffix.lower() in PRIVATE_SUFFIXES
                     or name.startswith(".env")
                     or parts & {"_codesignature", "xcuserdata", "saves", "logs"}):
                 raise ValueError("The IPA contains signing material, private files or game assets")
             if stat.S_ISLNK(entry.external_attr >> 16):
                 raise ValueError("The IPA contains a symbolic link")
+            for component in (path, *path.parents):
+                if component.suffix == ".framework":
+                    framework_paths.add(component)
             if entry.is_dir():
                 continue
             with archive.open(entry) as stream:
-                kind = unsigned_macho(stream)
-                if kind:
-                    binaries[entry.filename] = kind
+                binary = unsigned_macho(stream)
+                if binary is not None:
+                    binaries[path] = binary
             if len(path.parts) == 3 and path.parts[1].endswith(".app") and name == "info.plist":
                 if entry.file_size > 1 << 20:
                     raise ValueError("Oversized app Info.plist")
@@ -132,7 +160,7 @@ def audit(ipa, expected_commit=None):
             if name == "info.plist" and path.parent.suffix == ".framework":
                 if entry.file_size > 1 << 20:
                     raise ValueError("Oversized framework Info.plist")
-                frameworks.append(plistlib.loads(archive.read(entry)))
+                frameworks[path.parent] = plistlib.loads(archive.read(entry))
         if archive.testzip() is not None:
             raise ValueError("The IPA contains a corrupt ZIP entry")
         if len(infos) != 1:
@@ -144,15 +172,26 @@ def audit(ipa, expected_commit=None):
         platforms = info.get("CFBundleSupportedPlatforms")
         if platforms is not None and platforms != ["iPhoneOS"]:
             raise ValueError("Expected a device IPA, not a simulator app")
-        executable = info.get("CFBundleExecutable", "")
-        if not isinstance(executable, str) or "/" in executable or binaries.get(str(app / executable)) != 2:
-            raise ValueError("Missing unsigned ARM64 app executable")
+        app_minimum = minimum_os(info)
+        required = bundle_executable(app, info, binaries, 2, "app")
+        if app_minimum is not None and required > app_minimum:
+            raise ValueError("App executable requires a newer iOS version than MinimumOSVersion")
         version, build = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
         if not all(isinstance(v, str) and VERSION.fullmatch(v) for v in (version, build)):
             raise ValueError("Invalid app version or build number")
-        for framework in frameworks:
+        if framework_paths != frameworks.keys():
+            raise ValueError("Missing framework Info.plist")
+        for bundle, framework in frameworks.items():
             if (framework.get("CFBundleShortVersionString"), framework.get("CFBundleVersion")) != (version, build):
                 raise ValueError("Framework version does not match the app")
+            if framework.get("CFBundleSupportedPlatforms", ["iPhoneOS"]) != ["iPhoneOS"]:
+                raise ValueError("Expected an iOS device framework")
+            framework_minimum = minimum_os(framework)
+            required = bundle_executable(bundle, framework, binaries, 6, "framework")
+            if framework_minimum is not None and required > framework_minimum:
+                raise ValueError("Framework executable requires a newer iOS version than MinimumOSVersion")
+            if app_minimum is not None and max(required, framework_minimum or required) > app_minimum:
+                raise ValueError("Framework requires a newer iOS version than the app")
         if expected_commit is not None:
             if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
                 raise ValueError("Invalid source commit")

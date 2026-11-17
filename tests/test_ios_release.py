@@ -15,13 +15,13 @@ spec.loader.exec_module(release)
 SHA = "a" * 40
 
 
-def binary(signed=False, platform=2, legacy=False, file_type=2):
+def binary(signed=False, platform=2, legacy=False, file_type=2, minimum=0x100000):
     if platform is None:
         commands = b""
     elif legacy:
-        commands = struct.pack("<IIII", 0x25, 16, 0x100000, 0x1B0000)
+        commands = struct.pack("<IIII", 0x25, 16, minimum, 0x1B0000)
     else:
-        commands = struct.pack("<IIIIII", 0x32, 24, platform, 0x100000, 0x1B0000, 0)
+        commands = struct.pack("<IIIIII", 0x32, 24, platform, minimum, 0x1B0000, 0)
     count = int(platform is not None)
     if signed:
         commands += struct.pack("<IIII", 0x1D, 16, 48, 8)
@@ -115,6 +115,49 @@ class IOSReleaseTests(unittest.TestCase):
             self.archive(ipa, {"Payload/Horizon.app/Frameworks/Launcher.framework/Info.plist":
                               plistlib.dumps({"CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "1"})})
             with self.assertRaisesRegex(ValueError, "Framework version"):
+                release.audit(ipa, SHA)
+
+    def test_framework_plist_must_describe_an_embedded_dylib(self):
+        root = "Payload/Horizon.app/Frameworks/Launcher.framework"
+        info = plistlib.dumps({"CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "42.2",
+                               "CFBundleExecutable": "Launcher"})
+        for files, error in [
+            ({f"{root}/Launcher": binary(file_type=6)}, "Missing framework Info.plist"),
+            ({f"{root}/Info.plist": info}, "Missing unsigned ARM64 framework executable"),
+            ({f"{root}/Info.plist": info, f"{root}/Launcher": binary()}, "framework executable"),
+            ({f"{root}/Info.plist": info, f"{root}/Launcher": binary(file_type=6)}, None),
+        ]:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                ipa = Path(directory) / "framework.ipa"
+                self.archive(ipa, files)
+                if error is None:
+                    self.assertEqual(release.audit(ipa, SHA), ("0.1.0", "42.2"))
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        release.audit(ipa, SHA)
+
+    def test_bundle_cannot_advertise_older_ios_than_its_code_requires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "minimum.ipa"
+            for legacy in (False, True):
+                self.archive(ipa, info={"MinimumOSVersion": "16.0"},
+                             executable=binary(legacy=legacy, minimum=0x110000))
+                with self.assertRaisesRegex(ValueError, "App executable requires a newer iOS"):
+                    release.audit(ipa, SHA)
+            root = "Payload/Horizon.app/Frameworks/Launcher.framework"
+            framework = {"CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "42.2",
+                         "CFBundleExecutable": "Launcher", "MinimumOSVersion": "17.0"}
+            self.archive(ipa, {f"{root}/Info.plist": plistlib.dumps(framework),
+                               f"{root}/Launcher": binary(file_type=6, minimum=0x110000)},
+                         info={"MinimumOSVersion": "16.0"})
+            with self.assertRaisesRegex(ValueError, "Framework requires a newer iOS"):
+                release.audit(ipa, SHA)
+
+    def test_rejects_noncanonical_zip_member_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "aliased.ipa"
+            self.archive(ipa, {"Payload/Horizon.app/./Horizon": binary()})
+            with self.assertRaisesRegex(ValueError, "Unexpected IPA path"):
                 release.audit(ipa, SHA)
 
     def test_real_metadata_names_and_checksum_are_preserved(self):

@@ -321,6 +321,41 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertTrue(holds.modifiers.isEmpty)
     }
 
+    @MainActor func testCoveringTheGameClearsLatchedInputBeforeTheSameScreenResumes() throws {
+        var definition = CustomTouchButton()
+        definition.bindings = [340, 0, 0, 0]
+        definition.toggle = true
+        var config = TouchConfiguration()
+        config.customButtons = [definition]
+        let bridge = TouchGestureBridge(configuration: { config })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll(flags: UInt32 = 0, capacity: Int = 64) -> [[Double]] {
+            bridge.poll(screen: 1, flags: flags, width: 600, height: 300, scale: 1,
+                        capacity: capacity, withContext: true)
+        }
+        _ = poll()
+        let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        button.sendActions(for: .touchUpInside)
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 1, 340]])
+        XCTAssertEqual(bridge.customModifierBits, 1)
+
+        bridge.inputContext = 99
+        bridge.suspend()
+        XCTAssertTrue(button.isHidden)
+        XCTAssertFalse(button.isSelected)
+        XCTAssertEqual(bridge.customModifierBits, 0)
+        XCTAssertTrue(poll(flags: 2).isEmpty)
+        XCTAssertTrue(poll(capacity: 0).isEmpty)
+        XCTAssertFalse(button.isHidden)
+
+        button.sendActions(for: .touchUpInside)
+        let events = poll()
+        XCTAssertEqual(events.map { Array($0.prefix(3)) }, [[0, 4, 0], [7, 1, 340]])
+        XCTAssertEqual(Array(events.first?.dropFirst(6) ?? []).prefix(2), [0, 0])
+        XCTAssertTrue(poll().isEmpty)
+    }
+
     @MainActor func testOneShotCustomActionsCannotFireFromCancelledOrOutsideTouches() throws {
         var definition = CustomTouchButton()
         definition.bindings = [-1, -2, -7, -8]

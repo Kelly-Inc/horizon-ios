@@ -518,6 +518,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private var gui = CGSize.zero
     private var guiScale: Double = 1
     private var pending: [(Double, [Double], UInt64, UInt32, UInt64)] = []
+    private var needsCancelOnResume = false
     var inputContext: UInt64 = 0
     private var primaryTouch: UITouch?
     private var hotbarTouch: UITouch?
@@ -539,7 +540,8 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
 
     func attach(to view: UIView) {
         guard surface !== view else { return }
-        for button in customViews.values {button.release();button.removeFromSuperview()}
+        if !recognizers.isEmpty { suspend() }
+        for button in customViews.values { button.removeFromSuperview() }
         customViews.removeAll()
         if let surface { for recognizer in recognizers { surface.removeGestureRecognizer(recognizer) } }
         surface = view
@@ -564,21 +566,51 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         scroll.cancelsTouchesInView = true
     }
 
+    /// Launcher presentation can suspend engine frames before it polls the
+    /// native controls again. Clear UIKit ownership now and reset the engine
+    /// ledger ahead of the first new gesture when frames resume.
+    func suspend() {
+        active = false
+        for button in customViews.values { button.isHidden = true }
+        discardInput()
+        needsCancelOnResume = true
+    }
+
+    private func discardInput() {
+        for button in customViews.values { button.release() }
+        pending.removeAll()
+        primaryTouch = nil
+        hotbarTouch = nil
+        hotbarSlot = -1
+        suppressTap = false
+    }
+
     func poll(screen: UInt64, flags: UInt32, width: Double, height: Double, scale: Double, capacity: Int, withContext: Bool = false) -> [[Double]] {
         if flags & 4 != 0 {
-            for button in customViews.values {button.release()}
-            pending.removeAll();return []
+            discardInput()
+            return []
         }
         hotbarHold?.minimumPressDuration = configuration().holdDuration
         let enabled = flags & 2 == 0
-        if self.screen != screen || active != enabled { for button in customViews.values {button.release()}; pending.removeAll(); hotbarSlot = -1; suppressTap = false }
+        if !enabled, active {
+            suspend()
+        } else if self.screen != screen || active != enabled {
+            discardInput()
+        }
         self.screen = screen; active = enabled; playing = flags & 1 != 0
         noWorld = flags & 8 != 0
         controlsHidden = flags & 16 != 0; moreOpen = flags & 32 != 0
         closeShown = flags & 64 != 0; keyboardShown = flags & 128 != 0; hideCustomPaint = flags & 256 != 0
         gui = CGSize(width: width, height: height); guiScale = max(1, scale)
         updateCustomControls()
+        guard enabled else { return [] }
         let now = ProcessInfo.processInfo.systemUptime
+        if needsCancelOnResume {
+            // Context zero makes this a reset even if the last rendered
+            // menu's click context was evicted while the launcher was open.
+            pending.insert((now, [0, 4, 0, 0, -1], 0, 0, 0), at: 0)
+            needsCancelOnResume = false
+        }
         let count = min(max(0, capacity), pending.count)
         let output = pending.prefix(count).map { timestamp, values, context, modifiers, touch in
             values + [max(0, now - timestamp)] + (withContext

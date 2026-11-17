@@ -60,6 +60,7 @@ private func present(attempts: Int) {
             _ = await Bridge.send("launcher-visible false")
             return
         }
+        TouchGestureBridge.shared.suspend()
         root.present(host, animated: false) {
             presentationPending = false
             turn(host.view.window?.windowScene, to: UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait)

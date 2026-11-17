@@ -1862,6 +1862,15 @@ impl Game<'_> {
             (f64::from(batch.width), f64::from(batch.height)),
             f64::from(batch.scale),
         );
+        // A reset at the head of the queue invalidates deferred presses from
+        // before the launcher took over, even if the logical screen is unchanged.
+        let reset_first = events.first().is_some_and(|event| event.kind == 0);
+        if reset_first {
+            self.touch_cursor_reset();
+            self.touch_cursor_flush(event_loop);
+            self.touch_native_reset();
+            self.touch.native_screen = Some(screen);
+        }
         let now = self.touch_now();
         let (due, later) = std::mem::take(&mut self.touch.native_pending)
             .into_iter()
@@ -1872,7 +1881,7 @@ impl Game<'_> {
         for (input, _, _) in due {
             self.touch_native_input(event_loop, input);
         }
-        for event in events {
+        for event in events.into_iter().skip(usize::from(reset_first)) {
             if self.key_screen() != screen {
                 self.touch_native_reset();
                 break;

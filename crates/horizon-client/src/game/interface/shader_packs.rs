@@ -11,7 +11,7 @@ use horizon_client::shader_options::ShaderOptions;
 use horizon_client::text::Text;
 use horizon_shaders::{BlockIds, Macros, Pack, Properties, dimension_folder_named, load_post};
 
-use super::native_shaders::{fingerprint, outcome, refused, remember};
+use super::native_shaders::{fingerprint, outcome, remember};
 use super::{Dim, Game};
 use horizon_client_render::render_geometry::EntitySpan;
 use std::cell::{Cell, RefCell};
@@ -750,22 +750,29 @@ impl Game<'_> {
         };
         let native = (dev_pack().is_none() && selected.starts_with("horizon:"))
             || horizon_shader_api::package::is_pack(&path);
-        let stamp = if native { None } else { fingerprint(&path) };
         if native {
             // One of Horizon's own packs (game/modding/native_shaders.rs).
             self.tick_native_shader_pack(&path);
         } else if let Some(renderer) = &mut self.renderer
-            && !refused(&path, stamp)
+            && let Some(stamp) = self.native_shaders.check_classic_source(
+                &path,
+                renderer.shader_pack_dimension() == Some(dimension),
+                parser_busy(),
+            )
         {
+            // A changed source can recover from a refusal that marked this
+            // dimension loaded without an active shader.
+            if renderer.shader_pack_dimension() == Some(dimension) {
+                renderer.drop_shader_packs();
+                self.native_shaders.classic_source = None;
+                self.pack_ids = None;
+            }
             // Lava uses the solid terrain program. Supply its sprite layers before
             // taking the renderer inputs handed to the background source parser.
             renderer.set_pack_lava_layers(
-                ["lava_still", "lava_flow"]
-                    .iter()
-                    .filter_map(|f| {
-                        let name = format!("minecraft:block/{f}");
-                        self.pack.render.sprite_layers.get(&name).map(|&l| l as u16)
-                    })
+                ["minecraft:block/lava_still", "minecraft:block/lava_flow"]
+                    .into_iter()
+                    .filter_map(|f| self.pack.render.sprite_layers.get(f).map(|&l| l as u16))
                     .collect(),
             );
             let key = LoadKey {
@@ -847,6 +854,7 @@ impl Game<'_> {
                             )
                         } else {
                             self.pack_ids = None;
+                            self.native_shaders.classic_source = None;
                             let _ = renderer.set_shader_pack(dimension, None, &[]);
                             true
                         };
@@ -855,7 +863,7 @@ impl Game<'_> {
                         }
                     }
                 }
-            } else if renderer.shader_pack_dimension() != Some(dimension) && !parser_busy() {
+            } else {
                 let inputs = renderer.pack_inputs();
                 let mut macros = Macros::standard();
                 renderer.define_pack_macros(&mut macros);

@@ -55,7 +55,7 @@ pub(super) fn remember_look(
     remember(path, stamp, taken || (running && !manifest_refused));
 }
 
-pub(super) fn refused(path: &Path, stamp: Option<u64>) -> bool {
+fn refused(path: &Path, stamp: Option<u64>) -> bool {
     OUTCOMES.with_borrow(|packs| packs.get(path) == Some(&(stamp, false)))
 }
 
@@ -65,6 +65,7 @@ pub(super) struct NativeShaders {
     pub picked: String,
     /// The classic shader bytes handed to the current renderer generation.
     pub classic_source: Option<(PathBuf, Option<u64>)>,
+    classic_refusal_checked_at: Option<Instant>,
     /// The pack's files when it was last read (`fingerprint`).
     stamp: Option<u64>,
     looked: Option<Instant>,
@@ -121,8 +122,46 @@ impl NativeShaders {
     pub fn select(&mut self, name: &str) {
         self.picked = name.to_owned();
         self.classic_source = None;
+        self.classic_refusal_checked_at = None;
         self.stamp = None;
         self.looked = None;
+    }
+
+    /// Checks source bytes at load boundaries. A refused pack still selected by the
+    /// player gets a periodic check so it can recover when its files are replaced.
+    pub fn check_classic_source(
+        &mut self,
+        path: &Path,
+        dimension_loaded: bool,
+        parser_busy: bool,
+    ) -> Option<Option<u64>> {
+        if parser_busy {
+            return None;
+        }
+        let was_refused = outcome(path) == Some(false);
+        if was_refused {
+            let now = Instant::now();
+            if self
+                .classic_refusal_checked_at
+                .is_some_and(|last| now.duration_since(last) < LOOK_EVERY)
+            {
+                return None;
+            }
+            self.classic_refusal_checked_at = Some(now);
+        } else {
+            self.classic_refusal_checked_at = None;
+            if dimension_loaded {
+                return None;
+            }
+        }
+        let stamp = fingerprint(path);
+        if refused(path, stamp) {
+            return None;
+        }
+        if was_refused {
+            OUTCOMES.with_borrow_mut(|packs| packs.remove(path));
+        }
+        Some(stamp)
     }
 
     pub fn picking(name: &str) -> Self {
@@ -396,6 +435,48 @@ mod tests {
         remember(&root, fingerprint(&root), true);
         assert_eq!(outcome(&root), Some(true));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn classic_source_checks_only_at_load_boundaries_and_retries_changed_refusals() {
+        use super::{LOOK_EVERY, NativeShaders, fingerprint, outcome, remember};
+        use std::time::Instant;
+
+        let pack =
+            std::env::temp_dir().join(format!("horizon-classic-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&pack).unwrap();
+        let file = pack.join("shader.fsh");
+        std::fs::write(&file, "original").unwrap();
+        let original = fingerprint(&pack);
+        assert!(original.is_some());
+        let mut state = NativeShaders::default();
+
+        assert_eq!(state.check_classic_source(&pack, false, true), None);
+        assert_eq!(
+            state.check_classic_source(&pack, false, false),
+            Some(original)
+        );
+        remember(&pack, original, true);
+        assert_eq!(state.check_classic_source(&pack, true, false), None);
+
+        remember(&pack, original, false);
+        assert_eq!(state.check_classic_source(&pack, true, false), None);
+        let checked_at = state.classic_refusal_checked_at;
+        assert!(checked_at.is_some());
+        std::fs::write(&file, "a repaired source with a different size").unwrap();
+        assert_eq!(state.check_classic_source(&pack, true, true), None);
+        assert_eq!(state.classic_refusal_checked_at, checked_at);
+
+        state.classic_refusal_checked_at = Some(Instant::now() - LOOK_EVERY);
+        let replacement = fingerprint(&pack);
+        assert_ne!(replacement, original);
+        assert_eq!(
+            state.check_classic_source(&pack, true, false),
+            Some(replacement)
+        );
+        assert_eq!(outcome(&pack), None);
+        assert_eq!(state.check_classic_source(&pack, true, false), None);
+        std::fs::remove_dir_all(pack).unwrap();
     }
 
     fn manifest(extra: &str) -> Manifest {

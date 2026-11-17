@@ -2,10 +2,9 @@
 //! the ring/silent switch on as a game the player opened to play should be, mixed with whatever else is playing
 //! rather than stopping it. iOS's default (solo ambient) would go silent with the switch.
 //!
-//! shortcut: no interruption observer, so after a phone call the session stays inactive until the next start;
-//! add `AVAudioSessionInterruptionNotification` handling when that is reported.
+//! The native launcher handles interruption recovery and deactivation when it takes over.
 
-/// Set the session up: once, before the game opens its audio stream. Nothing elsewhere.
+/// Configure the session before a client opens its audio stream. Nothing elsewhere.
 pub fn start() {
     #[cfg(target_os = "ios")]
     ios::start();

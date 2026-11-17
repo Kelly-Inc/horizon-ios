@@ -491,11 +491,11 @@ impl Loading {
         );
         let renderer_ms = renderer_at.elapsed().as_millis();
         // Audio is created on the main thread, after the core is ready.
-        let audio = if !options.execution_role.is_client() {
-            Audio::silent(&loaded.pack.source)
-        } else {
-            Audio::with_device(&loaded.pack.source, &self.settings.sound_device)
-        };
+        let audio = startup_audio(
+            &loaded.pack.source,
+            options.execution_role.is_client(),
+            &self.settings.sound_device,
+        );
         // The menu read its language from the prepared root alone (`set_root`) and
         // `load_resources` skips it on this path: read it again with the mods' layers, in the
         // language picked in the menu.
@@ -1055,6 +1055,22 @@ pub(super) fn launcher_loading(
         error: None,
     };
     Ok(loading)
+}
+
+/// Configure the platform session just before constructing the client's output stream.
+pub(super) fn startup_audio(
+    source: &horizon_assets::resource_source::ResourceSource,
+    output: bool,
+    device: &str,
+) -> Audio {
+    if !output {
+        return Audio::silent(source);
+    }
+    #[cfg(all(target_os = "ios", feature = "audio"))]
+    if std::env::var_os("HORIZON_NO_AUDIO").is_none() {
+        horizon_airplay::audio::start();
+    }
+    Audio::with_device(source, device)
 }
 
 pub(super) fn mark_game_start(settings: &mut Settings) {

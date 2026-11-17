@@ -133,7 +133,6 @@ pub fn start<G>(
     horizon_threads::configure_allocator();
     // Before the event loop: iOS asks for the AirPlay scene's delegate by name when a display connects.
     horizon_airplay::register();
-    horizon_airplay::audio::start();
     #[cfg(target_os = "ios")]
     let documents = match into_app_sandbox() {
         Ok(documents) => documents,

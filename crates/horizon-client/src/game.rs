@@ -11720,11 +11720,11 @@ pub(crate) fn run_with(
     loaded.pack.content = Some(mods::content_for_loaded_root(&loaded.root, content)?);
     let gui = loaded.gui.ok_or("missing menu bundle")?;
     options.resources = loaded.root.clone();
-    let audio = if !options.execution_role.is_client() || options.headless {
-        Audio::silent(&loaded.pack.source)
-    } else {
-        Audio::with_device(&loaded.pack.source, &early_settings.sound_device)
-    };
+    let audio = loading_screen::startup_audio(
+        &loaded.pack.source,
+        options.execution_role.is_client() && !options.headless,
+        &early_settings.sound_device,
+    );
     let resources = loaded.resources;
     let game = start_game(
         &resources,

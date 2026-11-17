@@ -482,8 +482,36 @@ final class TouchControlsTests: XCTestCase {
         let first=holds.set(a,keys:[341,86],down:false)
         XCTAssertEqual(first.map{$0.0},[86]);XCTAssertTrue(first.allSatisfy{!$0.1})
         XCTAssertTrue(holds.modifiers.contains(.control))
-        XCTAssertEqual(holds.set(b,keys:[341,67],down:false).map{$0.0},[341,67])
+        XCTAssertEqual(holds.set(b,keys:[341,67],down:false).map{$0.0},[67,341])
         XCTAssertTrue(holds.modifiers.isEmpty)
+    }
+
+    @MainActor func testCustomChordAppliesModifiersBeforeKeysAndMouseButtons() throws {
+        var definition = CustomTouchButton()
+        definition.bindings = [86, -3, 341, 340]
+        var config = TouchConfiguration()
+        config.customButtons = [definition]
+        let bridge = TouchGestureBridge(configuration: { config })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll() -> [[Double]] {
+            bridge.poll(screen: 1, flags: 0, width: 600, height: 300, scale: 1,
+                        capacity: 64, withContext: true)
+        }
+        _ = poll()
+        let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        button.sendActions(for: .touchDown)
+        let pressed = poll()
+        XCTAssertEqual(pressed.map { Array($0.prefix(3)) },
+                       [[7, 1, 341], [7, 1, 340], [7, 1, 86], [7, 1, -3]])
+        XCTAssertEqual(pressed.map { $0[8] }, [2, 3, 3, 3])
+
+        button.sendActions(for: .touchUpInside)
+        let released = poll()
+        XCTAssertEqual(released.map { Array($0.prefix(3)) },
+                       [[7, 3, 86], [7, 3, -3], [7, 3, 341], [7, 3, 340]])
+        XCTAssertEqual(released.map { $0[8] }, [3, 3, 1, 0])
+        XCTAssertEqual(bridge.customModifierBits, 0)
     }
 
     @MainActor func testHiddenOrRemovedCustomButtonCannotReactivateAKey() throws {
@@ -604,7 +632,7 @@ final class TouchControlsTests: XCTestCase {
         chordButton.sendActions(for: .touchDown)
         chordButton.sendActions(for: .touchUpInside)
         XCTAssertEqual(poll().map { Array($0.prefix(3)) },
-                       [[7, 1, 341], [7, 1, 86], [7, 3, 341], [7, 3, 86]])
+                       [[7, 1, 341], [7, 1, 86], [7, 3, 86], [7, 3, 341]])
     }
 
     @MainActor func testOneShotCustomActionsCannotFireFromCancelledOrOutsideTouches() throws {

@@ -69,12 +69,20 @@ struct TouchBinding: Identifiable {
 final class CustomTouchHolds {
     private var owners: [UUID:[Int]] = [:]
     func reset() { owners.removeAll() }
-    func set(_ id: UUID, keys: [Int], down: Bool) -> [(Int,Bool)] {
+    func set(_ id: UUID, keys: [Int], down: Bool) -> [(Int, Bool)] {
         let old = owners[id] ?? []
-        let before = Set(owners.values.flatMap{$0})
-        if down { owners[id] = keys } else { owners.removeValue(forKey:id) }
-        let after = Set(owners.values.flatMap{$0})
-        return old.filter{!after.contains($0)}.map{($0,false)} + keys.filter{down && !before.contains($0)}.map{($0,true)}
+        let before = Set(owners.values.flatMap { $0 })
+        if down { owners[id] = keys } else { owners.removeValue(forKey: id) }
+        let after = Set(owners.values.flatMap { $0 })
+        let released = old.filter { !after.contains($0) }
+        let pressed = down ? keys.filter { !before.contains($0) } : []
+
+        // The game reads modifiers on each event. Hold them for every other
+        // key in the chord, regardless of the order of the binding slots.
+        func isModifier(_ code: Int) -> Bool { (340...347).contains(code) }
+        let upOrder = released.filter { !isModifier($0) } + released.filter(isModifier)
+        let downOrder = pressed.filter(isModifier) + pressed.filter { !isModifier($0) }
+        return upOrder.map { ($0, false) } + downOrder.map { ($0, true) }
     }
     var modifiers: UIKeyModifierFlags {
         let keys=Set(owners.values.flatMap{$0});var result:UIKeyModifierFlags=[]

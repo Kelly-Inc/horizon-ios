@@ -189,16 +189,16 @@ fn vertex_buffer(
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
     })
 }
-/// The per-quad words of the same page (`terrain_metadata.rs`: 2 u32 per quad).
+/// Metadata repeats each raw quad over its four physical arena slots.
 fn metadata_buffer(
     device: &wgpu::Device,
     quads: &[[u32; super::super::terrain_metadata::WORDS]],
     spare: usize,
 ) -> wgpu::Buffer {
     let unknown = encode(QuadState::UNKNOWN);
-    let mut words = vec![unknown];
-    words.extend(quads);
-    words.extend(std::iter::repeat_n(unknown, spare));
+    let mut words = vec![unknown; 4];
+    words.extend(quads.iter().flat_map(|&quad| std::iter::repeat_n(quad, 4)));
+    words.extend(std::iter::repeat_n(unknown, spare * 4));
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("diagnostic page metadata"),
         contents: bytemuck::cast_slice(&words),

@@ -22,7 +22,13 @@ pub(super) fn move_off_page<'a>(
         let Some((_, start, vertices)) = part.of(s).filter(|r| r.0 == page) else {
             continue;
         };
-        let bytes = vertices * arena.stride();
+        // Charge the copies actually recorded: a shader's physical-slot
+        // sidecar can be larger than its compact geometry. Counting only the
+        // vertex copy lets compaction exceed its per-frame transfer budget.
+        let sidecar = metadata
+            .as_ref()
+            .is_some_and(|(metadata, _)| metadata.get(page).is_some());
+        let bytes = vertices * (arena.stride() + if sidecar { terrain_metadata::BYTES } else { 0 });
         if moved && bytes > *budget {
             break;
         }

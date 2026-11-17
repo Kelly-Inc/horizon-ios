@@ -1,4 +1,6 @@
-//! Block identity and source cell beside each arena quad, independent of its texture.
+//! Block identity and lighting addressed by physical arena slots. A raw quad
+//! occupies four slots; a compact quad occupies one record slot. Both layouts
+//! can share a page without their metadata addresses aliasing.
 use super::upload::Uploads;
 use crate::mesher::QuadState;
 use std::collections::HashMap;
@@ -8,6 +10,19 @@ pub(super) struct TerrainMetadata {
 }
 pub(super) const WORDS: usize = 8;
 pub(super) const BYTES: u64 = WORDS as u64 * 4;
+/// A raw draw's first vertex slot, or a flat compact draw's record slot.
+/// Shared with the Metal address oracle so the tested GLSL is the shipped input.
+pub(super) const SLOT_GLSL: &str = "uint hz_metadata_slot(uint hz_vertex) {
+    return hz_vertex >= 0x10000000u ? ((hz_vertex - 0x10000000u) >> 2u) : (hz_vertex & ~3u);
+}
+";
+
+fn page_bytes(device: &wgpu::Device, capacity: u64) -> Option<u64> {
+    let bytes = capacity.max(1).checked_mul(BYTES)?;
+    let limits = device.limits();
+    (bytes <= limits.max_buffer_size && bytes <= limits.max_storage_buffer_binding_size)
+        .then_some(bytes)
+}
 pub(super) fn encode(state: QuadState) -> [u32; WORDS] {
     let mut words = [0; WORDS];
     words[0] = state.state;
@@ -29,7 +44,8 @@ pub(super) fn encode(state: QuadState) -> [u32; WORDS] {
 }
 
 impl TerrainMetadata {
-    /// `(page, first vertex, page capacity in vertices)` addresses the same arena as position data.
+    /// `(page, first physical slot, capacity in slots)` addresses the position
+    /// arena directly. The caller supplies one state per occupied slot.
     pub fn upload(
         &mut self,
         device: &wgpu::Device,
@@ -39,8 +55,20 @@ impl TerrainMetadata {
         states: impl IntoIterator<Item = QuadState>,
     ) -> bool {
         let (page, start, capacity) = allocation;
-        debug_assert_eq!(start % 4, 0);
-        let bytes = capacity.div_ceil(4).max(1) * BYTES;
+        let Some(bytes) = page_bytes(device, capacity) else {
+            return false;
+        };
+        let Some(remaining) = capacity.checked_sub(start) else {
+            return false;
+        };
+        let words: Vec<[u32; WORDS]> = states
+            .into_iter()
+            .take(usize::try_from(remaining.saturating_add(1)).unwrap_or(usize::MAX))
+            .map(encode)
+            .collect();
+        if words.len() as u64 > remaining {
+            return false;
+        }
         if self
             .pages
             .get(&page)
@@ -61,12 +89,11 @@ impl TerrainMetadata {
             }
             self.pages.insert(page, new);
         }
-        let words: Vec<[u32; WORDS]> = states.into_iter().map(encode).collect();
         if !words.is_empty() {
             uploads.buffer(
                 encoder,
                 &self.pages[&page],
-                (start / 4) * BYTES,
+                start * BYTES,
                 bytemuck::cast_slice(&words),
             );
         }
@@ -87,7 +114,18 @@ impl TerrainMetadata {
             // A device without vertex storage has no sidecars or consumer.
             return true;
         };
-        let bytes = capacity.div_ceil(4).max(1) * BYTES;
+        let Some(bytes) = page_bytes(device, capacity) else {
+            return false;
+        };
+        if from
+            .1
+            .checked_add(vertices)
+            .is_none_or(|end| end > source.size() / BYTES)
+            || to.1.checked_add(vertices).is_none_or(|end| end > capacity)
+        {
+            return false;
+        }
+
         if self
             .pages
             .get(&to.0)
@@ -110,12 +148,15 @@ impl TerrainMetadata {
         }
         encoder.copy_buffer_to_buffer(
             &source,
-            from.1 / 4 * BYTES,
+            from.1 * BYTES,
             &self.pages[&to.0],
-            to.1 / 4 * BYTES,
-            vertices / 4 * BYTES,
+            to.1 * BYTES,
+            vertices * BYTES,
         );
         true
+    }
+    pub fn get(&self, page: u32) -> Option<&wgpu::Buffer> {
+        self.pages.get(&page)
     }
     pub fn page(&self, page: u32) -> &wgpu::Buffer {
         self.pages
@@ -182,20 +223,18 @@ mod tests {
             translucent_states: vec![second],
             ..Default::default()
         };
-        let states = raw
-            .upload_states(true, false)
-            .expect("raw water has metadata in packed mode");
+        let states = raw.upload_states(true, false);
         assert!(metadata.upload(&device, &mut encoder, &mut uploads, (9, 8, 16), states));
         assert_ne!(&original, metadata.page(9));
         let read = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 4 * BYTES,
+            size: 16 * BYTES,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         // Arena compaction moves both quads into another page before the old page is freed.
         assert!(metadata.copy_range(&device, &mut encoder, (9, 4), (10, 4), 16, 8));
-        encoder.copy_buffer_to_buffer(metadata.page(10), 0, &read, 0, 4 * BYTES);
+        encoder.copy_buffer_to_buffer(metadata.page(10), 0, &read, 0, 16 * BYTES);
         uploads.finish(&encoder);
         queue.submit([encoder.finish()]);
         read.slice(..)
@@ -203,8 +242,8 @@ mod tests {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = read.slice(..).get_mapped_range().unwrap();
         let words: &[[u32; WORDS]] = bytemuck::cast_slice(&data);
-        assert_eq!(words[1], encode(first));
-        assert_eq!(words[2], encode(second));
+        assert_eq!(words[4], encode(first));
+        assert_eq!(words[8], encode(second));
         drop(data);
         read.unmap();
         drop(metadata.retain(|page| page != 9 && page != 10));
@@ -224,3 +263,7 @@ mod tests {
         assert!(metadata.pages.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "terrain_metadata/compact_tests.rs"]
+mod compact_tests;

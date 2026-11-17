@@ -21,11 +21,13 @@ fn whoami(proxy_from: &str) -> String {
 }
 
 #[test]
+#[ignore = "daily"]
 fn a_listed_load_balancer_names_the_client() {
     assert!(whoami("127.0.0.0/8").contains("203.0.113.7:51000"));
 }
 
 #[test]
+#[ignore = "daily"]
 fn anyone_else_is_closed_unanswered() {
     assert_eq!(whoami("10.0.0.0/8"), "");
 }

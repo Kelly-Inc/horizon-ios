@@ -9,15 +9,16 @@
 //!
 //! The launcher is a separate workspace, so this is the small part of it the
 //! game needs. Everything here blocks: the game runs it on a worker
-//! (`game/mod_browser.rs`).
+//! (`game/interface/mod_browser.rs`).
 use crate::mod_browser::Listing;
-use horizon_mods::index::{self, Index, Kind, Project, Trust, Version};
+use horizon_mod_package::index::{self, Index, Kind, Project, Trust, Version};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 // The existing managed service transport owns close-only socket leases.
 pub use horizon_cosmetics::transport::Cancellation;
 use horizon_cosmetics::transport::Connector;
+#[path = "mod_registry/storage.rs"]
 mod storage;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -180,15 +181,6 @@ fn fetch_text(at: &str, cancel: &Arc<Cancellation>) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Whether version `v` is a `.hmod` with code: the game doesn't run those any
-/// more, and the launcher neither lists nor installs them (`needs_port`).
-fn needs_port(v: &Version) -> bool {
-    v.file.name.ends_with(".hmod")
-        && v.capabilities
-            .iter()
-            .any(|c| *c != horizon_mods::Capability::Registries)
-}
-
 /// The version of content mod `p` this game installs: the newest for this
 /// Minecraft version that wasn't taken down and has no code.
 pub fn installable<'a>(index: &Index, p: &'a Project) -> Option<&'a Version> {
@@ -196,15 +188,15 @@ pub fn installable<'a>(index: &Index, p: &'a Project) -> Option<&'a Version> {
         return None;
     }
     index
-        .installable(p, GAME, horizon_mods::api_level::LEVEL)
-        .filter(|v| !needs_port(v))
+        .installable(p, GAME)
+        .filter(|v| v.capabilities.known() == [horizon_mod_package::Capability::Registries])
 }
 
 /// The registry's projects the browser offers, most downloaded first: content
 /// mods this game installs, with the version installed in `home` when there is
 /// one.
 pub fn listings(index: &Index, home: &Path) -> Vec<Listing> {
-    let installed = Installed::load(home);
+    let installed = Installed::load(home).unwrap_or_default();
     let mut out: Vec<Listing> = index
         .projects
         .iter()
@@ -274,12 +266,12 @@ pub fn install_managed(
         .ok_or_else(|| format!("{} has no version this game can install", p.name))?;
     let relative = format!("{}/{id}.hmod", crate::mod_list::DIR);
     let target = home.join(&relative);
-    {
-        let _lock = storage::lock_home(home, cancel)?;
-        storage::recover(home)?;
-        if let Err(done) = prepare_install(home, id, &relative, &target, v)? {
-            return Ok(done);
-        }
+    // Keep the same shared transaction gate through download and publication,
+    // as the launcher does; cancellation still interrupts acquisition/network IO.
+    let _lock = storage::lock_home(home, cancel)?;
+    storage::recover(home)?;
+    if let Err(done) = prepare_install(home, id, &relative, &target, v)? {
+        return Ok(done);
     }
     let bytes = get(&v.file.url, v.file.size)?;
     check_cancel(cancel)?;
@@ -288,8 +280,11 @@ pub fn install_managed(
     }
     let download = storage::stage(&home.join(DOWNLOADS), &bytes)?;
     let trust = index::check_file(index, p, v, &download.0)?;
+    let package = horizon_mod_package::Package::read(&download.0)?;
+    if package.manifest.native.is_some() || package.manifest.wasm.is_some() {
+        return Err("code mods are installed and updated in the launcher".into());
+    }
     check_cancel(cancel)?;
-    let _lock = storage::lock_home(home, cancel)?;
     storage::recover(home)?;
     let mut list = match prepare_install(home, id, &relative, &target, v)? {
         Ok(list) => list,
@@ -330,6 +325,21 @@ fn prepare_install(
     let list = Installed::load_checked(home)?;
     let ours = list.position(id);
     let old_file = ours.and_then(|i| list.entries[i]["file"].as_str().map(str::to_owned));
+    // Missing files do not relinquish native/code package ownership.
+    if (ours.is_some() && old_file.as_deref() != Some(relative))
+        || home
+            .join(crate::mod_list::NATIVE_DIR)
+            .join(format!("{id}.hmod"))
+            .exists()
+    {
+        return Err("code mods are installed and updated in the launcher".into());
+    }
+    if target.exists() && old_file.as_deref() == Some(relative) {
+        let package = horizon_mod_package::Package::read(target)?;
+        if package.manifest.native.is_some() || package.manifest.wasm.is_some() {
+            return Err("code mods are installed and updated in the launcher".into());
+        }
+    }
     if let Some(i) = ours
         && list.entries[i]["version"].as_str() == Some(v.version.as_str())
         && target.exists()
@@ -397,8 +407,8 @@ struct Installed {
 }
 
 impl Installed {
-    fn load(home: &Path) -> Self {
-        Self::load_checked(home).unwrap_or_default()
+    fn load(home: &Path) -> Result<Self, String> {
+        Self::load_checked(home)
     }
 
     fn load_checked(home: &Path) -> Result<Self, String> {
@@ -406,17 +416,26 @@ impl Installed {
         let file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let bytes = read_bounded(file, MAX_INDEX, &Cancellation::default())?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let bytes = read_bounded(file, MAX_INDEX, &Cancellation::default())
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         let entries = value
             .get("entries")
             .and_then(|v| v.as_array())
             .cloned()
-            .ok_or("invalid installed-mod manifest")?;
+            .ok_or_else(|| format!("{}: invalid installed-mod manifest", path.display()))?;
         Ok(Self { entries })
     }
+    #[cfg(test)]
+    fn save(&self, home: &Path) -> Result<(), String> {
+        let _guard = storage::lock_home(home, &Cancellation::default())?;
+        storage::recover(home)?;
+        storage::atomic_write(&home.join(MANIFEST), &self.bytes()?)
+    }
+
     fn bytes(&self) -> Result<Vec<u8>, String> {
         let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "entries": self.entries }))
             .map_err(|e| e.to_string())?;
@@ -459,7 +478,7 @@ impl Installed {
             return Some(version.to_owned());
         }
         let path: PathBuf = home.join(crate::mod_list::DIR).join(format!("{id}.hmod"));
-        horizon_mods::Package::read(&path)
+        horizon_mod_package::Package::read(&path)
             .ok()
             .filter(|p| p.manifest.id == id)
             .map(|p| p.manifest.version)
@@ -467,4 +486,5 @@ impl Installed {
 }
 
 #[cfg(test)]
+#[path = "mod_registry/tests.rs"]
 mod tests;

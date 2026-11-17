@@ -6,18 +6,17 @@ use super::{ItemRenderer, corners};
 use crate::cit::{CitRules, Hand, Kind};
 use crate::cit_assets::{self, model_id, sprite_id};
 use crate::hud::cit_glint::GlintTextures;
-use crate::items::ItemStack;
+use crate::items::{ItemInfo, ItemStack};
 use glam::Vec3;
+use horizon_assets::resource_source::ResourceSource;
 use horizon_assets::{
     item_bake::{BakedItemModel, bake_resolved},
     model::{Material, TextureSlot},
     resolve::{MISSING_MODEL, ModelLibrary},
 };
-#[cfg(test)]
-use horizon_world::nbt::Tag;
+use horizon_core::nbt::Tag;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
@@ -80,23 +79,26 @@ fn legacy(name: &str) -> &str {
     }
 }
 
-/// The `max_damage` a CIT rule's `damage` test reads: the stack's own
-/// component when it holds a non-negative int, else `item_max`, its item's.
-/// An explicit component removal reads as zero.
-pub fn stack_max_damage(stack: &ItemStack, item_max: u32) -> u32 {
-    stack.max_damage(item_max)
+/// Effective maximum for CIT percentage tests, including prototype and patch removals.
+pub fn stack_max_damage(stack: &ItemStack, info: Option<&ItemInfo>) -> u32 {
+    stack.max_damage(info).max(0) as u32
 }
 
-/// The winning `kind` (Armor or Elytra) rule of a worn `stack` whose item has `item_max` max
-/// damage, as an index into `rules.rules`. Worn items count as the main hand: OptiFine's off hand
+/// The winning `kind` (Armor or Elytra) rule of a worn `stack` with its item prototype,
+/// as an index into `rules.rules`. Worn items count as the main hand: OptiFine's off hand
 /// is the off-hand slot alone.
-pub fn worn_rule(rules: &CitRules, kind: Kind, stack: &ItemStack, item_max: u32) -> Option<usize> {
-    rules.select(kind, stack, Hand::Main, stack_max_damage(stack, item_max))
+pub fn worn_rule(
+    rules: &CitRules,
+    kind: Kind,
+    stack: &ItemStack,
+    info: Option<&ItemInfo>,
+) -> Option<usize> {
+    rules.select(kind, stack, Hand::Main, info)
 }
 
 /// The rules at `root` and `library` with their models, or `library` alone without rules.
 pub(super) fn load(
-    root: &Path,
+    root: &ResourceSource,
     library: Arc<ModelLibrary>,
 ) -> (Arc<ModelLibrary>, Option<CitModels>) {
     let rules = CitRules::load(root);
@@ -365,8 +367,19 @@ impl ItemRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prototype(max_damage: u32) -> ItemInfo {
+        ItemInfo {
+            max_damage,
+            components: vec!["minecraft:max_damage".into(), "minecraft:damage".into()],
+            ..ItemInfo::default()
+        }
+    }
     use horizon_assets::item_model::{DisplayContext, NoEnv, StackView};
-    use std::{collections::BTreeSet, fs, path::PathBuf};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+    };
 
     const CIT: &str = "assets/minecraft/optifine/cit";
 
@@ -509,8 +522,21 @@ mod tests {
     }
 
     fn renderer(root: &Path) -> ItemRenderer {
-        let library = crate::model_library::ParsedModels::load(root).into_item_library();
-        ItemRenderer::load_with_library(root, library).unwrap()
+        let library = crate::model_library::ParsedModels::load(&ResourceSource::directory(
+            root.to_path_buf(),
+        ))
+        .into_item_library();
+        let data = crate::test_resources::item_data(
+            root,
+            horizon_world::native_load_context::DataLoadOrigin::ClientPreload,
+        )
+        .unwrap();
+        ItemRenderer::load_with_library(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.to_path_buf()),
+            library,
+            &data,
+        )
+        .unwrap()
     }
 
     fn rule(r: &ItemRenderer, name: &str) -> usize {
@@ -698,6 +724,7 @@ mod tests {
 
     #[test]
     fn max_damage_is_the_stacks_component_else_the_items() {
+        let prototype = prototype(384);
         let with = |tag: Option<Tag>| {
             let mut stack = ItemStack::new("minecraft:bow", 1);
             if let Some(tag) = tag {
@@ -705,7 +732,7 @@ mod tests {
                     .data_mut()
                     .set_other("minecraft:max_damage", Some(tag));
             }
-            stack_max_damage(&stack, 384)
+            stack_max_damage(&stack, Some(&prototype))
         };
         assert_eq!(with(Some(Tag::Int(20))), 20);
         assert_eq!(with(Some(Tag::Int(0))), 0);
@@ -717,7 +744,7 @@ mod tests {
             "!minecraft:max_damage",
             Some(Tag::Compound(Default::default())),
         );
-        assert_eq!(stack_max_damage(&removed, 384), 0);
+        assert_eq!(stack_max_damage(&removed, Some(&prototype)), 0);
     }
 
     fn armor_rules(text: &str) -> CitRules {
@@ -732,9 +759,15 @@ mod tests {
     fn worn_armor_counts_as_the_main_hand() {
         let rules = armor_rules("type=armor\nitems=diamond_chestplate\ntexture=x\nhand=main\n");
         let stack = ItemStack::new("minecraft:diamond_chestplate", 1);
-        assert_eq!(worn_rule(&rules, Kind::Armor, &stack, 528), Some(0));
+        assert_eq!(
+            worn_rule(&rules, Kind::Armor, &stack, Some(&prototype(528))),
+            Some(0)
+        );
         let off = armor_rules("type=armor\nitems=diamond_chestplate\ntexture=x\nhand=off\n");
-        assert_eq!(worn_rule(&off, Kind::Armor, &stack, 528), None);
+        assert_eq!(
+            worn_rule(&off, Kind::Armor, &stack, Some(&prototype(528))),
+            None
+        );
     }
 
     #[test]
@@ -743,11 +776,17 @@ mod tests {
         let mut stack = ItemStack::new("minecraft:diamond_chestplate", 1);
         stack.damage = 5;
         // 5 of the item's 528 is under 1%.
-        assert_eq!(worn_rule(&rules, Kind::Armor, &stack, 528), None);
+        assert_eq!(
+            worn_rule(&rules, Kind::Armor, &stack, Some(&prototype(528))),
+            None
+        );
         stack
             .data_mut()
             .set_other("minecraft:max_damage", Some(Tag::Int(10)));
-        assert_eq!(worn_rule(&rules, Kind::Armor, &stack, 528), Some(0));
+        assert_eq!(
+            worn_rule(&rules, Kind::Armor, &stack, Some(&prototype(528))),
+            Some(0)
+        );
     }
 
     #[test]

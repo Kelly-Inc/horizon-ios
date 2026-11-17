@@ -233,6 +233,28 @@ final class SettingsModelTests: XCTestCase {
 
 @MainActor
 final class LauncherAsyncTests: XCTestCase {
+    func testPreparedFileStagesOutsideManualScanAndCleansOnlyItsCopy() async throws {
+        let source = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let bytes = Data("private import staging fixture".utf8)
+        try bytes.write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+        var staged: URL?
+        let model = GameFilesDownload(importArchive: { line in
+            XCTAssertTrue(line.hasPrefix("import-game-files "))
+            let file = URL(fileURLWithPath: String(line.dropFirst("import-game-files ".count)))
+            staged = file
+            XCTAssertNotEqual(file.deletingLastPathComponent().resolvingSymlinksInPath(),
+                              GameFolder.documents.resolvingSymlinksInPath())
+            XCTAssertEqual(try? Data(contentsOf: file), bytes)
+            return ["ok": true, "kind": "resources"]
+        })
+        await model.importPreparedFile(source)
+        XCTAssertNotNil(staged)
+        if let staged { XCTAssertFalse(FileManager.default.fileExists(atPath: staged.path)) }
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+        if case .done = model.state {} else { XCTFail("Import did not finish: \(model.state)") }
+    }
+
     private func hits(_ id: String) -> [String: Any] { ["hits": [["project_id": id, "title": id]]] }
 
     func testOldPackSearchCannotOverwriteNewResults() async {

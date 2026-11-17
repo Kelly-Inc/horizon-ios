@@ -5,31 +5,30 @@
 pub use horizon_optifine::cit::{Hand, Kind, Rule};
 
 use crate::cit_glint::{Global, StackGlint};
+use crate::resource_source::ResourceSource;
 use horizon_client_core::component::name_text;
 use horizon_client_core::scoreboard::comp_text;
+use horizon_core::nbt::{JavaString, Tag, parse_snbt};
 use horizon_items::item_data::{canon_tag, encode_components};
-use horizon_items::items::ItemStack;
+use horizon_items::items::{ItemInfo, ItemStack};
 use horizon_optifine::cit::{ComponentTest, Source, ValueTest};
 use horizon_optifine::{Properties, properties_files_in};
-use horizon_world::nbt::{JavaString, Tag, parse_snbt};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Every rule under the root's `optifine/cit/`, `mcpatcher/cit/` and CIT Resewn's
 /// `citresewn/cit/` folders, the one chosen first when several match first (`Rule::priority`).
 /// The pack's global `cit.properties` is not a rule.
-pub fn load_rules(root: &Path) -> Vec<Rule> {
+pub fn load_rules(root: &ResourceSource) -> Vec<Rule> {
     let tops = ["optifine", "mcpatcher", "citresewn"];
     let mut rules: Vec<Rule> = properties_files_in(root, &tops, "cit")
         .into_iter()
         .filter(|path| !path.ends_with("/cit.properties"))
         .filter_map(|path| {
-            let props = read_properties(&root.join(&path))?;
-            let rule = Rule::parse(&path, &props, |p| root.join(p).is_file());
+            let props = read_properties(root, &path)?;
+            let rule = Rule::parse(&path, &props, |p| root.contains(p));
             if rule.is_none() {
                 log::warn!("custom item textures: {path} is not a rule Horizon can read");
             }
@@ -43,8 +42,8 @@ pub fn load_rules(root: &Path) -> Vec<Rule> {
 /// A `.properties` file as CIT Resewn reads them (`Properties::parse_equals_first`): UTF-8,
 /// else Latin-1 as Java reads them, so a pack saved that way still loads. `None` when it can't
 /// be read.
-pub fn read_properties(path: &Path) -> Option<Properties> {
-    let bytes = fs::read(path).ok()?;
+pub fn read_properties(source: &ResourceSource, path: &str) -> Option<Properties> {
+    let bytes = source.read(path).ok()?;
     let text = String::from_utf8(bytes)
         .unwrap_or_else(|e| e.into_bytes().iter().map(|&b| char::from(b)).collect());
     Some(Properties::parse_equals_first(&text))
@@ -78,7 +77,7 @@ const CACHE_LIMIT: usize = 4096;
 
 impl CitRules {
     /// The enabled packs' rules under the overlay resource root.
-    pub fn load(root: &Path) -> Self {
+    pub fn load(root: &ResourceSource) -> Self {
         Self {
             global: crate::cit_glint::load_global(root),
             ..Self::new(load_rules(root))
@@ -137,43 +136,53 @@ impl CitRules {
         kind: Kind,
         stack: &ItemStack,
         hand: Hand,
-        max_damage: u32,
+        info: Option<&ItemInfo>,
     ) -> Option<usize> {
         let candidates = self.by_item[kind as usize].get(&*stack.item)?;
+        let max_damage = stack.max_damage(info).max(0) as u32;
+        let damage = stack.effective_damage(info).max(0) as u32;
         let comps = encode_components(stack);
-        let key = cache_key((0, kind, hand), stack, max_damage, comps.as_ref());
+        let key = cache_key((0, kind, hand), stack, max_damage, damage, comps.as_ref());
         if let Some(hit) = lock(&self.selected).get(&key) {
             return hit.map(|i| i as usize);
         }
         let found = candidates
             .iter()
             .copied()
-            .find(|&i| self.matches(i, stack, hand, max_damage, comps.as_ref()));
+            .find(|&i| self.matches(i, stack, hand, max_damage, damage, comps.as_ref()));
         remember(&self.selected, key, found);
         found.map(|i| i as usize)
     }
 
     /// Every matching Enchantment rule for the stack drawn in `hand` (`Hand::Main` for one in a
     /// GUI), in priority order.
-    pub fn enchantments(&self, stack: &ItemStack, hand: Hand, max_damage: u32) -> Vec<usize> {
+    pub fn enchantments(
+        &self,
+        stack: &ItemStack,
+        hand: Hand,
+        info: Option<&ItemInfo>,
+    ) -> Vec<usize> {
         let named = self.by_item[Kind::Enchantment as usize]
             .get(&*stack.item)
             .map_or(&[][..], Vec::as_slice);
         if named.is_empty() && self.any_item.is_empty() {
             return Vec::new();
         }
+        let max_damage = stack.max_damage(info).max(0) as u32;
+        let damage = stack.effective_damage(info).max(0) as u32;
         let comps = encode_components(stack);
         let key = cache_key(
             (1, Kind::Enchantment, hand),
             stack,
             max_damage,
+            damage,
             comps.as_ref(),
         );
         let hit = lock(&self.enchanted).get(&key).cloned();
         let found = hit.unwrap_or_else(|| {
             let mut all: Vec<u32> = named.iter().chain(&self.any_item).copied().collect();
             all.sort_unstable();
-            all.retain(|&i| self.matches(i, stack, hand, max_damage, comps.as_ref()));
+            all.retain(|&i| self.matches(i, stack, hand, max_damage, damage, comps.as_ref()));
             remember(&self.enchanted, key, all.clone());
             all
         });
@@ -188,7 +197,7 @@ impl CitRules {
         &self,
         stack: &ItemStack,
         hand: Hand,
-        max_damage: u32,
+        info: Option<&ItemInfo>,
         foil: bool,
     ) -> Option<Arc<StackGlint>> {
         let no_rules =
@@ -197,17 +206,20 @@ impl CitRules {
         if !foil || (no_rules && self.global.use_glint) {
             return None;
         }
+        let max_damage = stack.max_damage(info).max(0) as u32;
+        let damage = stack.effective_damage(info).max(0) as u32;
         let comps = encode_components(stack);
         let key = cache_key(
             (2, Kind::Enchantment, hand),
             stack,
             max_damage,
+            damage,
             comps.as_ref(),
         );
         if let Some(hit) = lock(&self.glints).get(&key) {
             return Some(hit.clone());
         }
-        let matched = self.enchantments(stack, hand, max_damage);
+        let matched = self.enchantments(stack, hand, info);
         let glint = Arc::new(StackGlint::new(
             &self.rules,
             &matched,
@@ -225,6 +237,7 @@ impl CitRules {
         stack: &ItemStack,
         hand: Hand,
         max_damage: u32,
+        damage: u32,
         comps: Option<&Tag>,
     ) -> bool {
         let rule = &self.rules[i as usize];
@@ -235,8 +248,6 @@ impl CitRules {
         if rule.stack_size.as_ref().is_some_and(|r| !r.contains(count)) {
             return false;
         }
-        // ItemStack.getDamageValue clamps reads and honors an explicitly removed component.
-        let damage = stack.damage_value(max_damage);
         if rule
             .damage
             .as_ref()
@@ -279,10 +290,16 @@ fn remember<V>(cache: &Mutex<HashMap<u64, V>>, key: u64, value: V) {
 }
 
 /// What a cached answer depends on; `query` tells `select`, `enchantments` and `glint` apart.
-fn cache_key(query: (u8, Kind, Hand), stack: &ItemStack, max: u32, comps: Option<&Tag>) -> u64 {
+fn cache_key(
+    query: (u8, Kind, Hand),
+    stack: &ItemStack,
+    max: u32,
+    damage: u32,
+    comps: Option<&Tag>,
+) -> u64 {
     let mut h = DefaultHasher::new();
     (query.0, query.1 as u8, query.2 as u8, &*stack.item).hash(&mut h);
-    (stack.count, stack.damage, max, comps).hash(&mut h);
+    (stack.count, stack.damage, max, damage, comps).hash(&mut h);
     h.finish()
 }
 
@@ -498,6 +515,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn prototype(max_damage: u32) -> ItemInfo {
+        ItemInfo {
+            max_damage,
+            components: vec!["minecraft:max_damage".into(), "minecraft:damage".into()],
+            ..ItemInfo::default()
+        }
+    }
+
     /// Rules from (file stem, properties), sorted as `load_rules` sorts them.
     fn rules(files: &[(&str, &str)]) -> CitRules {
         let mut rules: Vec<Rule> = files
@@ -518,7 +543,7 @@ mod tests {
     }
 
     fn item(cit: &CitRules, stack: ItemStack) -> Option<&str> {
-        stem(cit, cit.select(Kind::Item, &stack, Hand::Main, 0))
+        stem(cit, cit.select(Kind::Item, &stack, Hand::Main, None))
     }
 
     fn new(id: &str) -> ItemStack {
@@ -559,7 +584,12 @@ mod tests {
             item(&cit, ItemStack::new("minecraft:stick", 3)),
             Some("heavy")
         );
-        let pick = |kind, id, hand, max| stem(&cit, cit.select(kind, &new(id), hand, max));
+        let pick = |kind, id, hand, max| {
+            stem(
+                &cit,
+                cit.select(kind, &new(id), hand, Some(&prototype(max))),
+            )
+        };
         assert_eq!(pick(Kind::Item, "stick", Hand::Off, 0), Some("offhand"));
         assert_eq!(item(&cit, new("stone")), None);
         assert_eq!(item(&cit, new("elytra")), None);
@@ -672,6 +702,30 @@ mod tests {
     }
 
     #[test]
+    fn prototype_damage_is_part_of_the_rule_cache_key() {
+        let cit = rules(&[("damaged", "items=diamond_sword\ndamage=7")]);
+        let stack = new("diamond_sword");
+        let mut fresh = prototype(20);
+        assert_eq!(
+            cit.select(Kind::Item, &stack, Hand::Main, Some(&fresh)),
+            None
+        );
+        fresh.damage = 7;
+        assert_eq!(
+            stem(
+                &cit,
+                cit.select(Kind::Item, &stack, Hand::Main, Some(&fresh))
+            ),
+            Some("damaged")
+        );
+        fresh.damage = 0;
+        assert_eq!(
+            cit.select(Kind::Item, &stack, Hand::Main, Some(&fresh)),
+            None
+        );
+    }
+
+    #[test]
     fn damage_counts_only_for_damageable_items() {
         let cit = rules(&[
             ("worn", "items=diamond_sword\ndamage=50-100%"),
@@ -681,7 +735,10 @@ mod tests {
         let damaged = |id: &str, damage: u32, max: u32| {
             let mut stack = new(id);
             stack.damage = damage;
-            stem(&cit, cit.select(Kind::Item, &stack, Hand::Main, max))
+            stem(
+                &cit,
+                cit.select(Kind::Item, &stack, Hand::Main, Some(&prototype(max))),
+            )
         };
         // Half of 1561 is 780.5.
         assert_eq!(damaged("diamond_sword", 780, 1561), None);
@@ -694,7 +751,10 @@ mod tests {
             .data_mut()
             .set_other("!minecraft:damage", Some(Tag::Compound(Default::default())));
         assert_eq!(
-            stem(&cit, cit.select(Kind::Item, &removed, Hand::Main, 1561)),
+            stem(
+                &cit,
+                cit.select(Kind::Item, &removed, Hand::Main, Some(&prototype(1561)))
+            ),
             Some("zero_sword")
         );
     }
@@ -721,7 +781,7 @@ mod tests {
         );
         assert_eq!(item(&cit, enchanted("stone", &mixed)), Some("any3"));
         let glints = |stack: ItemStack| -> Vec<&str> {
-            let found = cit.enchantments(&stack, Hand::Main, 0).into_iter();
+            let found = cit.enchantments(&stack, Hand::Main, None).into_iter();
             found.map(|i| stem(&cit, Some(i)).unwrap()).collect()
         };
         let sharp = [("sharpness", 1)];
@@ -737,7 +797,12 @@ mod tests {
 
     /// `CitRules::glint` in the main hand, with the stack's own `has_foil` as callers pass it.
     fn glint(cit: &CitRules, stack: &ItemStack, item_glint: bool) -> Option<Arc<StackGlint>> {
-        cit.glint(stack, Hand::Main, 0, stack.has_foil(item_glint))
+        cit.glint(
+            stack,
+            Hand::Main,
+            None,
+            stack.has_foil(item_glint.then_some(true)),
+        )
     }
 
     /// `stack` with its `enchantment_glint_override` set to `on`.
@@ -805,7 +870,7 @@ mod tests {
         );
         // The same stack, asked again without its glint, is not answered from the cache.
         assert!(
-            cit.glint(&overridden(new("stick"), true), Hand::Main, 0, false)
+            cit.glint(&overridden(new("stick"), true), Hand::Main, None, false)
                 .is_none()
         );
     }
@@ -832,7 +897,7 @@ mod tests {
             .unwrap();
         cit.keep_glints(|i| i != broken);
         assert_eq!(layers(&cit), ["shown"]);
-        assert_eq!(cit.enchantments(&sword, Hand::Main, 0).len(), 1);
+        assert_eq!(cit.enchantments(&sword, Hand::Main, None).len(), 1);
         // None left: vanilla's glint stays.
         cit.keep_glints(|_| false);
         assert!(glint(&cit, &sword, false).is_none());
@@ -846,7 +911,7 @@ mod tests {
         ]);
         let sword = enchanted("diamond_sword", &[("sharpness", 1)]);
         let layers = |hand| -> Vec<&str> {
-            let glint = cit.glint(&sword, hand, 0, true).unwrap();
+            let glint = cit.glint(&sword, hand, None, true).unwrap();
             glint
                 .layers
                 .iter()

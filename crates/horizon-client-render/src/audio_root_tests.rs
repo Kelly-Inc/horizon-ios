@@ -2,8 +2,10 @@
 //! No output device, game assets, or user home is opened.
 use super::*;
 use base64::Engine;
+use horizon_assets::root_lease::RootLease;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use std::{fs, path::PathBuf};
 
 fn scratch(label: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -57,7 +59,7 @@ fn delayed_decode_keeps_both_overlay_and_source_after_reload() {
         RootLease::acquire(&source).unwrap(),
     ]);
     snapshot.register_alias(&root);
-    let mut audio = Audio::silent(&root);
+    let mut audio = Audio::silent(&ResourceSource::directory(root.clone()));
     let owner = audio.backend.work_owner.clone();
     let old_cache = audio.backend.cache.clone();
     audio.backend.live = true;
@@ -142,12 +144,15 @@ fn stream_read_from_prepared_base_finishes_before_the_retirement_gate_opens() {
     let home = scratch("base");
     let file = home.join("assets/test/sounds/late.ogg");
     silence(&file);
-    let mut audio = Audio::silent(&home);
+    let mut audio = Audio::silent(&ResourceSource::directory(home.clone()));
     let owner = audio.backend.work_owner.clone();
     let (entered, ready) = mpsc::channel();
     let (release, proceed) = mpsc::channel();
     let (result, decoded) = mpsc::channel();
-    let read_file = file.clone();
+    let read_file = Resource::file(
+        ResourceSource::directory(home.clone()),
+        "assets/test/sounds/late.ogg".into(),
+    );
     audio.backend.streams.push(AudioWork::spawn(
         "held stream",
         owner.clone(),

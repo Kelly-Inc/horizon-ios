@@ -127,6 +127,33 @@ impl Download {
 
 /// The finished download's name in `home`, and the partial one's.
 const DOWNLOADED: &str = "horizon-download.zip";
+
+/// Internal staging files must not enter the manual drop-folder importer:
+/// their owning download has yet to enforce source identity and archive type.
+/// The UUID form is the native launcher's historical Documents staging name.
+pub(super) fn reserved_archive(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    if name == DOWNLOADED {
+        return true;
+    }
+    let Some(id) = name
+        .strip_prefix("horizon-download-")
+        .and_then(|name| name.strip_suffix(".zip"))
+    else {
+        return false;
+    };
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
 /// A completed cache is reusable only for this requested URL's SHA-256. Never
 /// persist URLs themselves: a custom source may contain an access token.
 const DOWNLOADED_SOURCE: &str = "horizon-download.zip.source";

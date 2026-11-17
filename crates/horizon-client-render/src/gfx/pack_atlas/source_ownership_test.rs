@@ -34,8 +34,9 @@ fn dispatch(
 }
 
 #[test]
-#[ignore = "offscreen GPU control; run explicitly with an available adapter"]
+#[ignore = "daily"]
 fn terrain_source_ownership_gpu() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
         .expect("executed GPU control requires an adapter");
@@ -176,12 +177,16 @@ fn terrain_source_ownership_gpu() {
     let ids = storage(bytemuck::cast_slice(&[
         31i32, 0, -1, 1, 0, 47, 0, 59, 1, 13,
     ]));
-    let states = storage(bytemuck::cast_slice(&[
+    let states: Vec<_> = [
         crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(0, [2, 3, 4], false)),
         crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(1, [6, 3, 4], false)),
         crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(1, [6, 3, 4], false)),
         crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::new(1, [6, 3, 4], true)),
-    ]));
+    ]
+    .into_iter()
+    .flat_map(|quad| std::iter::repeat_n(quad, 4))
+    .collect();
+    let states = storage(bytemuck::cast_slice(&states));
     let vertex_storage = storage(bytemuck::cast_slice(&vertices));
     let rects = storage(bytemuck::cast_slice(&atlas.rects_table()));
     let group = |set: u32, buffers: &[&wgpu::Buffer]| {
@@ -417,7 +422,7 @@ fn terrain_source_ownership_gpu() {
         assert_eq!(reloaded[2 * i + 1], actual[2 * i + 1]);
     }
     let missing = storage(bytemuck::cast_slice(
-        &[crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::UNKNOWN); 4],
+        &[crate::gfx::terrain_metadata::encode(crate::mesher::QuadState::UNKNOWN); 16],
     ));
     let missing_groups = [
         groups[0].clone(),

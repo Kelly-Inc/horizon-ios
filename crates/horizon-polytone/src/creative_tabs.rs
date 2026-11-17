@@ -144,6 +144,31 @@ impl TabModifier {
         })
     }
 
+    /// Parse retained resource entries, including archive-backed pack resources.
+    /// The caller orders the entries and owns IO; one bad file leaves the others usable.
+    pub fn read_entries(
+        files: impl IntoIterator<Item = (String, Result<Vec<u8>, String>)>,
+    ) -> Vec<Self> {
+        files
+            .into_iter()
+            .filter_map(|(path, bytes)| {
+                let implicit = crate::implicit_id(&path, "creative_tab_modifiers")?;
+                let parsed = bytes
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<Json>(&bytes).map_err(|e| e.to_string())
+                    })
+                    .and_then(|json| Self::parse(&json, Some(&implicit)));
+                match parsed {
+                    Ok(modifier) => Some(modifier),
+                    Err(error) => {
+                        log::warn!("{path}: {error}");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Every modifier under a pack overlay root (a file's implicit target is its path).
     pub fn read_all(root: &Path) -> Vec<Self> {
         let mut out = Vec::new();
@@ -208,6 +233,31 @@ impl TabModifier {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retained_entries_keep_implicit_targets_and_isolate_bad_files() {
+        let entries = [
+            (
+                "assets/ruby/polytone/creative_tab_modifiers/tools.json".into(),
+                Ok(br#"{"icon":"ruby:hammer","name":"Tools"}"#.to_vec()),
+            ),
+            (
+                "assets/ruby/polytone/creative_tab_modifiers/bad.json".into(),
+                Ok(b"{".to_vec()),
+            ),
+            (
+                "assets/ruby/polytone/creative_tab_modifiers/unreadable.json".into(),
+                Err("read failed".into()),
+            ),
+            ("assets/ruby/other.json".into(), Ok(b"{}".to_vec())),
+        ];
+        let parsed = TabModifier::read_entries(entries);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].targets.matches("ruby:tools", &|_: &str| false));
+        assert!(!parsed[0].targets.matches("ruby:other", &|_: &str| false));
+        assert_eq!(parsed[0].icon.as_deref(), Some("ruby:hammer"));
+        assert_eq!(parsed[0].name, Some(json!("Tools")));
+    }
 
     #[test]
     fn removals_and_additions_edit_a_tab_in_order() {

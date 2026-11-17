@@ -1,36 +1,30 @@
-//! Client item discovery uses the complete resource path below `items/`, including subfolders.
-use horizon_assets::item_model::ClientItem;
-use std::{collections::BTreeMap, fs, path::Path};
+//! Nested client item identifiers resolve through the retained virtual resource source.
+use horizon_assets::{item_model::ClientItem, resource_source::ResourceSource};
+use std::collections::BTreeMap;
 
-pub(super) fn load(root: &Path) -> BTreeMap<String, ClientItem> {
+/// Every `items/**/*.json` client item definition, by identifier. Through
+/// Resolved resource names preserve nested item identifiers.
+pub(super) fn load(root: &ResourceSource) -> BTreeMap<String, ClientItem> {
     let mut out = BTreeMap::new();
-    let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
-        return out;
-    };
-    for ns in namespaces.flatten() {
-        let namespace = ns.file_name().to_string_lossy().into_owned();
-        let Ok(folder) = horizon_world::json_folder::read(&ns.path().join("items")) else {
-            continue;
-        };
-        for file in &folder.files {
-            let name = &file.name;
-            match file.bytes() {
-                Ok(bytes) => {
-                    let item = std::str::from_utf8(bytes)
-                        .map_err(|e| e.to_string())
-                        .and_then(|text| ClientItem::from_json(text).map_err(|e| e.to_string()));
-                    match item {
-                        Ok(item) => {
-                            out.insert(format!("{namespace}:{name}"), item);
-                        }
-                        Err(error) => log::warn!(
-                            "Horizon: invalid item definition {namespace}:{name}: {error}"
-                        ),
-                    }
+    for namespace in root.namespaces("assets") {
+        let prefix = format!("assets/{namespace}/items/");
+        for name in root.list(&prefix) {
+            let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(text) = root.read_to_string(&name) else {
+                continue;
+            };
+            match ClientItem::from_json(&text) {
+                Ok(item) => {
+                    out.insert(format!("{namespace}:{id}"), item);
                 }
-                Err(error) => log::warn!(
-                    "Horizon: could not read item definition {namespace}:{name}: {error}"
-                ),
+                Err(error) => {
+                    log::warn!("Horizon: item definition {namespace}:{id} not loaded: {error}")
+                }
             }
         }
     }
@@ -43,6 +37,7 @@ mod tests {
     use horizon_assets::item_model::{
         Context, DisplayContext, ItemModels, LayerContent, NoEnv, StackView,
     };
+    use std::fs;
 
     struct Fixture(std::path::PathBuf);
     impl Fixture {
@@ -75,7 +70,7 @@ mod tests {
         // A packed prepared root must read the prepared bytes, like the other
         // tables, rather than silently reverting to the loose-file loader.
         fixture.write("assets/server/items/weapons/orb.json", "{");
-        let definitions = load(&fixture.0);
+        let definitions = load(&ResourceSource::directory(fixture.0.clone()));
         let horizon_assets::item_model::ItemModelNode::Model(model) =
             &definitions["server:weapons/orb"].model
         else {
@@ -96,7 +91,7 @@ mod tests {
         fixture.write("assets/other/items/item/stones/orb.json", second);
         fixture.write("assets/server/items/item/invalid.json", "{");
         fixture.write("assets/server/items/item/ignored.txt", first);
-        let definitions = load(&fixture.0);
+        let definitions = load(&ResourceSource::directory(fixture.0.clone()));
         assert_eq!(definitions.len(), 4);
         assert!(definitions.contains_key("minecraft:paper"));
         assert!(definitions.contains_key("other:item/stones/orb"));
@@ -130,7 +125,7 @@ mod tests {
             );
         }
         fixture.write("assets/server/items/item/stones/orb.json", second);
-        let reloaded = load(&fixture.0);
+        let reloaded = load(&ResourceSource::directory(fixture.0.clone()));
         let horizon_assets::item_model::ItemModelNode::Model(leaf) =
             &reloaded["server:item/stones/orb"].model
         else {

@@ -782,7 +782,9 @@ fn write_tree(
 
 /// The phone's other door: archives that arrive with no network involved, dropped into `Documents`
 /// by the Files app, by Finder's or iTunes' File Sharing, or by a manager someone installed for the
-/// purpose. Every zip there is tried; ours are installed and consumed; anything that is not ours is
+/// purpose. Internal download cache names are left to their owning download,
+/// whose source/type checks must run first. Other zips are tried; recognized
+/// ones are installed and consumed; anything that is not ours is
 /// left alone with a word in the log, and anything that was ours but would not unpack is renamed so
 /// the next launch does not fail in the same place all over again.
 pub fn scan(home: &Path) -> Vec<Installed> {
@@ -792,7 +794,10 @@ pub fn scan(home: &Path) -> Vec<Installed> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("zip") {
+        if !path.is_file()
+            || path.extension().and_then(|e| e.to_str()) != Some("zip")
+            || download::reserved_archive(&path)
+        {
             continue;
         }
         let pack = match Pack::open(&path) {
@@ -1769,6 +1774,49 @@ mod tests {
         assert!(!home.join("resources/old.json").exists());
         assert!(!home.join("resources.previous").exists());
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn startup_scan_does_not_consume_automatic_download_cache_archives() {
+        let mut failures = Vec::new();
+        for (index, (name, marker)) in [
+            ("horizon-download.zip", "level.dat"),
+            (
+                "horizon-download-00000000-0000-4000-8000-000000000001.zip",
+                "level.dat",
+            ),
+            ("HORIZON-DOWNLOAD.zip", "horizon-resources.json"),
+            (
+                "horizon-download-ABCDEFAB-0000-4ABC-8ABC-ABCDEFABCDEF.zip",
+                "horizon-resources.json",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let home = temp_home(&format!("owned-cache-{index}"));
+            let cache = home.join(name);
+            let body = if marker == "level.dat" {
+                "cached world fixture"
+            } else {
+                r#"{"schema":7}"#
+            };
+            write_archive(&cache, &[(marker, body)]);
+            let automatic = scan(&home);
+            let untouched =
+                cache.is_file() && !home.join("saves").exists() && !home.join("resources").exists();
+            write_archive(
+                &home.join("horizon-download-my-world.zip"),
+                &[("level.dat", "manual world fixture")],
+            );
+            let manual = scan(&home);
+            let manual_ok = manual.len() == 1 && manual[0].kind == Kind::World;
+            fs::remove_dir_all(&home).unwrap();
+            if !automatic.is_empty() || !untouched || !manual_ok {
+                failures.push(format!("{name}: automatic={}, cache untouched={untouched}, manual accepted={manual_ok}", automatic.len()));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
     }
 
     #[test]

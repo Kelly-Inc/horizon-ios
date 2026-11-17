@@ -1,9 +1,10 @@
 //! Runtime block-state IDs imported from a version-pinned registry data export.
 //! This supplies identities and default properties, not block behavior.
+mod data;
 mod facts;
+mod intern;
 mod json;
 pub(crate) mod snapshot;
-use crate::{DATA_VERSION, chunk::BlockState, compression::invalid, nbt::Tag};
 use horizon_core::fast_hash::FxHashMap;
 pub use json::BlockStateJsonCodec;
 pub(crate) use json::java_integer;
@@ -16,19 +17,25 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+use {
+    crate::{DATA_VERSION, chunk::BlockState, compression::invalid},
+    horizon_core::nbt::Tag,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockStateId(pub u32);
 
 pub struct BlockRegistry {
-    states: Vec<BlockState>,
-    /// Ids by a hash of their state, checked against `states`: 12 bytes per
-    /// state instead of a second copy of every name and property map (about
-    /// 125 MB for a registry of 190,000 states).
-    ids: HashMap<u64, u32>,
-    /// States whose hash an earlier state already took (none in vanilla).
-    collided: BTreeMap<BlockState, BlockStateId>,
-    defaults: BTreeMap<String, BlockStateId>,
+    /// Game-owned, immutable mod worker metadata for this numeric registry snapshot.
+    /// Filled at resource resolution before any worker can use it; never shared across registries.
+    pub mod_worker_resource: std::sync::OnceLock<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// Optional higher-layer template data transform, frozen before placement workers start.
+    pub structure_block_entity_transform: std::sync::OnceLock<
+        std::sync::Arc<
+            dyn crate::worldgen::structure::block_entity_transform::BlockEntityTransform,
+        >,
+    >,
+    data: std::sync::Arc<data::Data>,
     /// Saved palette entries by the NBT they came from ([`Self::saved_state_id`]).
     /// A saved area repeats the same dozen states in every section of every
     /// column; this outlives one column, unlike the cache it replaces.
@@ -74,17 +81,6 @@ fn cacheable_saved_state(tag: &Tag) -> bool {
         _ => false,
     }
 }
-/// Equal when they hold the same states in the same order and the same block
-/// defaults and lookup indexes. Saved-entry memoization does not change identity.
-impl PartialEq for BlockRegistry {
-    fn eq(&self, other: &Self) -> bool {
-        self.states == other.states
-            && self.defaults == other.defaults
-            && self.ids == other.ids
-            && self.collided == other.collided
-    }
-}
-impl Eq for BlockRegistry {}
 /// The hash [`BlockRegistry`] indexes states by (fixed keys: the same in
 /// every process).
 fn state_key(state: &BlockState) -> u64 {
@@ -97,22 +93,6 @@ fn state_key(state: &BlockState) -> u64 {
     hasher.finish()
 }
 impl BlockRegistry {
-    /// Reuse immutable identities across client sessions instead of leaking a
-    /// duplicate registry at every startup. Equality includes IDs and defaults.
-    pub fn shared_static(self) -> &'static Self {
-        static REGISTRIES: std::sync::Mutex<Vec<&'static BlockRegistry>> =
-            std::sync::Mutex::new(Vec::new());
-        let mut registries = REGISTRIES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(registry) = registries.iter().find(|registry| ***registry == self) {
-            return registry;
-        }
-        let registry = Box::leak(Box::new(self));
-        registries.push(registry);
-        registry
-    }
-
     pub fn from_nbt(tag: &Tag) -> io::Result<Self> {
         if tag.get("DataVersion") != Some(&Tag::Int(DATA_VERSION)) {
             return Err(invalid("block registry DataVersion mismatch"));
@@ -181,12 +161,11 @@ impl BlockRegistry {
         if states.is_empty() || states.len() > i32::MAX as usize {
             return Err(invalid("invalid registry size"));
         }
-        let mut result = Self {
+        let mut result = data::Data {
             states: Vec::with_capacity(states.len()),
             ids: HashMap::with_capacity(states.len()),
             collided: BTreeMap::new(),
             defaults: BTreeMap::new(),
-            saved_states: RwLock::new(FxHashMap::default()),
         };
         // The states' property names and values: a few hundred strings, shared.
         let mut strings = crate::block_state_properties::SharedStrings::default();
@@ -227,22 +206,24 @@ impl BlockRegistry {
         {
             return Err(invalid("registry is missing block defaults"));
         }
-        Ok(result)
+        Ok(Self {
+            data: std::sync::Arc::new(result),
+            mod_worker_resource: std::sync::OnceLock::new(),
+            structure_block_entity_transform: std::sync::OnceLock::new(),
+            saved_states: RwLock::new(FxHashMap::default()),
+        })
     }
     pub fn len(&self) -> usize {
-        self.states.len()
+        self.data.states.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.states.is_empty()
+        self.data.states.is_empty()
     }
     pub fn state(&self, id: BlockStateId) -> Option<&BlockState> {
-        self.states.get(id.0 as usize)
+        self.data.states.get(id.0 as usize)
     }
     pub fn id(&self, state: &BlockState) -> Option<BlockStateId> {
-        match self.ids.get(&state_key(state)) {
-            Some(&id) if self.states[id as usize] == *state => Some(BlockStateId(id)),
-            _ => self.collided.get(state).copied(),
-        }
+        self.data.id(state)
     }
 
     /// The id a saved palette entry resolves to, with `decode_column`'s rules:
@@ -287,7 +268,7 @@ impl BlockRegistry {
         id
     }
     pub fn default_state(&self, name: &str) -> Option<BlockStateId> {
-        self.defaults.get(name).copied()
+        self.data.defaults.get(name).copied()
     }
 
     /// The values `property` takes on `block`, in `Property.getPossibleValues`
@@ -297,6 +278,7 @@ impl BlockRegistry {
     pub fn property_values(&self, block: &str, property: &str) -> Vec<&str> {
         let mut values: Vec<&str> = Vec::new();
         for state in self
+            .data
             .states
             .iter()
             .filter(|state| state.name.as_str() == block)
@@ -408,7 +390,7 @@ impl<'r> BlockTableFile<'r> {
     /// Reads `bytes`, checking every `states` list of the root compound and
     /// of the compounds directly under it against `registry`.
     pub fn read(bytes: &[u8], registry: &'r BlockRegistry) -> io::Result<Self> {
-        let mut visit = |states: &mut crate::nbt::ListElements<'_, '_, '_>| {
+        let mut visit = |states: &mut horizon_core::nbt::ListElements<'_, '_, '_>| {
             if states.len() != registry.len() {
                 return Err(states.error("table registry size mismatch"));
             }
@@ -423,9 +405,9 @@ impl<'r> BlockTableFile<'r> {
             }
             Ok(())
         };
-        let (named, _) = crate::nbt::read_named_streaming(
+        let (named, _) = horizon_core::nbt::read_named_streaming(
             bytes,
-            crate::nbt::Limits::tables(),
+            horizon_core::nbt::Limits::tables(),
             "states",
             &mut visit,
         )
@@ -447,73 +429,9 @@ impl<'r> BlockTableFile<'r> {
 }
 
 #[cfg(test)]
-mod session_registry_tests {
-    use super::*;
-    fn registry(default: i64) -> BlockRegistry {
-        BlockRegistry::from_states(
-            vec![
-                BlockState {
-                    name: "test:block".into(),
-                    properties: BTreeMap::from([("variant".into(), "a".into())]).into(),
-                },
-                BlockState {
-                    name: "test:block".into(),
-                    properties: BTreeMap::from([("variant".into(), "b".into())]).into(),
-                },
-            ],
-            BTreeMap::from([("test:block".into(), default)]),
-        )
-        .unwrap()
-    }
-    #[test]
-    fn equality_ignores_saved_palette_memoization_but_compares_native_identity() {
-        let first = registry(0);
-        let identical = registry(0);
-        first
-            .saved_states
-            .write()
-            .unwrap()
-            .insert(Tag::String("test:block".into()), Some(BlockStateId(0)));
-        assert!(
-            first == identical,
-            "warming a palette cache does not change registry identity"
-        );
-        assert!(
-            first != registry(1),
-            "default state IDs belong to registry identity"
-        );
-        let mut different_index = registry(0);
-        different_index.ids.clear();
-        assert!(
-            first != different_index,
-            "lookup indexes belong to registry identity"
-        );
-        let mut different_collision = registry(0);
-        different_collision
-            .collided
-            .insert(different_collision.states[0].clone(), BlockStateId(1));
-        assert!(
-            first != different_collision,
-            "collision resolutions belong to registry identity"
-        );
-    }
-
-    #[test]
-    fn repeated_sessions_share_only_identical_registries() {
-        let first = registry(0).shared_static();
-        for _ in 0..20 {
-            assert!(std::ptr::eq(first, registry(0).shared_static()));
-        }
-        let changed = registry(1).shared_static();
-        assert!(!std::ptr::eq(first, changed));
-        assert_eq!(changed.default_state("test:block"), Some(BlockStateId(1)));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbt::{Compound, JavaString};
+    use horizon_core::nbt::{Compound, JavaString};
 
     fn state(name: &str, properties: &[(&str, &str)]) -> Tag {
         let mut map = Compound::new();

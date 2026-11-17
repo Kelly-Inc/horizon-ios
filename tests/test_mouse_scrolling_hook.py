@@ -14,7 +14,7 @@ class MouseScrollingHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_axes_accumulation_context_gates_and_cancellation(self):
         source = "".join((ROOT / "crates/horizon-client/src" / path).read_text(encoding="utf-8")
-                         for path in ("game/play_input.rs", "game.rs"))
+                         for path in ("game/interface/play_input.rs", "game/runtime/window_handler.rs", "game.rs"))
         start = source.index("                    let (raw_x, raw_y) = match delta")
         normalize = source[start:source.index("                    // ScreenEvent.MouseScrolled.Pre", start)]
         start = source.index("                    if self.hotbar_takes_wheel()", start)
@@ -36,24 +36,23 @@ struct SpectatorGui { active: bool }
 impl SpectatorGui { fn is_menu_active(&self) -> bool { self.active } }
 fn glfw_modifiers(bits: u32) -> u32 { bits }
 struct Game { screen: Screen, overlay: bool, sleeping: Option<()>, player: Option<Player>,
-    zoom_claimed: bool, legacy_claimed: bool, synthetic: bool, cancel: bool, mouse: mouse::MouseLook, selected: usize,
+    zoom_claimed: bool, synthetic: bool, cancel: bool, mouse: mouse::MouseLook, selected: usize,
     settings: Settings, physical_buttons: HashSet<MouseButton>, cursor: (f32, f32), modifiers: u32,
-    spectator: bool, spectator_gui: SpectatorGui, menu_scrolls: Vec<i32>, legacy_calls: usize,
+    spectator: bool, spectator_gui: SpectatorGui, menu_scrolls: Vec<i32>,
     calls: Vec<([f64; 2], [i32; 2], [bool; 3], [f32; 2], u32)> }
 impl Game {
     fn new() -> Self { Self { screen: Screen::Playing, overlay: false, sleeping: None,
-        player: Some(Player { flying_speed: 0.1 }), zoom_claimed:false, legacy_claimed: false, synthetic: false,
-        cancel: false, mouse: mouse::MouseLook::default(), selected: 4,
+        player: Some(Player { flying_speed: 0.1 }),
+        zoom_claimed: false, synthetic: false, cancel: false, mouse: mouse::MouseLook::default(), selected: 4,
         settings: Settings { discrete_scroll: false, mouse_wheel_sensitivity: 1.0 },
         physical_buttons: HashSet::from([MouseButton::Left, MouseButton::Right]),
         cursor: (10.0, 20.0), modifiers: 5, spectator: false, spectator_gui: SpectatorGui { active: false },
-        menu_scrolls: vec![], legacy_calls: 0, calls: vec![] } }
+        menu_scrolls: vec![], calls: vec![] } }
     fn screen_over_playing(&self) -> bool { self.overlay }
+    fn extras_scroll(&mut self, _: f32) -> bool { self.zoom_claimed }
     fn pad_synthetic_input(&self) -> bool { self.synthetic }
     fn spectator(&self) -> bool { self.spectator }
     fn spectator_scroll(&mut self, steps: i32) { self.menu_scrolls.push(steps); }
-    fn extras_scroll(&mut self,_:f32)->bool{self.zoom_claimed}
-    fn native_wheel_event(&mut self, _: f32) -> bool { self.legacy_calls += 1; self.legacy_claimed }
     fn native_mouse_scrolling(&mut self, scroll: [f64;2], accumulated: [i32;2], buttons: [bool;3],
         cursor: [f32;2], modifiers: u32, canceled: &mut bool) {
         self.calls.push((scroll, accumulated, buttons, cursor, modifiers)); *canceled = self.cancel;
@@ -69,10 +68,11 @@ impl Game {
 fn horizontal_fractional_steps_and_context() {
     let mut game = Game::new();
     game.wheel(MouseScrollDelta::LineDelta(0.25, 0.0)).unwrap();
-    assert_eq!(game.selected, 4); assert!(game.calls.is_empty());
+    assert_eq!(game.selected, 4);
     game.wheel(MouseScrollDelta::LineDelta(0.75, 0.0)).unwrap();
-    assert_eq!(game.selected, 5); assert_eq!(game.legacy_calls, 2);
-    assert_eq!(game.calls, [([0.75,0.0], [1,0], [true,false,true], [10.0,20.0],5)]);
+    assert_eq!(game.selected, 5);
+    assert_eq!(game.calls, [([0.25,0.0], [0,0], [true,false,true], [10.0,20.0],5),
+        ([0.75,0.0], [1,0], [true,false,true], [10.0,20.0],5)]);
     let mut game = Game::new(); game.settings.mouse_wheel_sensitivity = 2.0;
     game.wheel(MouseScrollDelta::PixelDelta(Point { x: 60.0, y: -30.0 })).unwrap();
     assert_eq!(game.calls[0].0, [4.0,-2.0]); assert_eq!(game.calls[0].1, [4,-2]);
@@ -90,9 +90,9 @@ fn cancellation_consumes_steps_and_preserves_gameplay() {
             assert_eq!(game.player.as_ref().unwrap().flying_speed,0.1);
             game.cancel = false;
             game.wheel(MouseScrollDelta::LineDelta(0.0,0.25)).unwrap();
-            assert_eq!(game.calls.len(),1);
-            game.wheel(MouseScrollDelta::LineDelta(0.0,0.75)).unwrap();
             assert_eq!(game.calls.len(),2);
+            game.wheel(MouseScrollDelta::LineDelta(0.0,0.75)).unwrap();
+            assert_eq!(game.calls.len(),3);
             if !spectator { assert_eq!(game.selected,3); }
             else if menu { assert_eq!(game.menu_scrolls,[-1]); }
             else { assert!(game.player.as_ref().unwrap().flying_speed > 0.1); }
@@ -100,16 +100,21 @@ fn cancellation_consumes_steps_and_preserves_gameplay() {
     }
 }
 #[test]
-fn source_and_legacy_gates() {
-    for gate in 0..7 {
+fn gameplay_gates() {
+    for gate in 0..5 {
         let mut game = Game::new();
         match gate { 0 => game.screen = Screen::Other, 1 => game.overlay = true,
-            2 => game.sleeping = Some(()), 3 => game.player = None,
-            4 => game.legacy_claimed = true, 5 => game.synthetic = true, _ => game.zoom_claimed = true }
+            2 => game.sleeping = Some(()), 3 => game.player = None, _ => game.zoom_claimed = true }
         game.wheel(MouseScrollDelta::LineDelta(0.0,1.0)).unwrap();
         assert!(game.calls.is_empty());
-        assert_eq!(game.selected, if gate==5 {3} else {4});
+        assert_eq!(game.selected, 4);
     }
+}
+#[test]
+fn synthetic_scroll_does_not_call_native_hook() {
+    let mut game = Game::new(); game.synthetic = true;
+    game.wheel(MouseScrollDelta::LineDelta(0.0,1.0)).unwrap();
+    assert!(game.calls.is_empty()); assert_eq!(game.selected,3);
 }
 """.replace("MOUSE_PATH", (ROOT / "crates/horizon-client-input/src/mouse.rs").as_posix()).replace("NORMALIZE", normalize).replace("HOTBAR", hotbar).replace("DISPATCH", dispatch)
         with tempfile.TemporaryDirectory() as folder:

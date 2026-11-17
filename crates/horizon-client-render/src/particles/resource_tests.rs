@@ -42,7 +42,11 @@ fn vanilla_particle_description_resolves_foreign_and_default_namespace_sprites()
         )
         .unwrap();
         let atlas = HashMap::from([(atlas_key.to_owned(), test_rect())]);
-        let mut engine = ParticleEngine::new(&root, &atlas, &HashSet::new());
+        let mut engine = ParticleEngine::new(
+            &ResourceSource::directory(root.clone()),
+            &atlas,
+            &HashSet::new(),
+        );
         let particle = engine
             .make(
                 &ParticleOptions::simple(ParticleType::Smoke),
@@ -82,7 +86,11 @@ fn nested_native_particle_id_keeps_sprite_frames_and_declared_behaviour() {
         ("gems:particle/trails/bright".into(), test_rect()),
         ("particle/spark".into(), test_rect()),
     ]);
-    let mut engine = ParticleEngine::new(&root, &atlas, &HashSet::new());
+    let mut engine = ParticleEngine::new(
+        &ResourceSource::directory(root.clone()),
+        &atlas,
+        &HashSet::new(),
+    );
     let particle = engine.make(
         &ParticleOptions::named("gems:trails/spark"),
         [0.0, 0.0, -3.0],
@@ -118,7 +126,11 @@ fn resource_reload_clears_old_live_pending_emitters_and_firework_groups() {
         ("particle/smoke".into(), test_rect()),
         ("gems:particle/new".into(), test_rect()),
     ]);
-    let mut engine = ParticleEngine::new(&root, &atlas, &HashSet::new());
+    let mut engine = ParticleEngine::new(
+        &ResourceSource::directory(root.clone()),
+        &atlas,
+        &HashSet::new(),
+    );
     let smoke = engine
         .make(
             &ParticleOptions::simple(ParticleType::Smoke),
@@ -128,7 +140,7 @@ fn resource_reload_clears_old_live_pending_emitters_and_firework_groups() {
         )
         .unwrap();
     engine.particles.push(smoke.clone());
-    engine.pending.push(smoke);
+    engine.pending.push(PendingParticle::Ordinary(smoke));
     engine.tracking_emitter_for(
         ParticleOptions::simple(ParticleType::Smoke),
         TrackingTarget::LocalPlayer,
@@ -146,11 +158,28 @@ fn resource_reload_clears_old_live_pending_emitters_and_firework_groups() {
         [0.0; 3],
         true,
     );
+    // Move the real queued Starter into the live list, and leave another in
+    // the pending FIFO: a reload must discard both generations of firework work.
+    let PendingParticle::Starter(starter) = engine.pending.pop().unwrap() else {
+        panic!("fireworks must queue a starter");
+    };
+    engine.starters.push(starter);
+    engine.fireworks(
+        [0.0; 3],
+        [0.0; 3],
+        vec![FireworkExplosion::default()],
+        [0.0; 3],
+        true,
+    );
     assert!(!engine.particles.is_empty());
     assert!(!engine.pending.is_empty());
     assert!(!engine.emitters.is_empty());
     assert!(!engine.starters.is_empty());
-    engine.reload(&root, &atlas, &HashSet::new());
+    engine.reload(
+        &ResourceSource::directory(root.clone()),
+        &atlas,
+        &HashSet::new(),
+    );
     // Pinned 26.3 ParticleResources' apply callback clears live groups,
     // queued particles, tracking emitters and group counts before rebinding.
     println!(
@@ -192,12 +221,16 @@ fn prepared_particle_reload_needs_no_files_and_discards_old_controlled_handles()
         ("particle/smoke".into(), test_rect()),
         ("gems:particle/spark".into(), test_rect()),
     ]);
-    let mut engine = ParticleEngine::new(&root, &atlas, &HashSet::new());
+    let mut engine = ParticleEngine::new(
+        &ResourceSource::directory(root.clone()),
+        &atlas,
+        &HashSet::new(),
+    );
     let controlled = engine
         .controlled("gems:trails/spark", [0.0; 3], false, NoopController)
         .unwrap();
     engine.particles.push(controlled.clone());
-    engine.pending.push(controlled);
+    engine.pending.push(PendingParticle::Ordinary(controlled));
     let smoke = engine
         .make(
             &ParticleOptions::simple(ParticleType::Smoke),
@@ -207,7 +240,7 @@ fn prepared_particle_reload_needs_no_files_and_discards_old_controlled_handles()
         )
         .unwrap();
     engine.particles.push(smoke);
-    let prepared = PreparedParticles::load(&root);
+    let prepared = PreparedParticles::load(&ResourceSource::directory(root.clone()));
     std::fs::remove_dir_all(&root).unwrap();
     let changed_rect = Rect {
         u0: 0.0,

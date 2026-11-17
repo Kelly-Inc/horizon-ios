@@ -11,21 +11,21 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const TRANSACTION: &str = ".mod-browser-transaction";
 
-pub(super) fn lock_home(home: &Path, cancel: &Cancellation) -> Result<File, String> {
-    fs::create_dir_all(home).map_err(|e| e.to_string())?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.join(".mod-browser.lock"))
-        .map_err(|e| e.to_string())?;
+pub(super) fn lock_home(
+    home: &Path,
+    cancel: &Cancellation,
+) -> Result<horizon_mod_package::install_lock::HomeLockGuard, String> {
     loop {
         check_cancel(cancel)?;
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
-            Err(fs::TryLockError::Error(e)) => return Err(e.to_string()),
+        match horizon_mod_package::install_lock::try_lock_home_checked(home) {
+            Ok(Some(guard)) => return Ok(guard),
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                return Err(format!(
+                    "cannot lock mod browser in {}: {error}",
+                    home.display()
+                ));
+            }
         }
     }
 }
@@ -125,7 +125,7 @@ fn read_journal(path: &Path) -> Result<Journal, String> {
         &Cancellation::default(),
     )?;
     let journal: Journal = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if !horizon_mods::index::valid_id(&journal.id) {
+    if !horizon_mod_package::index::valid_id(&journal.id) {
         return Err("invalid mod transaction id".into());
     }
     Ok(journal)

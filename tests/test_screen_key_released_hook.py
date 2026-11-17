@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import unittest
 
+from native_hook_sources import native_hook_sources
+
 from test_world_input_capture import method
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,8 +16,8 @@ class ScreenKeyReleasedHookTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
     def test_cancelled_release_still_releases_every_binding(self):
         source = "".join((ROOT / "crates/horizon-client/src" / path).read_text(encoding="utf-8")
-                         for path in ("game/play_input.rs", "game/key_codes.rs", "game.rs"))
-        hooks = (ROOT / "crates/horizon-client/src/game/native_hooks.rs").read_text(encoding="utf-8")
+                         for path in ("game/interface/play_input.rs", "game/interface/key_codes.rs", "game/runtime/window_handler.rs", "game.rs"))
+        hooks = native_hook_sources()
         gate = method(hooks.replace("pub(super) fn", "fn"), "screen_key_released")
         mapping = method(source, "mapped_key_event").replace('cfg!(target_os = "ios")', 'self.ios')
         button = method(source.replace("pub(super) fn keyboard_button(", "    fn keyboard_button("), "keyboard_button")
@@ -94,7 +96,7 @@ fn release_and_screen_gates() {
         let handled=if ios && state==ElementState::Released && matches!(key,PhysicalKey::Code(_)){0}else{handled};
         game.dispatch(WindowEvent::KeyboardInput { event: KeyEvent { state, physical_key: key } }).unwrap();
         assert_eq!(game.extra_releases,usize::from(ios&&handled==0));
-        assert_eq!(game.native_releases,usize::from(ios&&handled==0));
+        assert_eq!(game.native_releases,0);
         assert_eq!((game.calls.get(), game.handled), (expected_calls, handled));
         if handled == 0 { if matches!(key,PhysicalKey::Code(1)){assert!(!game.keys.contains(&1));} assert_eq!(game.released, if ios {vec![(false,10),(false,11),(true,2)]}else{vec![(false,10),(false,11)]}); }
         game.dispatch(WindowEvent::Other).unwrap();
@@ -110,7 +112,7 @@ fn release_and_screen_gates() {
     }
     }}
 }
-""".replace("SYNTHETIC", method((ROOT / "crates/horizon-client/src/game/touch.rs").read_text(), "touch_synthetic_input")).replace("GATE", gate.replace("super::glfw_modifiers", "glfw_modifiers")).replace("MAPPING", mapping).replace("DISPATCH", dispatch).replace("BUTTON", button)
+""".replace("SYNTHETIC", method((ROOT / "crates/horizon-client/src/game/interface/touch.rs").read_text(), "touch_synthetic_input")).replace("GATE", gate.replace("super::glfw_modifiers", "glfw_modifiers")).replace("MAPPING", mapping).replace("DISPATCH", dispatch).replace("BUTTON", button)
         with tempfile.TemporaryDirectory() as folder:
             src, exe = Path(folder) / "release.rs", Path(folder) / "release.exe"
             src.write_text(fixture, encoding="utf-8")

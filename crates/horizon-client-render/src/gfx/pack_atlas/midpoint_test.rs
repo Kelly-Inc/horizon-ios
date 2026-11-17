@@ -6,6 +6,7 @@ use wgpu::util::DeviceExt;
 
 #[test]
 fn mid_tex_coord_follows_each_quads_mapped_corners() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         return;
@@ -125,6 +126,7 @@ fn mid_tex_coord_follows_each_quads_mapped_corners() {
 /// sprite's own pixels, so a corner is half the sprite's own side from `mc_midTexCoord`.
 #[test]
 fn flat_draws_map_uvs_onto_a_stitched_sprite() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         return;
@@ -168,6 +170,99 @@ fn flat_draws_map_uvs_onto_a_stitched_sprite() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// #16758: a small model element samples its own sprite region, not a wider one. The redstone
+/// torch's flame is a 2x2-pixel element with UVs [7, 6]-[9, 8] of a 16-pixel sprite. Whatever
+/// padding the Mipmap Levels and anisotropy options give the sprite's holder, the element's
+/// corners must land on its own [7, 9] x [6, 8] pixels of it, and `mc_midTexCoord` on its middle.
+#[test]
+fn a_small_elements_flat_uvs_cover_its_own_sprite_region() {
+    let instance = crate::gfx::test_gpu::instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        return;
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    // The flame's UVs, as the model asks for them.
+    let uv = [
+        [7. / 16., 6. / 16.],
+        [9. / 16., 6. / 16.],
+        [9. / 16., 8. / 16.],
+        [7. / 16., 8. / 16.],
+    ];
+    let positions = [[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]];
+    let vertices: Vec<_> = (0..4)
+        .map(|k| TerrainVertex::new(positions[k], uv[k], 0x8000, u32::MAX, 0))
+        .collect();
+    let origin = f32::from_bits((1. / UV_STEPS).to_bits());
+    // The same quad in the compact layout, as a solid quad on the block grid reaches a pack:
+    // one record, padded to a whole quad of slots (`mesher::packed::place`).
+    let record = crate::mesher::packed::pack_quad(
+        vertices.as_chunks::<4>().0.first().unwrap(),
+        crate::mesher::packed::WHITE,
+    )
+    .expect("the flame's grid position and 1/32-step UVs pack");
+    let records = [record, [0; 6], [0; 6], [0; 6]];
+    // The game's Mipmap Levels option, and 16x anisotropy with anisotropic filtering on: the
+    // padding is vanilla's `1 << level`, times 8 at that bit. One 16 px sprite in a holder of
+    // 16 + 2 * padding, rounded up to the mip step, in an atlas of that power of two.
+    for (mip, anisotropy) in [(0u32, 0u32), (4, 0), (4, 4)] {
+        let padding: u32 = (1 << mip) << anisotropy.saturating_sub(1).min(4);
+        let holder = (16 + 2 * padding).div_ceil(1 << mip) << mip;
+        let atlas_side = holder.next_power_of_two();
+        let array = super::tests::upscaled_array(&device, &queue, &[16]);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let atlas = PackAtlas::stitched(
+            &device,
+            &mut encoder,
+            &[array],
+            1,
+            16,
+            &[16],
+            mip,
+            anisotropy,
+        )
+        .unwrap();
+        queue.submit([encoder.finish()]);
+        let corner = padding | padding << 16;
+        assert_eq!(
+            (atlas.size(), atlas.rects_table()),
+            ([atlas_side, atlas_side], vec![corner, 16])
+        );
+        for shadow in [false, true] {
+            let pixels = sample(&device, &queue, &atlas, &vertices, origin, [true, shadow]);
+            let packed = sample_page(
+                &device,
+                &queue,
+                &atlas,
+                bytemuck::cast_slice(&records),
+                crate::mesher::packed::PACKED_BASE..crate::mesher::packed::PACKED_BASE + 4,
+                origin,
+                [true, shadow],
+                "vec4(mc_midTexCoord, gl_MultiTexCoord0.xy)",
+            );
+            let corner = padding as f32;
+            let side = atlas_side as f32;
+            for (k, [u, v]) in uv.iter().enumerate() {
+                let expected = [
+                    (corner + 8.) / side,
+                    (corner + 7.) / side,
+                    (corner + u * 16.) / side,
+                    (corner + v * 16.) / side,
+                ];
+                for actual in [pixels[k], packed[k]] {
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(a, b)| (a - b).abs() < 1e-6),
+                        "corner {k}, mip={mip} anisotropy={anisotropy}, shadow={shadow}: \
+                         {actual:?} != {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Read back with a probe pack of ours, Iris 1.11.7's terrain `gl_Vertex` (camera on the block
 /// grid) puts a water top, 8/9 - 0.001 of a block up, at 29094/32768, and plants offset by 13/15
 /// and 0.1 of a block at 28398/32768 and 3276/32768 (#8464): each 32768th below the position.
@@ -175,6 +270,7 @@ fn flat_draws_map_uvs_onto_a_stitched_sprite() {
 /// below a grid line: Iris reads plants offset by 9/15 exactly on a half block.
 #[test]
 fn terrain_vertices_go_down_to_the_32768th_below_them() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         return;
@@ -212,7 +308,7 @@ fn terrain_vertices_go_down_to_the_32768th_below_them() {
             [32768.0, 16384.0, 311296.0],
         ),
         // Keep the zero control and pad a second complete source quad: the
-        // production terrain metadata sidecars are addressed per four vertices.
+        // production metadata follows the physical arena slots of both layouts.
         ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
         ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
         ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
@@ -248,11 +344,135 @@ fn terrain_vertices_go_down_to_the_32768th_below_them() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-// Shader packs intentionally use raw terrain with per-quad metadata: see
-// Renderer::follow_packed_layout and SectionMesh::upload_states. Forcing compact
-// records into this shader probe would bypass that contract. The supported raw
-// attribute and lighting paths are exercised end to end in pack_terrain_tests;
-// mesher::packed tests cover compact records used by ordinary terrain rendering.
+/// A shader pack's flat terrain inputs read a compact record (`mesher::packed`) as the four
+/// vertices it holds: a whole tinted face with its own ambient occlusion per corner
+/// (`separateAo`), two more, and a slab's top kept as its vertices (`packed::FULL`).
+#[test]
+fn compact_records_feed_a_pack_the_vertices_they_hold() {
+    let _gpu = crate::gfx::test_gpu::lock();
+    use crate::mesher::packed;
+    let instance = crate::gfx::test_gpu::instance();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        return;
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 16,
+            height: 16,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let mut atlas = PackAtlas::new(&device, &mut encoder, &[texture], 1, 1, 16).unwrap();
+    queue.submit([encoder.finish()]);
+    atlas.separate_ao = true;
+    let tint = 0x7F_B238u32;
+    let ao = [255u32, 153, 102, 204];
+    let face = |x: f32, y: f32| {
+        let pos = [
+            [x, y, 5.0],
+            [x, y, 6.0],
+            [x + 1.0, y, 6.0],
+            [x + 1.0, y, 5.0],
+        ];
+        let uv = [[0, 0], [16 << 10, 0], [16 << 10, 16 << 10], [0, 16 << 10]];
+        (0..4).map(move |i| {
+            let [r, g, b] = [16, 8, 0].map(|s| 200 * (tint >> s & 255) / 255);
+            TerrainVertex {
+                pos: pos[i],
+                uv: uv[i],
+                layer: 0x8000,
+                light: 0xF0 | 0x40 << 8,
+                color: r | g << 8 | b << 16 | ao[i] << 24,
+            }
+        })
+    };
+    let solid: Vec<_> = [(3.0, 16.0), (5.0, 16.0), (7.0, 16.0), (3.0, 8.5)]
+        .into_iter()
+        .flat_map(|(x, y)| face(x, y))
+        .collect();
+    let records = packed::layout(&solid, &[tint; 4]);
+    assert_eq!(
+        packed::packed_quads(&records, 4),
+        3,
+        "whole faces pack, the slab doesn't"
+    );
+    let page = bytemuck::cast_slice(&records);
+    let packed_range = packed::PACKED_BASE..packed::PACKED_BASE + 16;
+    let origin = f32::from_bits((1. / UV_STEPS).to_bits());
+    let mut failures = Vec::new();
+    for expression in [
+        "gl_Vertex",
+        "gl_Color",
+        "vec4(gl_MultiTexCoord0.xy, gl_MultiTexCoord1.xy)",
+        "vec4(gl_Normal, 0.0)",
+        "at_tangent",
+        "at_midBlock",
+        "vec4(mc_midTexCoord, mc_Entity.xy)",
+    ] {
+        for shadow in [false, true] {
+            let flags = [true, shadow];
+            let wide = sample_probe(&device, &queue, &atlas, &solid, origin, flags, expression);
+            let compact = sample_page(
+                &device,
+                &queue,
+                &atlas,
+                page,
+                packed_range.clone(),
+                origin,
+                flags,
+                expression,
+            );
+            let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|f| f.to_bits()).collect::<Vec<_>>();
+            if bits(&wide) != bits(&compact) {
+                failures.push(format!(
+                    "{expression} shadow={shadow}: {wide:?} != {compact:?}"
+                ));
+            }
+            if expression == "gl_Color" {
+                for (corner, want) in ao.iter().enumerate() {
+                    let got = compact[corner][3];
+                    if (got - *want as f32 / 255.0).abs() > 1e-6 {
+                        failures.push(format!("corner {corner}'s alpha {got} != {want}/255"));
+                    }
+                }
+            }
+        }
+    }
+    // A pack's frames keep the translucent quads in the section arena after the solid range: three
+    // records and no `FULL` quad, then a water quad, whose corners must read as its own.
+    let mut page: Vec<[u32; 6]> = packed::layout(&solid[..12], &[tint; 3]);
+    let water: Vec<_> = face(9.0, 15.0).collect();
+    let at = page.len() as u32;
+    page.extend(water.iter().map(|v| bytemuck::cast::<_, [u32; 6]>(*v)));
+    for expression in ["vec4(gl_Normal, 0.0)", "at_tangent", "at_midBlock"] {
+        let flags = [true, false];
+        let wide = sample_probe(&device, &queue, &atlas, &water, origin, flags, expression);
+        let page = bytemuck::cast_slice(&page);
+        let after = sample_page(
+            &device,
+            &queue,
+            &atlas,
+            page,
+            at..at + 4,
+            origin,
+            flags,
+            expression,
+        );
+        if wide != after {
+            failures.push(format!("water {expression}: {wide:?} != {after:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 
 fn sample(
     device: &wgpu::Device,
@@ -443,13 +663,50 @@ fn sample_page(
         bytemuck::cast_slice(&[-1i32, 0, 0, 0, 0].repeat(quads)),
         wgpu::BufferUsages::STORAGE,
     );
-    // The production arena uploads one encoded metadata sidecar per quad at
-    // set 3, binding 2; it is independent of the vertex page and sprite layer.
-    let states: Vec<_> = (0..quads)
-        .map(|state| {
-            crate::gfx::terrain_metadata::encode(QuadState::new(state as u32, [0; 3], false))
-        })
-        .collect();
+    // These vertices bypass the CPU mesher. Supply the matching lighting
+    // sidecars explicitly; native alpha remains vertex data, not an AO channel
+    // the production shader adapter may reinterpret.
+    let stride = std::mem::size_of::<TerrainVertex>();
+    let mut states = vec![crate::gfx::terrain_metadata::encode(QuadState::UNKNOWN); vertices];
+    for first in (drawn.start..drawn.end).step_by(4) {
+        let packed = first >= crate::mesher::packed::PACKED_BASE;
+        let slot = if packed {
+            ((first - crate::mesher::packed::PACKED_BASE) / 4) as usize
+        } else {
+            first as usize
+        };
+        let quad: [TerrainVertex; 4] = if packed {
+            let words: [u32; 6] =
+                bytemuck::pod_read_unaligned(&page[slot * stride..(slot + 1) * stride]);
+            if words[5] & crate::mesher::packed::FULL == 0 {
+                std::array::from_fn(|corner| crate::mesher::packed::packed_vertex(&words, corner))
+            } else {
+                let raw = slot + words[0] as usize;
+                std::array::from_fn(|corner| {
+                    bytemuck::pod_read_unaligned(
+                        &page[(raw + corner) * stride..(raw + corner + 1) * stride],
+                    )
+                })
+            }
+        } else {
+            std::array::from_fn(|corner| {
+                bytemuck::pod_read_unaligned(
+                    &page[(slot + corner) * stride..(slot + corner + 1) * stride],
+                )
+            })
+        };
+        let tint = quad[0].color | 0xff000000;
+        let state = QuadState {
+            lighting: atlas.separate_ao.then_some(crate::mesher::QuadLighting {
+                tint,
+                shaded_tint: tint,
+                no_directional: quad.map(|vertex| vertex.color),
+            }),
+            ..QuadState::new(0, [0; 3], false)
+        };
+        let encoded = crate::gfx::terrain_metadata::encode(state);
+        states[slot..slot + if packed { 1 } else { 4 }].fill(encoded);
+    }
     let metadata = buffer(bytemuck::cast_slice(&states), wgpu::BufferUsages::STORAGE);
     let data = buffer(
         page,

@@ -12,6 +12,7 @@ const ATLAS: [u8; 4] = [10, 200, 30, 255];
 
 #[test]
 fn unknown_samplers_and_colortex0_to_3_in_gbuffers_terrain_read_the_atlas() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let Some(gpu) = Gpu::new() else { return };
     let files = vec![
         ("final.vsh".to_owned(), VERTEX.to_owned()),
@@ -118,7 +119,7 @@ fn unknown_samplers_and_colortex0_to_3_in_gbuffers_terrain_read_the_atlas() {
             usage: wgpu::BufferUsages::VERTEX,
         });
     let terrain_group = unused_terrain_group(&post, &gpu.device);
-    let hud = HudBatch::new(SIZE);
+    let hud = HudBatch::scratch(SIZE);
     let frame = fixture_frame(&hud);
     let pixels = gpu.render(&mut post, &color, &depth, &frame, &mut |rp, list, _, _| {
         if list == TerrainList::Solid {

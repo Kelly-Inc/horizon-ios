@@ -8,6 +8,7 @@
       "/crates/horizon-addresses/**",
       "/crates/horizon-bench/**",
       "/crates/horizon-core/**",
+      "/crates/horizon-guest-stack/**",
       "/crates/horizon-hooks/**",
       "/crates/horizon-perf-format/**",
       "/crates/horizon-platform/**",

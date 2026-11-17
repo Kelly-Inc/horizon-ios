@@ -206,6 +206,15 @@ impl ExclusiveRoot {
     }
 }
 
+// A subprocess spawn can briefly inherit other tests' lock descriptors before
+// close-on-exec. Keep lock-release assertions out of that spawn window, without
+// weakening the production locks or the cross-process ownership test.
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +233,7 @@ mod tests {
 
     #[test]
     fn clones_and_delayed_readers_keep_the_same_root_locked() {
+        let _serial = test_guard();
         let root = root("clone");
         fs::write(root.join("lazy.bin"), b"old snapshot").unwrap();
         let lease = RootLease::acquire(&root).unwrap();
@@ -238,6 +248,7 @@ mod tests {
 
     #[test]
     fn an_overlay_keeps_its_managed_base_alive() {
+        let _serial = test_guard();
         let base = root("parent");
         let overlay = base.with_file_name("00000000000000cd");
         fs::create_dir_all(&overlay).unwrap();
@@ -251,6 +262,7 @@ mod tests {
 
     #[test]
     fn dropping_a_newer_acquisition_does_not_hide_the_older_reader() {
+        let _serial = test_guard();
         let root = root("two-readers");
         let older = RootLease::acquire(&root).unwrap();
         let newer = RootLease::acquire(&root).unwrap();
@@ -266,6 +278,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn canonical_and_symlink_spellings_share_reader_protection() {
+        let _serial = test_guard();
         let root = root("aliases");
         let cache = root.parent().unwrap().parent().unwrap();
         let alias = cache.with_extension("alias");
@@ -298,6 +311,7 @@ mod tests {
 
     #[test]
     fn another_process_prevents_collection_until_it_releases() {
+        let _serial = test_guard();
         let root = root("process");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["root_lease::tests::lease_child", "--exact", "--nocapture"])

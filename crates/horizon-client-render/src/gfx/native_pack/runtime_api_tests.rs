@@ -1,4 +1,4 @@
-//! Check-only shader API lines must never become a partial runtime pack.
+//! The current checked shader API reaches its post, tonemap and linear runtime pipelines.
 use super::*;
 use horizon_shader_api::{MANIFEST, Pack, check};
 
@@ -7,8 +7,8 @@ fn checked(api: &str, extra: &str, tonemap: bool) -> Report {
     let source = if tonemap {
         "fn tonemap(input: TonemapInput) -> vec3<f32> { return input.color; }"
     } else {
-        // Read a field in the legacy prefix as well as writing a known colour.
-        "fn post(input: PostInput) -> vec4<f32> { return vec4<f32>(16.0/255.0,128.0/255.0,240.0/255.0,1.0+frame.time*0.0); }"
+        // Return known linear light and read a field of the current frame.
+        "fn post(input: PostInput) -> vec4<f32> { return vec4<f32>(pow(vec3<f32>(16.0/255.0,128.0/255.0,240.0/255.0),vec3<f32>(2.2)),1.0+frame.time*0.0); }"
     };
     let manifest = format!(
         "schema=1\nid=\"runtime_control\"\nname=\"Runtime control\"\nversion=\"1\"\napi=\"{api}\"\n{stage}\nfile=\"stage.wgsl\"\n{extra}"
@@ -20,7 +20,8 @@ fn checked(api: &str, extra: &str, tonemap: bool) -> Report {
 }
 
 #[test]
-fn checked_new_api_reports_are_refused_and_the_legacy_pack_keeps_rendering() {
+fn checked_current_api_builds_post_tonemap_and_linear_variants() {
+    let _gpu = crate::gfx::test_gpu::lock();
     let instance = crate::gfx::test_gpu::instance();
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         return;
@@ -35,11 +36,13 @@ fn checked_new_api_reports_are_refused_and_the_legacy_pack_keeps_rendering() {
         globals: &empty,
         flat: None,
         sprites: [1.0; 2],
+        sprite_views: &[],
         format: wgpu::TextureFormat::Rgba8Unorm,
         linear: false,
         sprite_tags: &[],
         sprite_materials: &[],
         entities: &empty,
+        retained_entities: &empty,
         weather_groups: [&empty, &empty],
         pbr: None,
     };
@@ -47,34 +50,41 @@ fn checked_new_api_reports_are_refused_and_the_legacy_pack_keeps_rendering() {
         &device,
         &queue,
         &terrain,
-        checked("0.1", "", false),
+        checked(horizon_shader_api::API, "", false),
         &[],
         Default::default(),
     )
     .unwrap();
-    assert!(current.draws());
+    assert!(!current.post.labels().is_empty());
     assert_eq!(labels, ["stage.wgsl"]);
-    for (extra, tonemap, reason) in [
-        ("", true, "tonemap"),
-        ("", false, "shader API 0.2"),
-        ("[frame]\nblend=\"linear\"\n", false, "linear"),
+    for (extra, tonemap, linear) in [
+        ("", true, false),
+        ("", false, false),
+        ("[frame]\nblend=\"linear\"\n", false, true),
     ] {
-        let report = checked("0.2", extra, tonemap);
-        assert!(
-            !report.stages.is_empty(),
-            "the public checker accepts this pack"
-        );
-        let result = NativePack::new(&device, &queue, &terrain, report, &[], Default::default());
-        let Err(error) = result else {
-            panic!(
-                "check-only shader semantics were silently enabled: {extra:?}, tonemap={tonemap}"
-            );
-        };
-        assert!(error.contains(reason), "{error}");
+        let report = checked(horizon_shader_api::API, extra, tonemap);
+        assert!(!report.stages.is_empty());
+        let candidate_shape = TerrainShape { linear, ..terrain };
+        let (built, labels) = NativePack::new(
+            &device,
+            &queue,
+            &candidate_shape,
+            report,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(built.tonemaps(), tonemap);
+        assert_eq!(labels, ["stage.wgsl"]);
     }
 
-    // A refused candidate must not replace the previously constructed 0.1 pack. Execute its
-    // real GPU pipeline after all three refusals, including the unchanged Frame prefix.
+    // The ordinary post stage still executes after constructing the other variants.
+    // Frame data has SDR headroom; zeroed uniform storage would clip every pixel.
+    let inputs = horizon_shader_api::Frame {
+        headroom: 1.0,
+        ..Default::default()
+    };
+    queue.write_buffer(&current.frame.buffer, 0, bytemuck::bytes_of(&inputs));
     let texture = |format, extra| {
         device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Native API runtime pixel control"),
@@ -130,13 +140,14 @@ fn checked_new_api_reports_are_refused_and_the_legacy_pack_keeps_rendering() {
         }),
         ..Default::default()
     });
-    current.post.as_mut().unwrap().run(
+    current.post.run(
         &device,
         &mut encoder,
         (&color_view, &depth_view, &current.frame.surface_view),
         &screen_view,
         [4, 4],
         true,
+        None,
         None,
     );
     let stride = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;

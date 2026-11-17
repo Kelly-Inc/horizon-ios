@@ -750,6 +750,7 @@ impl PackAtlas {
             "const uint hz_quad_words = {}u;\n",
             super::terrain_metadata::WORDS
         ));
+        declarations.push_str(super::terrain_metadata::SLOT_GLSL);
         let [width, height] = self.size();
         // A sprite's cell in its own sides, and the share of the atlas a side is: from the table
         // in flat draws (`rects_table`), from the grid in others.
@@ -812,7 +813,7 @@ impl PackAtlas {
         }
         body.push_str(FACE);
         body.push_str(r#"    hz_mc_entity=vec4(-1.0,0.0,0.0,0.0); hz_mid_block=vec3(0.0); hz_emission=0.0;
-    uint hz_meta=(uint(gl_VertexIndex)>>2u)*hz_quad_words;
+    uint hz_meta=hz_metadata_slot(uint(gl_VertexIndex))*hz_quad_words;
     uvec2 hz_source=uvec2(0xffffffffu,0u);
     if(hz_meta+7u<uint(hz_quad_states.length())) hz_source=uvec2(hz_quad_states[hz_meta],hz_quad_states[hz_meta+1u]);
     if(hz_source.x!=0xffffffffu){
@@ -897,6 +898,7 @@ mod tests {
     /// Two arrays of 2x2 sprites, one layer split; each layer a colour of its own.
     #[test]
     fn layers_land_in_their_cells() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
@@ -1022,6 +1024,7 @@ mod tests {
     /// by 8 atlas. Each sprite has its own pixels, and its padding repeats its edge.
     #[test]
     fn stitched_sprites_keep_their_own_size_and_padding() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;
@@ -1219,16 +1222,19 @@ mod tests {
 
     #[test]
     fn stitched_material_maps_share_colour_rectangles() {
+        let _gpu = crate::gfx::test_gpu::lock();
         material_fixture(false);
     }
 
     #[test]
     fn animated_stitched_material_updates_only_its_rectangle() {
+        let _gpu = crate::gfx::test_gpu::lock();
         material_fixture(true);
     }
 
     #[test]
     fn terrain_inputs_separate_ao_uses_metadata_not_hdr_alpha() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let instance = crate::gfx::test_gpu::instance();
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             return;

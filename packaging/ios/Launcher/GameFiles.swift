@@ -95,9 +95,10 @@ final class GameFilesDownload: NSObject, ObservableObject {
         return message
     }
 
-    /// Where a finished download waits for the importer; it consumes the file.
+    /// The importer consumes this private staging file. Keep it outside Documents,
+    /// where startup scans user-provided archives without download intent metadata.
     private nonisolated static var destination: URL {
-        GameFolder.documents.appendingPathComponent("horizon-download-\(UUID().uuidString).zip")
+        FileManager.default.temporaryDirectory.appendingPathComponent("horizon-download-\(UUID().uuidString).zip")
     }
 
     func start() {
@@ -193,6 +194,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
                       let size = values.fileSize, Int64(size) <= Self.maximumArchiveBytes else {
                     throw CocoaError(.fileReadTooLarge)
                 }
+                try FileManager.default.createDirectory(at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try FileManager.default.copyItem(at: url, to: local)
             }.value
             guard generation == attempt, !Task.isCancelled else { return }
@@ -352,6 +354,7 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
         } else {
             do {
                 let destination = Self.destination
+                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? FileManager.default.removeItem(at: destination)
                 try FileManager.default.moveItem(at: location, to: destination)
                 outcome = .success(destination)

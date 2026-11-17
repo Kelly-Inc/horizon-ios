@@ -65,6 +65,7 @@ jobs:
             --example pack_load_bench -- --scale "$SCALE") > base.md \
             || echo "The bench does not build on the base." > base.md
       - name: Summary
+        # Through the environment, as the step before: an input pasted into the script would run.
         env:
           BASE: ${{ inputs.base || 'main' }}
         run: |

@@ -3,6 +3,21 @@ use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
 
+// Adapt the original retirement regression to the production yield-based save API.
+// This is test-only scheduling: all ownership and writes go through Streaming.
+impl Streaming {
+    fn poll_save(&mut self, world: &mut World) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(2);
+        loop {
+            match self.prepare_poll_save(world, deadline) {
+                SaveStep::Pending => return false,
+                SaveStep::Full(chunk) => self.save_finished(chunk),
+                SaveStep::Protos(protos) => return self.submit_protos(protos),
+            }
+        }
+    }
+}
+
 struct HeldDecoration {
     entered: mpsc::SyncSender<()>,
     release: Mutex<mpsc::Receiver<()>>,
@@ -47,7 +62,9 @@ fn context() -> crate::Result<Arc<WorkerContext>> {
         std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES required"),
     );
     let assets = Arc::new(Assets::load(&root)?);
-    let render = Arc::new(assets.reload(&root)?);
+    let render = Arc::new(assets.reload(
+        &horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+    )?);
     let facts = BlockFacts::load(&root, assets.registry)?;
     Ok(Arc::new(WorkerContext {
         tables: Arc::new(MeshTables::new(
@@ -55,11 +72,16 @@ fn context() -> crate::Result<Arc<WorkerContext>> {
             &render,
             &facts,
             crate::models::load_visibility(&root, assets.registry)?,
+            None,
         )?),
         light: Arc::new(LightTables::load(&root, assets.registry, &facts)?),
-        biomes: Arc::new(Biomes::load(&root)?),
+        biomes: Arc::new(Biomes::load(
+            &horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+        )?),
         assets,
         render,
+        hidden_states: Arc::from([]),
+        part_tables: Default::default(),
     }))
 }
 
@@ -245,14 +267,15 @@ fn closing_stream_preserves_owned_generation_before_ack() -> crate::Result<()> {
             for i in 0..prefix {
                 streaming
                     .deferred
-                    .push(Done::Proto(i, 80, Box::new(0u64), false));
+                    .push_back(Done::Proto(i, 80, Box::new(0u64), false));
             }
-            streaming.deferred.push(done);
+            streaming.deferred.push_back(done);
         } else {
             streaming.shared.done.send(done);
         }
         streaming.protos.insert((20, 20), Some(Box::new(999u64)));
-        streaming.save_checked_out([(20, 20)]);
+        let protos = streaming.checkout_protos([(20, 20)]);
+        streaming.submit_protos(protos);
         assert_eq!(streaming.saving, 1);
         if mode.starts_with("blocking_save") {
             streaming.save(&mut world, true);

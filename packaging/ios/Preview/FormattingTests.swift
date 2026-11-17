@@ -91,6 +91,59 @@ final class GameLinkRefreshTests: XCTestCase {
         XCTAssertEqual(game.version, "current")
     }
 
+    func testQueuedJoinOffersSetupAndResumesOnceAfterRecovery() async {
+        var phase = "unknown"
+        var commands: [String] = []
+        let game = GameLink { command in
+            commands.append(command)
+            if command == "launcher-state" { return ["phase": phase, "reason": "Files are damaged"] }
+            if command.hasPrefix("launcher-start ") { return ["ok": true, "phase": "loading"] }
+            if command.hasPrefix("launcher-commit-start ") { return ["ok": true, "status": "committed"] }
+            return ["ok": true]
+        }
+        game.prepareSession = {}
+        var presentations = 0
+        game.uncover = { presentations += 1 }
+        await game.join("example.invalid")
+        phase = "needs_files"
+        await game.refresh()
+        XCTAssertTrue(game.requestingGameFiles)
+        XCTAssertFalse(commands.contains("connect example.invalid"))
+        game.requestingGameFiles = false
+        await game.refresh()
+        XCTAssertFalse(game.requestingGameFiles, "The same failure must not reopen dismissed setup")
+
+        phase = "title"
+        await game.refresh()
+        await game.refresh()
+        XCTAssertEqual(commands.filter { $0 == "connect example.invalid" }.count, 1)
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(game.launching)
+    }
+
+    func testEarlierStartReplyCannotHideRecoveryAlreadyReportedByRefresh() async {
+        let submitted = expectation(description: "start submitted")
+        var reply: CheckedContinuation<[String: Any], Never>?
+        let game = GameLink { command in
+            if command.hasPrefix("launcher-start ") {
+                return await withCheckedContinuation {
+                    reply = $0
+                    submitted.fulfill()
+                }
+            }
+            return ["phase": "needs_files", "reason": "Files are damaged"]
+        }
+        game.prepareSession = {}
+        let join = Task { await game.join("example.invalid") }
+        await fulfillment(of: [submitted], timeout: 2)
+        await game.refresh()
+        reply?.resume(returning: ["ok": true, "phase": "loading"])
+        await join.value
+
+        XCTAssertEqual(game.phase, .needsFiles("Files are damaged"))
+        XCTAssertTrue(game.requestingGameFiles)
+    }
+
     func testACancelledRefreshDoesNotPublishItsReply() async {
         let entered = expectation(description: "held refresh")
         var hold = false

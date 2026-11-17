@@ -217,14 +217,20 @@ struct HomeView: View {
                     .accessibilityIdentifier("launcher-playing-as")
             }
             HStack {
-                Button { Task { await link.play() } } label: {
+                Button {
+                    if needsFiles {
+                        link.requestingGameFiles = true
+                    } else {
+                        Task { await link.play() }
+                    }
+                } label: {
                     Label(playLabel, systemImage: "play.fill")
                         .font(.headline).frame(minWidth: 124, minHeight: 36)
                 }
                 .controlSize(.large)
                 .launcherPrimaryButton()
                 .tint(Theme.accent)
-                .disabled((download.busy && !needsFiles) || link.launching != nil)
+                .disabled(!needsFiles && (download.busy || link.launching != nil))
                 .accessibilityIdentifier("launcher-play-button")
                 if link.launching != nil {
                     Button("Cancel") { link.cancelLaunch() }.foregroundStyle(.white).frame(minHeight: 44)
@@ -257,7 +263,7 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    private var playLabel: String { link.launching ?? (needsFiles ? "Game files needed" : "Play") }
+    private var playLabel: String { needsFiles ? "Game files needed" : (link.launching ?? "Play") }
     private var needsFiles: Bool { link.needsGameFiles }
 
     private var accountSheet: some View {

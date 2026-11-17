@@ -187,10 +187,12 @@ final class GameLink: ObservableObject {
         if let version = state["version"] as? String {
             self.version = version
         }
-        if phase == .title, was != .title {
-            if let action = queued {
+        if let action = queued {
+            if phase == .title {
                 queued = nil
                 await run(action.action, attempt: action.id)
+            } else if case .needsFiles = phase, was != phase {
+                requestingGameFiles = true
             }
         }
     }
@@ -305,7 +307,11 @@ final class GameLink: ObservableObject {
         switch answer["phase"] as? String {
         case "title": phase = .title
         case "world": phase = .world
-        case "loading": phase = .loading(0)
+        case "loading":
+            // A refresh can observe a failed load while this earlier start reply
+            // is still in flight.
+            if case .needsFiles = phase { break }
+            phase = .loading(0)
         default:
             if phase == .waiting || phase == .unknown { phase = .loading(0) }
         }
@@ -408,6 +414,7 @@ final class GameLink: ObservableObject {
                 } else {
                     try self.check(attempt)
                     self.queued = (attempt.id, action)
+                    if case .needsFiles = self.phase { self.requestingGameFiles = true }
                 }
             } catch { await self.failed(attempt, error: error) }
         }

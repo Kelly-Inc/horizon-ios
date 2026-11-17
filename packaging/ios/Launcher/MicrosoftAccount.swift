@@ -352,14 +352,23 @@ final class MicrosoftAccount: ObservableObject {
         }
         let expires = now().addingTimeInterval(lifetime)
         let store = try await net.get("https://api.minecraftservices.com/entitlements/mcstore", token: token)
-        let owned = (store["items"] as? [[String: Any]] ?? []).contains {
+        guard let entitlements = store["items"] as? [[String: Any]] else {
+            throw AccountError("Minecraft could not confirm game ownership. Try again.")
+        }
+        let owned = entitlements.contains {
             ["game_minecraft", "product_minecraft"].contains($0["name"] as? String ?? "")
         }
         guard owned else { throw AccountError("This account doesn't own Minecraft: Java Edition.") }
         let profile = try await net.get("https://api.minecraftservices.com/minecraft/profile", token: token,
                                         allowErrors: true)
-        guard profile["status"] == nil, let id = profile["id"] as? String, let name = profile["name"] as? String else {
-            throw AccountError("Create your Minecraft profile on minecraft.net first.")
+        if let status = profile["status"] as? Int {
+            if status == 404 {
+                throw AccountError("Create your Minecraft profile on minecraft.net first.")
+            }
+            throw AccountError("Minecraft could not load your profile (\(status)). Try again.")
+        }
+        guard let id = profile["id"] as? String, let name = profile["name"] as? String else {
+            throw AccountError("Minecraft returned an incomplete account profile. Try again.")
         }
         try Task.checkCancellation()
         let normalized = id.replacingOccurrences(of: "-", with: "").lowercased()

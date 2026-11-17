@@ -98,16 +98,22 @@ struct AccountNet {
             throw AccountError("Could not reach the sign-in service. Check your connection and try again.")
         }
         try Task.checkCancellation()
-        let status = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
-        guard var object = (try? JSONSerialization.jsonObject(with: result.0)) as? [String: Any] else {
+        guard let response = result.1 as? HTTPURLResponse else {
             throw AccountError("The sign-in service returned an incomplete response. Try again.")
         }
+        let status = response.statusCode
+        let body = (try? JSONSerialization.jsonObject(with: result.0)) as? [String: Any]
         if !(200..<300).contains(status) {
             guard allowErrors else {
                 throw AccountError("The sign-in service is unavailable (\(status)). Try again.")
             }
-            object["status"] = status
+            var error = body ?? [:]
+            error["status"] = status
+            return error
         }
-        return object
+        guard let body else {
+            throw AccountError("The sign-in service returned an incomplete response. Try again.")
+        }
+        return body
     }
 }

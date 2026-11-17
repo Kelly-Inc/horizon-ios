@@ -40,6 +40,7 @@ private final class MemoryAccountVault: AccountVault {
 
 private final class AuthURLProtocol: URLProtocol {
     static var failure: Error?
+    static var rawBody: ((URLRequest) -> Data?)?
     static var response: (URLRequest) -> (Int, [String: Any]) = { _ in (500, [:]) }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -48,7 +49,8 @@ private final class AuthURLProtocol: URLProtocol {
         let (status, body) = Self.response(request)
         let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: try! JSONSerialization.data(withJSONObject: body))
+        let data = Self.rawBody?(request) ?? (try! JSONSerialization.data(withJSONObject: body))
+        client?.urlProtocol(self, didLoad: data)
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
@@ -82,7 +84,7 @@ final class AccountTests: XCTestCase {
         preparedGameFiles = nil
         session.invalidateAndCancel()
         defaults.removePersistentDomain(forName: suite)
-        AuthURLProtocol.response = { _ in (500, [:]) }; AuthURLProtocol.failure = nil
+        AuthURLProtocol.response = { _ in (500, [:]) }; AuthURLProtocol.failure = nil; AuthURLProtocol.rawBody = nil
     }
     private func seed(expired: Bool = true) throws {
         defaults.set(try JSONEncoder().encode(MicrosoftAccount.Catalog(profiles: [alice, bob], selected: alice.uuid)), forKey: "microsoftAccounts.v2")
@@ -206,6 +208,55 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-old-refresh")
         XCTAssertTrue(bridgeCommands.isEmpty)
     }
+    func testMissingEntitlementsAreDistinguishedFromAnAccountWithoutJavaEdition() async throws {
+        let replies: [([String: Any], String)] = [
+            ([:], "Minecraft could not confirm game ownership. Try again."),
+            (["items": []], "This account doesn't own Minecraft: Java Edition."),
+        ]
+        for (body, message) in replies {
+            try seed()
+            network()
+            let response = AuthURLProtocol.response
+            AuthURLProtocol.response = { request in
+                if request.url!.path == "/entitlements/mcstore" { return (200, body) }
+                return response(request)
+            }
+            let account = model()
+            do { try await account.handOver(); XCTFail("Play should wait for verified ownership") }
+            catch { XCTAssertEqual(error.localizedDescription, message) }
+            XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
+            XCTAssertEqual(account.profile, alice)
+        }
+        XCTAssertTrue(bridgeCommands.isEmpty)
+    }
+
+    func testProfileOutageDoesNotAskThePlayerToCreateAProfile() async throws {
+        for (status, message) in [
+            (503, "Minecraft could not load your profile (503). Try again."),
+            (404, "Create your Minecraft profile on minecraft.net first."),
+            (200, "Minecraft returned an incomplete account profile. Try again."),
+        ] {
+            try seed()
+            network()
+            let response = AuthURLProtocol.response
+            AuthURLProtocol.response = { request in
+                if request.url!.path == "/minecraft/profile" { return (status, [:]) }
+                return response(request)
+            }
+            AuthURLProtocol.rawBody = { request in
+                request.url!.path == "/minecraft/profile" && status != 200
+                    ? Data("Non-JSON service error".utf8) : nil
+            }
+            let account = model()
+            do { try await account.handOver(); XCTFail("An unavailable profile must block Play") }
+            catch { XCTAssertEqual(error.localizedDescription, message) }
+            XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-rotated")
+            XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
+            XCTAssertEqual(account.profile, alice)
+        }
+        XCTAssertTrue(bridgeCommands.isEmpty)
+    }
+
     func testUnknownExpiryIsNotAcceptedAsOneDay() async throws {
         try seed(); network(expiry: false); let account = model()
         do { try await account.handOver(); XCTFail("missing expiry must fail") } catch {}

@@ -35,6 +35,7 @@ const MAX_PACKED: u64 = 2 << 30;
 const MAX_UNPACKED: u64 = 4 << 30;
 const MAX_ENTRIES: usize = 50_000;
 const WORLD_IMPORT_STAGING: &str = ".horizon-world-importing";
+const PACK_IMPORT_STAGING: &str = ".horizon-pack-importing";
 
 #[derive(Debug, Default)]
 struct HomeGate {
@@ -457,30 +458,15 @@ impl Pack {
         if !entries.contains_key(Kind::ResourcePack.marker()) {
             return Err("the archive has no resource pack metadata at its resource root".into());
         }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = unique(&dest.with_extension("zip.importing"));
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        let written = (|| -> Result<()> {
+        publish_pack(dest, |file| {
             let mut output = ZipWriter::new(file);
             for (name, index) in entries {
                 output.raw_copy_file_rename(self.archive.by_index(index)?, name)?;
             }
-            let file = output.finish()?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, dest)?;
-            fs::remove_file(&self.path)?;
-            Ok(())
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        written
+            Ok(output.finish()?)
+        })?;
+        fs::remove_file(&self.path)?;
+        Ok(())
     }
 
     /// Put the archive where the game reads it, under `home` (`Documents` on a phone), and consume
@@ -605,6 +591,9 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
         if let Err(error) = clear_world_staging(&home.join(Kind::World.folder())) {
             log::warn!("Horizon: could not clear unfinished world import: {error}");
         }
+        if let Err(error) = clear_pack_staging(&home.join(Kind::ResourcePack.folder())) {
+            log::warn!("Horizon: could not clear unfinished resource pack import: {error}");
+        }
         let scratch = home.join("resources.unpacking");
         let staged = home.join("resources.staged");
         let dest = home.join(Kind::Resources.folder());
@@ -662,12 +651,51 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent)?;
     }
-    if fs::rename(from, to).is_ok() {
-        return Ok(());
+    match fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
+        Err(error) => return Err(error.into()),
     }
-    fs::copy(from, to)?;
+    let mut source = File::open(from)?;
+    publish_pack(to, |mut output| {
+        output.set_permissions(source.metadata()?.permissions())?;
+        io::copy(&mut source, &mut output)?;
+        Ok(output)
+    })?;
+    drop(source);
     fs::remove_file(from)?;
     Ok(())
+}
+
+fn clear_pack_staging(folder: &Path) -> io::Result<()> {
+    match fs::remove_file(folder.join(PACK_IMPORT_STAGING)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// The home lock serializes these writes. The staging file lives on the pack's
+/// volume but has no ZIP extension, so a partial archive is never discoverable.
+fn publish_pack(dest: &Path, write: impl FnOnce(File) -> Result<File>) -> Result<()> {
+    let folder = dest.parent().ok_or("the resource pack needs a folder")?;
+    fs::create_dir_all(folder)?;
+    clear_pack_staging(folder)?;
+    let temporary = folder.join(PACK_IMPORT_STAGING);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let published = (|| -> Result<()> {
+        let file = write(file)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, dest)?;
+        Ok(())
+    })();
+    if published.is_err() {
+        let _ = clear_pack_staging(folder);
+    }
+    published
 }
 
 /// Say what an archive is without touching what it contains.
@@ -1598,6 +1626,34 @@ mod tests {
         assert_eq!(contents, "last");
         assert_eq!(zip.len(), 2);
         drop(zip);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pack_publication_hides_partial_bytes_and_cleans_up_failed_writes() {
+        use std::io::Write;
+
+        let home = temp_home("pack-publication");
+        let packs = home.join(Kind::ResourcePack.folder());
+        let destination = packs.join("new.zip");
+        let staging = packs.join(PACK_IMPORT_STAGING);
+        let published = publish_pack(&destination, |mut file| {
+            file.write_all(b"partial archive")?;
+            assert!(staging.is_file());
+            assert!(!destination.exists());
+            Err(io::Error::other("simulated copy failure").into())
+        });
+        assert!(published.is_err());
+        assert!(!destination.exists());
+        assert!(!staging.exists());
+
+        // An interrupted process leaves staging bytes until startup recovery.
+        fs::write(&staging, b"interrupted copy").unwrap();
+        let existing = packs.join("existing.zip");
+        fs::write(&existing, b"existing pack").unwrap();
+        assert_eq!(recover(&home).unwrap(), None);
+        assert!(!staging.exists());
+        assert_eq!(fs::read(existing).unwrap(), b"existing pack");
         fs::remove_dir_all(home).unwrap();
     }
 

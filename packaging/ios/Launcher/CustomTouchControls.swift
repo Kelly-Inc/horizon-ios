@@ -57,6 +57,7 @@ struct TouchBinding: Identifiable {
 /// release a key that another control still owns.
 final class CustomTouchHolds {
     private var owners: [UUID:[Int]] = [:]
+    func reset() { owners.removeAll() }
     func set(_ id: UUID, keys: [Int], down: Bool) -> [(Int,Bool)] {
         let old = owners[id] ?? []
         let before = Set(owners.values.flatMap{$0})
@@ -78,6 +79,7 @@ final class CustomTouchView: UIButton {
     var send: (UUID,[Int],Bool,UIKeyModifierFlags)->Void
     private let activate: (UIKeyModifierFlags) -> Void
     private var buttonHeld = false
+    private var touchStarted = false
     init(_ definition: CustomTouchButton, activate: @escaping (UIKeyModifierFlags) -> Void = { _ in },
          send: @escaping (UUID,[Int],Bool,UIKeyModifierFlags)->Void) {
         self.definition=definition; self.send=send; self.activate=activate; super.init(frame:.zero)
@@ -97,16 +99,22 @@ final class CustomTouchView: UIButton {
         return super.point(inside:point,with:event)
     }
     @objc private func down(_ sender:UIButton,event:UIEvent?){
+        touchStarted = true
         if !definition.toggle {buttonHeld=true;send(definition.id,definition.keys,true,event?.modifierFlags ?? [])}
     }
     @objc private func up(_ sender:UIButton,event:UIEvent?){
+        guard touchStarted else { return }
+        touchStarted = false
         let flags = event?.modifierFlags ?? []
         if definition.toggle {
             buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,flags)
         } else {release(flags)}
         activate(flags)
     }
-    @objc private func outside(_ sender:UIButton,event:UIEvent?){if !definition.toggle {release(event?.modifierFlags ?? [])}}
+    @objc private func outside(_ sender: UIButton, event: UIEvent?) {
+        touchStarted = false
+        if !definition.toggle { release(event?.modifierFlags ?? []) }
+    }
     override func accessibilityActivate() -> Bool {
         if definition.toggle {buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,[])}
         else {send(definition.id,definition.keys,true,[]);send(definition.id,definition.keys,false,[])}
@@ -114,7 +122,13 @@ final class CustomTouchView: UIButton {
         return true
     }
     @objc private func cancelled(){release()}
-    func release(_ flags:UIKeyModifierFlags=[]){if buttonHeld{buttonHeld=false;isSelected=false;send(definition.id,definition.keys,false,flags)}}
+    func release(_ flags: UIKeyModifierFlags = [], notify: Bool = true) {
+        touchStarted = false
+        guard buttonHeld else { return }
+        buttonHeld = false
+        isSelected = false
+        if notify { send(definition.id, definition.keys, false, flags) }
+    }
 }
 
 struct CustomTouchEditor: View {

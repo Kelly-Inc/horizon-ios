@@ -336,6 +336,7 @@ final class TouchControlsTests: XCTestCase {
         }
         _ = poll()
         let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        button.sendActions(for: .touchDown)
         button.sendActions(for: .touchUpInside)
         XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 1, 340]])
         XCTAssertEqual(bridge.customModifierBits, 1)
@@ -349,11 +350,59 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertTrue(poll(capacity: 0).isEmpty)
         XCTAssertFalse(button.isHidden)
 
+        button.sendActions(for: .touchDown)
         button.sendActions(for: .touchUpInside)
         let events = poll()
         XCTAssertEqual(events.map { Array($0.prefix(3)) }, [[0, 4, 0], [7, 1, 340]])
         XCTAssertEqual(Array(events.first?.dropFirst(6) ?? []).prefix(2), [0, 0])
         XCTAssertTrue(poll().isEmpty)
+    }
+
+    @MainActor func testGestureQueueOverflowClearsLatchedModifiersAndDropsTheWholeChord() throws {
+        var shift = CustomTouchButton()
+        shift.bindings = [340, 0, 0, 0]
+        shift.toggle = true
+        var chord = CustomTouchButton()
+        chord.bindings = [341, 86, 0, 0]
+        var config = TouchConfiguration()
+        config.customButtons = [shift, chord]
+        let bridge = TouchGestureBridge(configuration: { config })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll() -> [[Double]] {
+            bridge.poll(screen: 1, flags: 0, width: 600, height: 300, scale: 1,
+                        capacity: 128, withContext: true)
+        }
+        _ = poll()
+        let buttons = surface.subviews.compactMap { $0 as? CustomTouchView }
+        let shiftButton = try XCTUnwrap(buttons.first { $0.definition.id == shift.id })
+        let chordButton = try XCTUnwrap(buttons.first { $0.definition.id == chord.id })
+        shiftButton.sendActions(for: .touchDown)
+        shiftButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) }, [[7, 1, 340]])
+        XCTAssertTrue(shiftButton.isSelected)
+
+        bridge.inputContext = 99
+        for _ in 0..<32 {
+            chordButton.sendActions(for: .touchDown)
+            chordButton.sendActions(for: .touchUpInside)
+        }
+        shiftButton.sendActions(for: .touchDown)
+        chordButton.sendActions(for: .touchDown)
+        XCTAssertEqual(bridge.customModifierBits, 0)
+        XCTAssertFalse(shiftButton.isSelected)
+        let reset = poll()
+        XCTAssertEqual(reset.map { Array($0.prefix(3)) }, [[0, 4, 0]])
+        XCTAssertEqual(Array(reset.first?.dropFirst(6) ?? []).prefix(2), [0, 0])
+
+        chordButton.sendActions(for: .touchUpInside)
+        shiftButton.sendActions(for: .touchUpInside)
+        XCTAssertTrue(poll().isEmpty)
+        XCTAssertFalse(shiftButton.isSelected)
+        chordButton.sendActions(for: .touchDown)
+        chordButton.sendActions(for: .touchUpInside)
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) },
+                       [[7, 1, 341], [7, 1, 86], [7, 3, 341], [7, 3, 86]])
     }
 
     @MainActor func testOneShotCustomActionsCannotFireFromCancelledOrOutsideTouches() throws {

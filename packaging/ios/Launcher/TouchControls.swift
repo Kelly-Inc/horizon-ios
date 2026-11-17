@@ -518,7 +518,8 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private var gui = CGSize.zero
     private var guiScale: Double = 1
     private var pending: [(Double, [Double], UInt64, UInt32, UInt64)] = []
-    private var needsCancelOnResume = false
+    private var needsEngineReset = false
+    private var overflowed = false
     var inputContext: UInt64 = 0
     private var primaryTouch: UITouch?
     private var hotbarTouch: UITouch?
@@ -573,11 +574,13 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         active = false
         for button in customViews.values { button.isHidden = true }
         discardInput()
-        needsCancelOnResume = true
+        needsEngineReset = true
     }
 
     private func discardInput() {
-        for button in customViews.values { button.release() }
+        for button in customViews.values { button.release(notify: false) }
+        customHolds.reset()
+        customPressed.removeAll()
         pending.removeAll()
         primaryTouch = nil
         hotbarTouch = nil
@@ -597,6 +600,11 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         } else if self.screen != screen || active != enabled {
             discardInput()
         }
+        if overflowed {
+            // A control may have tracked another finger before the next poll.
+            discardInput()
+            overflowed = false
+        }
         self.screen = screen; active = enabled; playing = flags & 1 != 0
         noWorld = flags & 8 != 0
         controlsHidden = flags & 16 != 0; moreOpen = flags & 32 != 0
@@ -605,11 +613,11 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         updateCustomControls()
         guard enabled else { return [] }
         let now = ProcessInfo.processInfo.systemUptime
-        if needsCancelOnResume {
+        if needsEngineReset {
             // Context zero makes this a reset even if the last rendered
             // menu's click context was evicted while the launcher was open.
             pending.insert((now, [0, 4, 0, 0, -1], 0, 0, 0), at: 0)
-            needsCancelOnResume = false
+            needsEngineReset = false
         }
         let count = min(max(0, capacity), pending.count)
         let output = pending.prefix(count).map { timestamp, values, context, modifiers, touch in
@@ -632,21 +640,23 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
             if let old=customViews[definition.id],old.definition != definition {old.release();old.removeFromSuperview();customViews.removeValue(forKey:definition.id)}
             if customViews[definition.id] == nil {
                 let button = CustomTouchView(definition, activate: { [weak self] flags in
-                    guard let self, self.active else { return }
+                    guard let self, self.active, !self.overflowed else { return }
                     for code in definition.keys where TouchBinding.isActivationAction(code) {
                         if code == -5 {
                             if !self.playing { self.toggleMenuCursor() }
                         } else {
                             // The existing native protocol consumes these on the up phase.
                             self.emit(7, phase: 3, location: CGPoint(x: code, y: 0), modifiers: flags)
+                            if self.overflowed { return }
                         }
                     }
                 }) { [weak self] id,keys,down,flags in
-                    guard let self else{return}
+                    guard let self, !self.overflowed else { return }
                     let heldKeys = keys.filter { !TouchBinding.isActivationAction($0) }
                     for (code,pressed) in self.customHolds.set(id,keys:heldKeys,down:down) {
                         if pressed {self.customPressed.insert(code)} else {self.customPressed.remove(code)}
                         self.emit(7,phase:pressed ? 1 : 3,location:CGPoint(x:code,y:0),modifiers:flags)
+                        if self.overflowed { return }
                     }
                 }
                 customViews[definition.id]=button;surface.addSubview(button)
@@ -675,10 +685,15 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     }
     private func emit(_ kind: Double, phase: Int, location: CGPoint = .zero, slot: Int = -1,
                       modifiers: UIKeyModifierFlags = [], touch: UInt64 = 0) {
-        guard active || (kind == 7 && phase == 3) else { return }
+        guard !overflowed, active || (kind == 7 && phase == 3) else { return }
         // If an event storm exhausts the bounded queue, cancel the old gesture
         // state rather than lose an up edge and leave a button held forever.
-        if pending.count >= 128 { pending = [(ProcessInfo.processInfo.systemUptime, [0, 4, 0, 0, -1], inputContext, 0, 0)] }
+        if pending.count >= 128 {
+            overflowed = true
+            discardInput()
+            needsEngineReset = true
+            return
+        }
         var virtualFlags:UIKeyModifierFlags=[]
         if customPressed.contains(340)||customPressed.contains(344){virtualFlags.insert(.shift)}
         if customPressed.contains(341)||customPressed.contains(345){virtualFlags.insert(.control)}

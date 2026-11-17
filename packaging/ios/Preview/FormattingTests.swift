@@ -582,6 +582,42 @@ final class AutomaticGameFilesTests: XCTestCase {
         XCTAssertFalse(model.busy)
     }
 
+    func testStaleBackgroundExpirationDoesNotEndTheRetry() async throws {
+        let restore = temporarilyRemoveResourceMarker()
+        defer { restore() }
+        let url = try XCTUnwrap(ProcessInfo.processInfo.environment["HORIZON_DOWNLOAD_FIXTURE_URL"]
+                               ?? "http://127.0.0.1:1/game.zip")
+        var expirations: [@MainActor @Sendable () -> Void] = []
+        var ended: [UIBackgroundTaskIdentifier] = []
+        var events: [String] = []
+        let first = UIBackgroundTaskIdentifier(rawValue: 1)
+        let second = UIBackgroundTaskIdentifier(rawValue: 2)
+        let model = GameFilesDownload(
+            automaticSource: { ["url": url + "?delay=1"] },
+            diagnostic: { events.append($0) },
+            backgroundTasks: GameFilesBackgroundTasks(begin: { expire in
+                expirations.append(expire)
+                return expirations.count == 1 ? first : second
+            }, end: { ended.append($0) })
+        )
+        defer { model.cancel() }
+
+        await model.startAutomatic()
+        model.cancel()
+        await model.startAutomatic()
+        XCTAssertEqual(expirations.count, 2)
+        guard expirations.count == 2 else { return }
+        expirations[0]()
+        XCTAssertEqual(ended, [first])
+        XCTAssertFalse(events.contains { $0.contains("background_time_expired") })
+        expirations[1]()
+        expirations[1]()
+        XCTAssertEqual(ended, [first, second])
+        XCTAssertEqual(events.filter { $0.contains("background_time_expired") }.count, 1)
+        model.cancel()
+        XCTAssertEqual(ended, [first, second])
+    }
+
     func testCancelledSetupTaskCannotStartLateDownload() async {
         var resume: CheckedContinuation<[String: Any], Never>?
         let model = GameFilesDownload(automaticSource: {

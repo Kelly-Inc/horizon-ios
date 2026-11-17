@@ -31,6 +31,16 @@ struct GameFilesCredential: Codable {
     }
 }
 
+struct GameFilesBackgroundTasks {
+    let begin: @MainActor (@escaping @MainActor @Sendable () -> Void) -> UIBackgroundTaskIdentifier
+    let end: @MainActor (UIBackgroundTaskIdentifier) -> Void
+
+    static let application = Self(
+        begin: { UIApplication.shared.beginBackgroundTask(withName: "Horizon game files", expirationHandler: $0) },
+        end: { UIApplication.shared.endBackgroundTask($0) }
+    )
+}
+
 /// Prepared game files downloaded automatically on first launch, or imported from a custom link.
 /// Both routes use the game's checked importer. Raw Java assets are prepared on a computer.
 @MainActor
@@ -61,6 +71,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
     private let importArchive: ImportArchive
     private let automaticSource: @MainActor () async -> [String: Any]
     private let diagnostic: @MainActor (String) -> Void
+    private let backgroundTasks: GameFilesBackgroundTasks
     private var startedAt = ProcessInfo.processInfo.systemUptime
     private var lastProgressAt = 0.0
     private var receivedBytes: Int64 = 0
@@ -110,13 +121,15 @@ final class GameFilesDownload: NSObject, ObservableObject {
 
     init(importArchive: @escaping ImportArchive = { await Bridge.send($0) },
          automaticSource: @escaping @MainActor () async -> [String: Any] = { await Bridge.send("game-files-source") },
-         diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) }) {
+         diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) },
+         backgroundTasks: GameFilesBackgroundTasks = .application) {
         let savedLink = UserDefaults.standard.string(forKey: "gameFilesLink") ?? ""
         self.link = savedLink
         self.token = Keychain.read(for: Self.origin(of: savedLink)) ?? ""
         self.importArchive = importArchive
         self.automaticSource = automaticSource
         self.diagnostic = diagnostic
+        self.backgroundTasks = backgroundTasks
         super.init()
     }
     private var background: UIBackgroundTaskIdentifier = .invalid
@@ -266,9 +279,12 @@ final class GameFilesDownload: NSObject, ObservableObject {
         var request = URLRequest(url: url)
         if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         // A prepared tree is ~600 MB: ask for the time to finish if the player looks away.
-        background = UIApplication.shared.beginBackgroundTask(withName: "Horizon game files") { [weak self] in
-            let download = self
-            Task { @MainActor in download?.trace("background_time_expired"); download?.endBackground() }
+        let generation = attempt
+        background = backgroundTasks.begin { [weak self] in
+            guard let self, self.attempt == generation, self.background != .invalid else { return }
+            // UIKit gives this callback a synchronous chance to end the task before suspension.
+            self.endBackground()
+            self.trace("background_time_expired")
         }
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         session.sessionDescription = String(attempt.uuidString.prefix(8))
@@ -288,10 +304,10 @@ final class GameFilesDownload: NSObject, ObservableObject {
     }
 
     private func endBackground() {
-        if background != .invalid {
-            UIApplication.shared.endBackgroundTask(background)
-            background = .invalid
-        }
+        let identifier = background
+        guard identifier != .invalid else { return }
+        background = .invalid
+        backgroundTasks.end(identifier)
     }
 
     private func finished(_ outcome: Result<URL, Error>, from source: URLSession) async {

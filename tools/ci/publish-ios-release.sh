@@ -5,15 +5,23 @@ set -euo pipefail
 tag="ios-build-${BUILD}"
 ipa_name=$(basename "$IPA")
 checksum_name=$(basename "$CHECKSUM")
-# A pre-existing tag must not redirect this build to another source revision.
-gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" --jq '.[].ref' > release-tag-refs.txt
-if grep -Fx -- "refs/tags/$tag" release-tag-refs.txt >/dev/null; then
-  target=$(gh api "repos/$GH_REPO/commits/$tag" --jq .sha)
-  if [[ "$target" != "$GITHUB_SHA" ]]; then
-    echo '::error::Release tag points to a different commit; refusing to modify it.'
-    exit 1
+# An existing release's tag determines its commit. A commit lookup with an
+# explicit tag ref also works when a branch happens to have the same name.
+check_release_tag() {
+  local refs target
+  refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" --jq '.[].ref')
+  tag_exists=false
+  if grep -Fx -- "refs/tags/$tag" <<< "$refs" >/dev/null; then
+    target=$(gh api "repos/$GH_REPO/commits/tags/$tag" --jq .sha)
+    if [[ "$target" != "$GITHUB_SHA" ]]; then
+      echo '::error::Release tag points to a different commit; refusing to modify it.'
+      exit 1
+    fi
+    tag_exists=true
   fi
-fi
+}
+check_release_tag
+had_tag=$tag_exists
 # An older run retried after a newer release must not take over Latest.
 latest=true
 if gh api "repos/$GH_REPO/releases/latest" --include > release-latest.http; then
@@ -82,10 +90,16 @@ PYUPLOAD
 }
 
 if gh release view "$tag" --json isDraft,targetCommitish,assets > release-state.json; then
-  target=$(python3 -c 'import json; print(json.load(open("release-state.json"))["targetCommitish"])')
-  if [[ "$target" != "$GITHUB_SHA" ]]; then
-    echo '::error::Release tag points to a different commit; refusing to modify it.'
-    exit 1
+  if [[ "$tag_exists" == false ]]; then
+    # GitHub only uses targetCommitish when it still has to create the tag.
+    # An untagged draft must name the exact build commit, never a moving branch.
+    python3 - "$GITHUB_SHA" <<'PYTARGET'
+import json, sys
+
+release = json.load(open("release-state.json"))
+if not release["isDraft"] or release["targetCommitish"] != sys.argv[1]:
+    raise SystemExit("Release has no matching tag or draft commit")
+PYTARGET
   fi
   release_asset_plan plan > release-upload-plan.txt
   uploads=()
@@ -112,6 +126,11 @@ if ((${#uploads[@]})); then
   # Verify the server-side bytes before retiring older downloads or publishing.
   gh release view "$tag" --json isDraft,assets > release-state.json
   release_asset_plan verify
+fi
+check_release_tag
+if [[ "$had_tag" == true && "$tag_exists" == false ]]; then
+  echo '::error::Release tag disappeared during publication; stopping.'
+  exit 1
 fi
 while IFS= read -r obsolete; do
   [[ -z "$obsolete" ]] || gh release delete-asset "$tag" "$obsolete" --yes

@@ -416,7 +416,8 @@ with open(os.environ["CALL_LOG"], "a") as f: f.write(json.dumps(args)+"\\n")
 scenario=os.environ["SCENARIO"]
 if args[0]=="api":
     if "matching-refs" in args[1]:
-        if scenario=="wrong-tag": print("refs/tags/ios-build-42.2")
+        if scenario not in ("new", "draft", "draft-wrong-target", "published-no-tag", "upload-failed", "upload-missing"):
+            print("refs/tags/ios-build-42.2")
     elif args[1].endswith("/releases/latest"):
         if scenario == "latest-network-error": sys.exit(1)
         status = {"no-latest": "404 Not Found", "latest-server-error": "503 Service Unavailable"}.get(scenario, "200 OK")
@@ -424,14 +425,17 @@ if args[0]=="api":
         if not status.startswith("200"): sys.exit(1)
         if scenario != "latest-invalid":
             print(json.dumps({"tag_name":{"older":"ios-build-99.1", "local-newer":"v0.1.62", "local-older":"v0.0.1", "local-equal":"v0.1.0"}.get(scenario,"ios-build-41.1")}))
-    else: print(os.environ["TAG_SHA"])
+    else:
+        assert args[1].endswith("/commits/tags/ios-build-42.2"), args
+        moved = scenario == "tag-moved-during-upload" and Path("fixture-uploaded").exists()
+        print("b" * 40 if moved else os.environ["TAG_SHA"])
 elif args[:2]==["release","view"]:
     uploaded = Path("fixture-uploaded").exists()
     if not uploaded and scenario in ["new", "upload-failed", "wrong-tag", "upload-missing"]: sys.exit(1)
     names = ["game.ipa", "game.ipa.sha256"] if uploaded or scenario != "incomplete" else []
     if uploaded and scenario == "upload-missing":
         names.remove("game.ipa.sha256")
-    if scenario in ("legacy", "upload-mismatch") and not uploaded: names=["Horizon-iOS-0.1.0-build42.2-unsigned.ipa", "Horizon-iOS-0.1.0-build42.2-unsigned.ipa.sha256", "other.txt", "Horizon-iOS-0.1.0-build41.1-unsigned.ipa"]
+    if scenario in ("legacy", "upload-mismatch", "tag-moved-during-upload") and not uploaded: names=["Horizon-iOS-0.1.0-build42.2-unsigned.ipa", "Horizon-iOS-0.1.0-build42.2-unsigned.ipa.sha256", "other.txt", "Horizon-iOS-0.1.0-build41.1-unsigned.ipa"]
     assets = []
     for name in names:
         if name == "game.ipa.sha256" and not uploaded and scenario in ("starter", "partial-mismatch"):
@@ -444,7 +448,9 @@ elif args[:2]==["release","view"]:
             content = b"another checksum"
         assets.append({"name": name, "state": "uploaded", "size": len(content),
                        "digest": "sha256:" + hashlib.sha256(content).hexdigest()})
-    print(json.dumps({"isDraft":scenario=="draft", "targetCommitish":os.environ["GITHUB_SHA"], "assets":assets}))
+    target = "main" if scenario in ("tagged-with-branch-target", "draft-wrong-target") else os.environ["GITHUB_SHA"]
+    print(json.dumps({"isDraft": scenario in ("draft", "draft-wrong-target"),
+                      "targetCommitish": target, "assets": assets}))
 elif args[:2]==["release","upload"]:
     if scenario == "upload-failed": sys.exit(1)
     Path("fixture-uploaded").touch()
@@ -508,6 +514,25 @@ elif args[:2]==["release","upload"]:
             result, calls = self.run_flow(scenario, "b" * 40)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(any(c[:2] in [["release", "upload"], ["release", "edit"]] for c in calls))
+
+    def test_existing_tag_takes_precedence_over_release_branch_metadata(self):
+        result, calls = self.run_flow("tagged-with-branch-target")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(call[:2] == ["release", "edit"] for call in calls))
+        for scenario in ("draft-wrong-target", "published-no-tag"):
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_flow(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual([call[1] for call in calls if call[0] == "release"], ["view"])
+
+    def test_tag_moved_during_upload_blocks_promotion_and_asset_removal(self):
+        result, calls = self.run_flow("tag-moved-during-upload")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("different commit", result.stdout)
+        actions = [call[1] for call in calls if call[0] == "release"]
+        self.assertIn("upload", actions)
+        self.assertNotIn("delete-asset", actions)
+        self.assertNotIn("edit", actions)
 
     def test_legacy_assets_repair_only_this_build_after_upload(self):
         result, calls = self.run_flow("legacy")

@@ -599,13 +599,20 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         for definition in config.customButtons {
             if let old=customViews[definition.id],old.definition != definition {old.release();old.removeFromSuperview();customViews.removeValue(forKey:definition.id)}
             if customViews[definition.id] == nil {
-                let button = CustomTouchView(definition, activate: { [weak self] in
-                    guard let self, self.active, !self.playing, definition.keys.contains(-5) else { return }
-                    self.toggleMenuCursor()
+                let button = CustomTouchView(definition, activate: { [weak self] flags in
+                    guard let self, self.active else { return }
+                    for code in definition.keys where TouchBinding.isActivationAction(code) {
+                        if code == -5 {
+                            if !self.playing { self.toggleMenuCursor() }
+                        } else {
+                            // The existing native protocol consumes these on the up phase.
+                            self.emit(7, phase: 3, location: CGPoint(x: code, y: 0), modifiers: flags)
+                        }
+                    }
                 }) { [weak self] id,keys,down,flags in
                     guard let self else{return}
-                    // Menu cursor mode changes on activation, never on hold cleanup.
-                    for (code,pressed) in self.customHolds.set(id,keys:keys.filter { $0 != -5 },down:down) {
+                    let heldKeys = keys.filter { !TouchBinding.isActivationAction($0) }
+                    for (code,pressed) in self.customHolds.set(id,keys:heldKeys,down:down) {
                         if pressed {self.customPressed.insert(code)} else {self.customPressed.remove(code)}
                         self.emit(7,phase:pressed ? 1 : 3,location:CGPoint(x:code,y:0),modifiers:flags)
                     }

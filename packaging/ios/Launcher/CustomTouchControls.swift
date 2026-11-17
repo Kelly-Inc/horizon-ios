@@ -29,6 +29,12 @@ struct TouchBinding: Identifiable {
     let code: Int
     let title: String
     var id: Int { code }
+    static func isActivationAction(_ code: Int) -> Bool {
+        switch code {
+        case -1, -2, -5, -7, -8: return true
+        default: return false
+        }
+    }
     static let choices: [TouchBinding] = {
         var values = [TouchBinding(code:0,title:"None"), .init(code:-3,title:"Left mouse"), .init(code:-4,title:"Right mouse"),
                       .init(code:-6,title:"Middle mouse"), .init(code:-7,title:"Scroll up"), .init(code:-8,title:"Scroll down"), .init(code:-1,title:"Show/hide keyboard"), .init(code:-2,title:"Show/hide controls"), .init(code:-5,title:"Toggle menu cursor mode")]
@@ -52,12 +58,11 @@ struct TouchBinding: Identifiable {
 final class CustomTouchHolds {
     private var owners: [UUID:[Int]] = [:]
     func set(_ id: UUID, keys: [Int], down: Bool) -> [(Int,Bool)] {
-        let fresh = owners[id] == nil
         let old = owners[id] ?? []
         let before = Set(owners.values.flatMap{$0})
         if down { owners[id] = keys } else { owners.removeValue(forKey:id) }
         let after = Set(owners.values.flatMap{$0})
-        return old.filter{!after.contains($0)}.map{($0,false)} + keys.filter{down && (fresh || !before.contains($0))}.map{($0,true)}
+        return old.filter{!after.contains($0)}.map{($0,false)} + keys.filter{down && !before.contains($0)}.map{($0,true)}
     }
     var modifiers: UIKeyModifierFlags {
         let keys=Set(owners.values.flatMap{$0});var result:UIKeyModifierFlags=[]
@@ -71,9 +76,9 @@ final class CustomTouchHolds {
 final class CustomTouchView: UIButton {
     var definition: CustomTouchButton
     var send: (UUID,[Int],Bool,UIKeyModifierFlags)->Void
-    private let activate: () -> Void
+    private let activate: (UIKeyModifierFlags) -> Void
     private var buttonHeld = false
-    init(_ definition: CustomTouchButton, activate: @escaping () -> Void = {},
+    init(_ definition: CustomTouchButton, activate: @escaping (UIKeyModifierFlags) -> Void = { _ in },
          send: @escaping (UUID,[Int],Bool,UIKeyModifierFlags)->Void) {
         self.definition=definition; self.send=send; self.activate=activate; super.init(frame:.zero)
         setTitle(definition.name,for:.normal);setTitleColor(.systemYellow,for:.selected);backgroundColor=UIColor.black.withAlphaComponent(0.4)
@@ -95,16 +100,17 @@ final class CustomTouchView: UIButton {
         if !definition.toggle {buttonHeld=true;send(definition.id,definition.keys,true,event?.modifierFlags ?? [])}
     }
     @objc private func up(_ sender:UIButton,event:UIEvent?){
+        let flags = event?.modifierFlags ?? []
         if definition.toggle {
-            buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,event?.modifierFlags ?? [])
-        } else {release(event?.modifierFlags ?? [])}
-        activate()
+            buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,flags)
+        } else {release(flags)}
+        activate(flags)
     }
     @objc private func outside(_ sender:UIButton,event:UIEvent?){if !definition.toggle {release(event?.modifierFlags ?? [])}}
     override func accessibilityActivate() -> Bool {
         if definition.toggle {buttonHeld.toggle();isSelected=buttonHeld;send(definition.id,definition.keys,buttonHeld,[])}
         else {send(definition.id,definition.keys,true,[]);send(definition.id,definition.keys,false,[])}
-        activate()
+        activate([])
         return true
     }
     @objc private func cancelled(){release()}

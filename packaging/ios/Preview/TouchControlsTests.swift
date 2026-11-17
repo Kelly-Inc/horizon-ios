@@ -311,13 +311,40 @@ final class TouchControlsTests: XCTestCase {
     func testCustomSharedHoldsReleaseOnlyTheirOwnInputs() {
         let holds=CustomTouchHolds(), a=UUID(), b=UUID()
         XCTAssertEqual(holds.set(a,keys:[341,86],down:true).map{$0.0},[341,86])
-        _ = holds.set(b,keys:[341,67],down:true)
+        let second = holds.set(b, keys: [341, 67], down: true)
+        XCTAssertEqual(second.map { $0.0 }, [67])
+        XCTAssertTrue(second.allSatisfy { $0.1 })
         let first=holds.set(a,keys:[341,86],down:false)
         XCTAssertEqual(first.map{$0.0},[86]);XCTAssertTrue(first.allSatisfy{!$0.1})
         XCTAssertTrue(holds.modifiers.contains(.control))
         XCTAssertEqual(holds.set(b,keys:[341,67],down:false).map{$0.0},[341,67])
         XCTAssertTrue(holds.modifiers.isEmpty)
     }
+
+    @MainActor func testOneShotCustomActionsCannotFireFromCancelledOrOutsideTouches() throws {
+        var definition = CustomTouchButton()
+        definition.bindings = [-1, -2, -7, -8]
+        var config = TouchConfiguration()
+        config.customButtons = [definition]
+        let bridge = TouchGestureBridge(configuration: { config })
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: surface)
+        func poll() -> [[Double]] {
+            bridge.poll(screen: 1, flags: 0, width: 600, height: 300, scale: 1, capacity: 64)
+        }
+        _ = poll()
+        let button = try XCTUnwrap(surface.subviews.compactMap { $0 as? CustomTouchView }.first)
+        for event: UIControl.Event in [.touchCancel, .touchUpOutside] {
+            button.sendActions(for: .touchDown)
+            button.sendActions(for: event)
+            XCTAssertTrue(poll().isEmpty)
+        }
+        button.sendActions(for: .touchDown)
+        button.sendActions(for: .touchUpInside)
+        XCTAssertEqual(poll().map { Array($0.prefix(3)) },
+                       [[7, 3, -1], [7, 3, -2], [7, 3, -7], [7, 3, -8]])
+    }
+
     func testCustomRectUsesTheSameNormalizedCanvasAfterRotation() {
         var button=CustomTouchButton();button.centre=TouchCentre(x:0.5,y:0.5)
         for size in [CGSize(width:600,height:300),CGSize(width:300,height:600)] {

@@ -362,12 +362,14 @@ private struct TouchLayoutEditor: View {
     }
     @State private var toolbarCentre: CGPoint?
     @State private var toolbarStart: CGPoint?
-    @State private var guiLimit = TouchEditorGeometry.savedScale()
+    @Environment(\.displayScale) private var displayScale
+    private let guiOptions = TouchEditorGeometry.savedOptions()
     var body: some View {
         GeometryReader { geometry in
             let width = geometry.size.width
             let height = geometry.size.height
-            let metrics = TouchEditorGeometry(size: geometry.size, displayScale: UIScreen.main.scale, limit: guiLimit)
+            let metrics = TouchEditorGeometry(size: geometry.size, displayScale: displayScale,
+                                              limit: guiOptions.limit, forceUnicode: guiOptions.forceUnicode)
             let gui = metrics.gui
             let scale = metrics.pointsPerUnit
             let toolbarWidth = min(500.0, max(280.0, width - 32))
@@ -550,21 +552,28 @@ private struct TouchLayoutCustomControl: View {
 struct TouchEditorGeometry {
     let gui: CGSize
     let pointsPerUnit: CGFloat
-    init(size: CGSize, displayScale: CGFloat, limit: Int) {
+    init(size: CGSize, displayScale: CGFloat, limit: Int, forceUnicode: Bool = false) {
         let density = max(1, displayScale)
         let pixels = (Int((size.width * density).rounded()), Int((size.height * density).rounded()))
         var scale = 1
         while (limit == 0 || scale < limit) && pixels.0 / (scale + 1) >= 320 && pixels.1 / (scale + 1) >= 240 {
             scale += 1
         }
+        if forceUnicode, scale % 2 != 0 { scale += 1 }
         gui = CGSize(width: ceil(Double(pixels.0) / Double(scale)), height: ceil(Double(pixels.1) / Double(scale)))
         pointsPerUnit = CGFloat(scale) / density
     }
-    static func savedScale() -> Int {
-        let url = GameFolder.documents.appendingPathComponent("options.txt")
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
-        let value = text.split(separator: "\n").last(where: { $0.hasPrefix("guiScale:") })
-        return max(0, value.flatMap { Int($0.dropFirst("guiScale:".count).trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 0)
+    static func savedOptions(
+        at url: URL = GameFolder.documents.appendingPathComponent("options.txt")
+    ) -> (limit: Int, forceUnicode: Bool) {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return (0, false) }
+        let lines = text.split(whereSeparator: \.isNewline)
+        func value(_ name: String) -> Substring? {
+            let prefix = name + ":"
+            return lines.last(where: { $0.hasPrefix(prefix) })?.dropFirst(prefix.count)
+        }
+        let limit = value("guiScale").flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 0
+        return (max(0, limit), value("forceUnicodeFont") == "true")
     }
 }
 

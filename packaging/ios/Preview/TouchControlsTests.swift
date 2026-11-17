@@ -266,6 +266,28 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertEqual(manual.gui, CGSize(width: 1266, height: 585))
         XCTAssertEqual(manual.pointsPerUnit, 2.0 / 3.0, accuracy: 0.0001)
     }
+    func testEditorUsesTheSavedUnicodeGuiScale() throws {
+        let options = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: options) }
+        try Data("forceUnicodeFont:false\r\nguiScale:0\r\nforceUnicodeFont:true\r\nguiScale:3\r\n".utf8)
+            .write(to: options)
+        let saved = TouchEditorGeometry.savedOptions(at: options)
+        XCTAssertEqual(saved.limit, 3)
+        XCTAssertTrue(saved.forceUnicode)
+
+        let size = CGSize(width: 900, height: 600)
+        let normal = TouchEditorGeometry(size: size, displayScale: 2, limit: saved.limit)
+        XCTAssertEqual(normal.gui, CGSize(width: 600, height: 400))
+        let unicode = TouchEditorGeometry(size: size, displayScale: 2,
+                                          limit: saved.limit, forceUnicode: saved.forceUnicode)
+        XCTAssertEqual(unicode.gui, CGSize(width: 450, height: 300))
+        XCTAssertEqual(unicode.pointsPerUnit, 2)
+        let sceneScale = TouchEditorGeometry(size: size, displayScale: 3,
+                                             limit: saved.limit, forceUnicode: saved.forceUnicode)
+        XCTAssertEqual(sceneScale.gui, CGSize(width: 675, height: 450))
+        XCTAssertEqual(sceneScale.pointsPerUnit, 4.0 / 3.0, accuracy: 0.0001)
+    }
+
     func testSizingOpacityAndForwardLockRoundTrip() throws {
         let model = TouchPreferences(defaults:defaults)
         var config = model.configuration

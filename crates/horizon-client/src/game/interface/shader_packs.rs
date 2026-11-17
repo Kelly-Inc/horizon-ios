@@ -203,6 +203,9 @@ pub(super) const HELP: &[&str] =
     &["shader-pack [list|off|NAME]    list or select a shader pack in shaderpacks/"];
 thread_local! {
     static REPORT: RefCell<Option<Value>> = const { RefCell::new(None) };
+    // Automatic disable clears the selection and the live renderer report.
+    // Keep the reason available to the launcher until the next explicit pick.
+    static LAST_DISABLED: RefCell<Option<Value>> = const { RefCell::new(None) };
     static OPTIONS_REVISION: Cell<u64> = const { Cell::new(0) };
 }
 pub(super) fn record_report(name: &str, dimension: i32, programs: &[String], notes: &[String]) {
@@ -264,6 +267,7 @@ pub(super) fn command(
             .horizon
             .select_shader_pack(&root, name)
             .map_err(|error| format!("could not save the shader selection: {error}"))?;
+        LAST_DISABLED.with_borrow_mut(Option::take);
     }
     settings.shader_packs = packs;
     let selected =
@@ -274,13 +278,17 @@ pub(super) fn command(
             .filter(|r| r["pack"].as_str() == selected)
             .cloned()
     });
+    let last_disabled = selected
+        .is_none()
+        .then(|| LAST_DISABLED.with_borrow(Clone::clone))
+        .flatten();
     let list: Vec<Value> = settings
         .shader_packs
         .iter()
         .map(|pack| json!({"name": pack.file, "title":pack.title, "problem":null}))
         .collect();
     Ok(Some((
-        json!({"packs":list,"selected":selected,"runtime":report}),
+        json!({"packs":list,"selected":selected,"runtime":report,"last_disabled":last_disabled}),
         changed,
     )))
 }
@@ -584,6 +592,10 @@ impl Game<'_> {
     /// Settle shader jobs without rendering, including while the launcher covers the game.
     pub(super) fn poll_shader_workers(&mut self) {
         let selected = picked_pack(&self.settings).to_owned();
+        if !selected.is_empty() {
+            // In-game settings can pick a shader without the launcher command.
+            LAST_DISABLED.with_borrow_mut(Option::take);
+        }
         let selected_path = self.native_shaders.resolve_path(
             &Self::shader_packs_dir(),
             &selected,
@@ -653,7 +665,7 @@ impl Game<'_> {
             // This report is a completed GPU job, never the pending notice.
             // Apply the same quarantine as the synchronous loader so a pack
             // that the device refuses is not retried on every app launch.
-            self.shader_pack_failed(&name, dimension, &notes.join("; "));
+            self.shader_pack_failed(&name, dimension, &notes.join("; "), &notes);
         }
     }
 
@@ -785,7 +797,7 @@ impl Game<'_> {
                             Err(refused) => {
                                 let mut notes = refused.notes;
                                 notes.push(refused.reason.clone());
-                                self.shader_pack_failed(&name, dimension, &refused.reason);
+                                self.shader_pack_failed(&name, dimension, &refused.reason, &notes);
                                 record_report(&name, dimension, &[], &notes);
                             }
                         }
@@ -793,7 +805,12 @@ impl Game<'_> {
                     Err(error) => {
                         remember(&path, fingerprint(&path), false);
                         if error.starts_with(SOURCE_PANIC) {
-                            self.shader_pack_failed(&name, dimension, &error);
+                            self.shader_pack_failed(
+                                &name,
+                                dimension,
+                                &error,
+                                std::slice::from_ref(&error),
+                            );
                         } else {
                             self.pack_ids = None;
                             let _ = renderer.set_shader_pack(dimension, None, &[]);
@@ -976,7 +993,7 @@ impl Game<'_> {
     /// Turns off the pack `name` after loading it panicked or failed: nothing runs in its place,
     /// it is no longer the picked pack (so the next start does not load it again), and the chat
     /// says so.
-    fn shader_pack_failed(&mut self, name: &str, dimension: i32, error: &str) {
+    fn shader_pack_failed(&mut self, name: &str, dimension: i32, error: &str, notes: &[String]) {
         let path = Self::shader_packs_dir().join(name);
         remember(&path, fingerprint(&path), false);
         log::error!("shader pack {name}: turned off: {error}");
@@ -986,9 +1003,24 @@ impl Game<'_> {
             // a pack this can't fail).
             let _ = renderer.set_shader_pack(dimension, None, &[]);
         }
-        if Self::shader_packs_dir().join(&self.settings.horizon.shader_pack) == path {
-            self.settings.horizon.shader_pack.clear();
-            self.settings.save(&Self::options_path());
+        if !name.is_empty() && dev_pack().is_none() && self.settings.horizon.shader_pack == name {
+            let mut notes = notes.to_vec();
+            if notes.is_empty() && !error.is_empty() {
+                notes.push(error.to_owned());
+            }
+            if let Err(error) = self
+                .settings
+                .horizon
+                .select_shader_pack(&Self::game_dir(), String::new())
+            {
+                // The failed shader must stay off for this session even if
+                // the disk cannot record the change for the next launch.
+                self.settings.horizon.shader_pack.clear();
+                notes.push(format!("Could not save the Off selection: {error}"));
+            }
+            LAST_DISABLED.with_borrow_mut(|report| {
+                *report = Some(json!({"pack": name, "dimension": dimension, "notes": notes}));
+            });
         }
         self.system_message(Text::colored(
             format!("Shader pack {name} could not be loaded and was turned off"),

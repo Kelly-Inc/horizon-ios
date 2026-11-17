@@ -465,6 +465,29 @@ final class LauncherAsyncTests: XCTestCase {
 
 @MainActor
 final class PackMutationTests: XCTestCase {
+    func testAutomaticallyDisabledShaderShowsItsDiagnosticWithoutAppearingActive() async {
+        var shader: [String: Any] = [
+            "selected": NSNull(),
+            "last_disabled": ["pack": "Failed.zip", "notes": ["Missing renderer input"]],
+        ]
+        let choices = PackChoices(request: { command in
+            if command == "shader-pack list" { return shader }
+            return ["options": ["resourcePacks": ["value": [String]()]]]
+        })
+        await choices.load()
+        XCTAssertNil(choices.shaderPack)
+        XCTAssertFalse(choices.isOn("Failed.zip", kind: .shader))
+        XCTAssertEqual(choices.shaderNotes, ["Missing renderer input"])
+        XCTAssertTrue(choices.shaderStatus?.contains("Failed.zip was turned off") == true)
+
+        shader["selected"] = "Working.zip"
+        shader["runtime"] = ["programs": ["composite"], "notes": ["Current note"]]
+        await choices.load()
+        XCTAssertEqual(choices.shaderPack, "Working.zip")
+        XCTAssertEqual(choices.shaderStatus, "Running 1 shader programs.")
+        XCTAssertEqual(choices.shaderNotes, ["Current note"])
+    }
+
     func testStaleShaderOffDoesNotDisableTheNewlySelectedPack() async {
         var current = "a.zip"
         var writes: [String] = []

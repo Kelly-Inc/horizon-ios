@@ -303,6 +303,10 @@ final class PackChoices: ObservableObject {
             } else {
                 shaderStatus = "Selected. Open a world to load this pack, then return here for its status."
             }
+        } else if let failure = shaders["last_disabled"] as? [String: Any],
+                  let name = failure["pack"] as? String {
+            shaderStatus = "\(name) was turned off because it could not load."
+            shaderNotes = failure["notes"] as? [String] ?? []
         }
         return nil
     }

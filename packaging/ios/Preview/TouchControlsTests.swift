@@ -308,6 +308,45 @@ final class TouchControlsTests: XCTestCase {
         let old=try JSONDecoder().decode(TouchConfiguration.self,from:Data(#"{"centres":{}}"#.utf8))
         XCTAssertTrue(old.customButtons.isEmpty)
     }
+
+    func testPartiallyDamagedLayoutRetainsReadableControlsAndPreferences() throws {
+        var first = CustomTouchButton()
+        first.name = "First"
+        first.bindings = [340, 65, 0, 0]
+        var second = CustomTouchButton()
+        second.name = "Second"
+        let encoder = JSONEncoder()
+        let firstJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(first)) as? [String: Any])
+        let secondJSON = try JSONSerialization.jsonObject(with: encoder.encode(second))
+        var duplicate = firstJSON
+        duplicate["name"] = "Duplicate"
+        var damaged = secondJSON as? [String: Any] ?? [:]
+        damaged["bindings"] = "not a key list"
+        let stored: [String: Any] = [
+            "customButtons": [firstJSON, damaged, duplicate, secondJSON],
+            "centres": ["5": ["x": 0.7, "y": 0.3], "6": ["x": "invalid", "y": 0.5]],
+            "sizes": "invalid",
+            "opacities": ["5": 0.6, "6": "invalid"],
+            "joystick": false,
+            "virtualMouse": "invalid",
+            "showControls": false,
+            "hotbarGestures": false,
+        ]
+        defaults.set(try JSONSerialization.data(withJSONObject: stored), forKey: TouchPreferences.key)
+        let preferences = TouchPreferences(defaults: defaults)
+        let recovered = preferences.configuration
+        XCTAssertEqual(recovered.customButtons, [first, second])
+        XCTAssertEqual(recovered.centres, ["5": TouchCentre(x: 0.7, y: 0.3)])
+        XCTAssertTrue(recovered.sizes.isEmpty)
+        XCTAssertEqual(recovered.opacities, ["5": 0.6])
+        XCTAssertFalse(recovered.joystick)
+        XCTAssertTrue(recovered.virtualMouse)
+        XCTAssertFalse(recovered.showControls)
+        XCTAssertFalse(recovered.hotbarGestures)
+        preferences.save(recovered)
+        XCTAssertEqual(TouchPreferences(defaults: defaults).configuration, recovered)
+    }
+
     func testCustomSharedHoldsReleaseOnlyTheirOwnInputs() {
         let holds=CustomTouchHolds(), a=UUID(), b=UUID()
         XCTAssertEqual(holds.set(a,keys:[341,86],down:true).map{$0.0},[341,86])

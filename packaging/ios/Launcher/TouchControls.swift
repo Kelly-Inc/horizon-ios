@@ -100,6 +100,14 @@ struct TouchSize: Codable, Equatable {
     var valid: Bool { width.isFinite && height.isFinite && (0.02...0.8).contains(width) && (0.02...0.8).contains(height) }
 }
 
+/// Decode entries independently so a damaged control does not erase its neighbours.
+private struct SavedTouchValue<Value: Decodable>: Decodable {
+    let value: Value?
+    init(from decoder: Decoder) {
+        value = try? Value(from: decoder)
+    }
+}
+
 struct TouchConfiguration: Codable, Equatable {
     var centres: [String: TouchCentre] = [:]
     var customButtons: [CustomTouchButton] = []
@@ -117,18 +125,26 @@ struct TouchConfiguration: Codable, Equatable {
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        customButtons = try c.decodeIfPresent([CustomTouchButton].self, forKey: .customButtons) ?? []
-        centres = try c.decodeIfPresent([String: TouchCentre].self, forKey: .centres) ?? [:]
-        sizes = try c.decodeIfPresent([String: TouchSize].self, forKey: .sizes) ?? [:]
-        opacities = try c.decodeIfPresent([String: Double].self, forKey: .opacities) ?? [:]
-        forwardLock = try c.decodeIfPresent(Bool.self, forKey: .forwardLock) ?? false
-        showControls = try c.decodeIfPresent(Bool.self, forKey: .showControls) ?? true
-        virtualMouse = try c.decodeIfPresent(Bool.self, forKey: .virtualMouse) ?? true
-        joystick = try c.decodeIfPresent(Bool.self, forKey: .joystick) ?? false
-        mouseGestures = try c.decodeIfPresent(Bool.self, forKey: .mouseGestures) ?? true
-        hotbarGestures = try c.decodeIfPresent(Bool.self, forKey: .hotbarGestures) ?? true
-        slideableHotbar = try c.decodeIfPresent(Bool.self, forKey: .slideableHotbar) ?? false
-        let duration = try c.decodeIfPresent(Double.self, forKey: .holdDuration) ?? 0.4
+        func field<T: Decodable>(_ type: T.Type, _ key: CodingKeys) -> T? {
+            try? c.decode(type, forKey: key)
+        }
+        let buttons = field([SavedTouchValue<CustomTouchButton>].self, .customButtons) ?? []
+        var ids = Set<UUID>()
+        customButtons = buttons.compactMap(\.value).filter { ids.insert($0.id).inserted }
+        centres = field([String: SavedTouchValue<TouchCentre>].self, .centres)?
+            .compactMapValues(\.value) ?? [:]
+        sizes = field([String: SavedTouchValue<TouchSize>].self, .sizes)?
+            .compactMapValues(\.value) ?? [:]
+        opacities = field([String: SavedTouchValue<Double>].self, .opacities)?
+            .compactMapValues(\.value) ?? [:]
+        forwardLock = field(Bool.self, .forwardLock) ?? false
+        showControls = field(Bool.self, .showControls) ?? true
+        virtualMouse = field(Bool.self, .virtualMouse) ?? true
+        joystick = field(Bool.self, .joystick) ?? false
+        mouseGestures = field(Bool.self, .mouseGestures) ?? true
+        hotbarGestures = field(Bool.self, .hotbarGestures) ?? true
+        slideableHotbar = field(Bool.self, .slideableHotbar) ?? false
+        let duration = field(Double.self, .holdDuration) ?? 0.4
         holdDuration = duration.isFinite ? min(2, max(0.1, duration)) : 0.4
     }
     var buttons: [TouchButton] {

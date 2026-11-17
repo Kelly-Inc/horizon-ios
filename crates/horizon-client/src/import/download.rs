@@ -167,6 +167,17 @@ struct ResumeTag {
     source: String,
     target: String,
     etag: String,
+    #[serde(default)]
+    length: Option<u64>,
+}
+
+fn strong_etag(tag: &str) -> bool {
+    tag.strip_prefix('"')
+        .and_then(|tag| tag.strip_suffix('"'))
+        .is_some_and(|tag| {
+            tag.bytes()
+                .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
+        })
 }
 
 fn source_hash(url: &str) -> String {
@@ -270,7 +281,7 @@ fn fetch_once(
     let saved = fs::read(&tag_file)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ResumeTag>(&bytes).ok())
-        .filter(|saved| saved.source == source && !saved.etag.is_empty());
+        .filter(|saved| saved.source == source && strong_etag(&saved.etag));
     let tag = saved.as_ref().map(|saved| saved.etag.as_str());
     // A part whose file can't be named is not resumed: it could be the start of another file.
     let have = match &tag {
@@ -323,7 +334,9 @@ fn fetch_once(
         if response
             .header("ETag")
             .is_some_and(|value| Some(value) != tag)
-            || saved.as_ref().is_none_or(|saved| saved.target != target)
+            || saved.as_ref().is_none_or(|saved| {
+                saved.target != target || saved.length.is_some_and(|expected| expected != length)
+            })
         {
             return Err(restart());
         }
@@ -353,18 +366,27 @@ fn fetch_once(
     let file = if resumed {
         fs::OpenOptions::new().append(true).open(part)
     } else {
+        // Unlink the old validator before changing the bytes it describes.
+        match fs::remove_file(&tag_file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Stop::Failed(format!(
+                    "could not clear saved download state: {error}"
+                )));
+            }
+        }
         File::create(part)
     };
     let mut file = file.map_err(|e| Stop::Failed(format!("could not save the download: {e}")))?;
     if !resumed {
-        // Truncate the old bytes before replacing their validator. If creation fails,
-        // its old validator still belongs to the old bytes. Never persist URL secrets.
-        let _ = fs::remove_file(&tag_file);
-        if let Some(etag) = response.header("ETag").filter(|tag| !tag.starts_with("W/"))
+        // Never persist URL secrets, or a validator that cannot be used by If-Range.
+        if let Some(etag) = response.header("ETag").filter(|tag| strong_etag(tag))
             && let Ok(saved) = serde_json::to_vec(&ResumeTag {
                 source,
                 target,
                 etag: etag.to_owned(),
+                length: (whole != 0).then_some(whole),
             })
         {
             let _ = fs::write(&tag_file, saved);
@@ -478,6 +500,13 @@ mod tests {
                 false,
             ),
             (
+                "changed-total",
+                "206 Partial Content",
+                "Content-Range: bytes 4-5/6\r\nETag: \"one\"\r\n",
+                false,
+                false,
+            ),
+            (
                 "wrong-length",
                 "206 Partial Content",
                 "Content-Range: bytes 4-6/7\r\n",
@@ -497,6 +526,7 @@ mod tests {
                     source: source_hash(&format!("http://{address}/game.zip")),
                     target: source_hash(&format!("http://{address}/game.zip")),
                     etag: "\"one\"".into(),
+                    length: (name == "changed-total").then_some(8),
                 })
                 .unwrap(),
             )
@@ -534,6 +564,43 @@ mod tests {
             }
             fs::remove_dir_all(home).unwrap();
         }
+    }
+
+    #[test]
+    fn only_well_formed_strong_entity_tags_can_resume() {
+        for (tag, expected) in [
+            ("\"one\"", true),
+            ("\"\"", true),
+            ("W/\"one\"", false),
+            ("one", false),
+            ("\"one\", \"two\"", false),
+            ("\"has a space\"", false),
+            ("\"unterminated", false),
+        ] {
+            assert_eq!(strong_etag(tag), expected, "{tag:?}");
+        }
+    }
+
+    #[test]
+    fn full_download_does_not_replace_partial_bytes_if_its_validator_cannot_be_cleared() {
+        let home = home("blocked-validator");
+        fs::create_dir_all(&home).unwrap();
+        let part = home.join(PARTIAL);
+        fs::write(&part, b"old").unwrap();
+        fs::create_dir(home.join(PARTIAL_TAG)).unwrap();
+        let url = serve(b"new".to_vec(), 3);
+        let result = fetch_once(
+            &ureq::AgentBuilder::new().build(),
+            &url,
+            &part,
+            &AtomicU64::new(0),
+            &AtomicU64::new(0),
+        );
+        assert!(
+            matches!(result, Err(Stop::Failed(message)) if message.contains("clear saved download state"))
+        );
+        assert_eq!(fs::read(part).unwrap(), b"old");
+        fs::remove_dir_all(home).unwrap();
     }
 
     /// One HTTP answer from a local socket: `length` in the header, `body` sent.

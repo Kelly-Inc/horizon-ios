@@ -134,6 +134,7 @@ final class GameLink: ObservableObject {
     }
     private var currentLaunch: LaunchAttempt?
     private var phaseEpoch = UUID()
+    private var appliedRefresh: UUID?
     private var queued: (id: UUID, action: () async -> [String: Any])?
     private let send: (String) async -> [String: Any]
 
@@ -182,8 +183,9 @@ final class GameLink: ObservableObject {
         case "needs_files": phase = .needsFiles(state["reason"] as? String)
         case "title": phase = .title
         case "world": phase = .world
-        default: phase = .unknown
+        default: return
         }
+        appliedRefresh = epoch
         if let version = state["version"] as? String {
             self.version = version
         }
@@ -296,6 +298,8 @@ final class GameLink: ObservableObject {
         // The cached phase can predate Quit/reset. Ask the backend on every
         // intent, and assign ownership before it is allowed to start loading.
         attempt.submitted = true
+        phaseEpoch = UUID()
+        let refreshAtSubmission = appliedRefresh
         let answer = await self.send("launcher-start \(attempt.id.uuidString)")
         guard answer["ok"] as? Bool == true, answer.error == nil else {
             try check(attempt)
@@ -303,15 +307,13 @@ final class GameLink: ObservableObject {
         }
         attempt.accepted = true
         try check(attempt)
-        phaseEpoch = UUID()
+        // State requests submitted after the start command describe a newer
+        // engine state, even when their replies arrive before this one.
+        guard appliedRefresh == refreshAtSubmission else { return }
         switch answer["phase"] as? String {
         case "title": phase = .title
         case "world": phase = .world
-        case "loading":
-            // A refresh can observe a failed load while this earlier start reply
-            // is still in flight.
-            if case .needsFiles = phase { break }
-            phase = .loading(0)
+        case "loading": phase = .loading(0)
         default:
             if phase == .waiting || phase == .unknown { phase = .loading(0) }
         }

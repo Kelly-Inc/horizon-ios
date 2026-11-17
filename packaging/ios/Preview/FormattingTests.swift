@@ -144,6 +144,95 @@ final class GameLinkRefreshTests: XCTestCase {
         XCTAssertTrue(game.requestingGameFiles)
     }
 
+    func testEarlierStartReplyCannotSendTheLauncherBackFromTheTitle() async {
+        let submitted = expectation(description: "start submitted")
+        var startReply: CheckedContinuation<[String: Any], Never>?
+        var connects = 0
+        let game = GameLink { command in
+            if command.hasPrefix("launcher-start ") {
+                return await withCheckedContinuation {
+                    startReply = $0
+                    submitted.fulfill()
+                }
+            }
+            if command == "launcher-state" { return ["phase": "title"] }
+            if command.hasPrefix("launcher-commit-start ") { return ["ok": true, "status": "committed"] }
+            if command == "connect example.invalid" { connects += 1 }
+            return ["ok": true]
+        }
+        game.prepareSession = {}
+        let join = Task { await game.join("example.invalid") }
+        await fulfillment(of: [submitted], timeout: 2)
+        await game.refresh()
+        startReply?.resume(returning: ["ok": true, "phase": "loading"])
+        await join.value
+
+        XCTAssertEqual(game.phase, .title)
+        XCTAssertEqual(connects, 1)
+        XCTAssertNil(game.launching)
+    }
+
+    func testStartReplyDoesNotDiscardANewerRefreshStillInFlight() async {
+        let submitted = expectation(description: "start submitted")
+        let refreshing = expectation(description: "state requested")
+        var startReply: CheckedContinuation<[String: Any], Never>?
+        var stateReply: CheckedContinuation<[String: Any], Never>?
+        let game = GameLink { command in
+            if command.hasPrefix("launcher-start ") {
+                return await withCheckedContinuation {
+                    startReply = $0
+                    submitted.fulfill()
+                }
+            }
+            return await withCheckedContinuation {
+                stateReply = $0
+                refreshing.fulfill()
+            }
+        }
+        game.prepareSession = {}
+        let join = Task { await game.join("example.invalid") }
+        await fulfillment(of: [submitted], timeout: 2)
+        let refresh = Task { await game.refresh() }
+        await fulfillment(of: [refreshing], timeout: 2)
+        startReply?.resume(returning: ["ok": true, "phase": "loading"])
+        await join.value
+        XCTAssertEqual(game.phase, .loading(0))
+
+        stateReply?.resume(returning: ["phase": "loading", "progress": 0.6])
+        await refresh.value
+        XCTAssertEqual(game.phase, .loading(0.6))
+    }
+
+    func testStartDiscardsAStateReadMadeDuringAccountPreparation() async {
+        let preparing = expectation(description: "account preparation started")
+        let refreshing = expectation(description: "state requested before start")
+        var prepare: CheckedContinuation<Void, Never>?
+        var stateReply: CheckedContinuation<[String: Any], Never>?
+        let game = GameLink { command in
+            if command.hasPrefix("launcher-start ") { return ["ok": true, "phase": "loading"] }
+            return await withCheckedContinuation {
+                stateReply = $0
+                refreshing.fulfill()
+            }
+        }
+        game.prepareSession = {
+            await withCheckedContinuation {
+                prepare = $0
+                preparing.fulfill()
+            }
+        }
+        let join = Task { await game.join("example.invalid") }
+        await fulfillment(of: [preparing], timeout: 2)
+        let refresh = Task { await game.refresh() }
+        await fulfillment(of: [refreshing], timeout: 2)
+        prepare?.resume()
+        await join.value
+
+        stateReply?.resume(returning: ["phase": "title"])
+        await refresh.value
+        XCTAssertEqual(game.phase, .loading(0))
+    }
+
     func testACancelledRefreshDoesNotPublishItsReply() async {
         let entered = expectation(description: "held refresh")
         var hold = false

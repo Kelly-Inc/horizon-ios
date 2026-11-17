@@ -544,6 +544,68 @@ final class LauncherAsyncTests: XCTestCase {
 
     private func hits(_ id: String) -> [String: Any] { ["hits": [["project_id": id, "title": id]]] }
 
+    func testCancelledPackSearchLeavesCurrentResultsInPlace() async {
+        var requests = 0
+        let store = PackStore(fetch: { _ in
+            requests += 1
+            return self.hits("current")
+        })
+        await store.search(.resource, query: "current")
+        let cancelled = Task { await store.search(.shader, query: "cancelled") }
+        cancelled.cancel()
+        await cancelled.value
+        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(store.results.map(\.id), ["current"])
+        XCTAssertFalse(store.searching)
+    }
+
+    func testCancellingPackInstallWhileAwaitingVersionsDoesNotStartTransfer() async {
+        let requested = expectation(description: "pack version lookup started")
+        var reply: CheckedContinuation<Any?, Never>?
+        var transfers = 0
+        let store = PackStore(fetch: { _ in
+            await withCheckedContinuation {
+                reply = $0
+                requested.fulfill()
+            }
+        }, transfer: { _ in
+            transfers += 1
+            throw URLError(.cannotConnectToHost)
+        })
+        let project = ModrinthProject(id: "fixture", kind: .shader, title: "Fixture", summary: "",
+                                      author: "", downloads: 0, icon: nil, gameVersions: [])
+        let task = Task { await store.install(project, version: "26.3") }
+        await fulfillment(of: [requested], timeout: 2)
+        task.cancel()
+        reply?.resume(returning: [["game_versions": ["26.3"], "files": [
+            ["filename": "shader.zip", "url": "https://example.invalid/shader.zip",
+             "size": 1, "hashes": ["sha512": String(repeating: "f", count: 128)]]
+        ]]])
+        switch await task.value {
+        case .success: XCTFail("Cancelled install succeeded")
+        case let .failure(error): XCTAssertEqual(error.message, "The pack download was cancelled.")
+        }
+        XCTAssertEqual(transfers, 0)
+        XCTAssertNil(store.downloading[project.id])
+    }
+
+    func testFailedVersionLookupIsDistinguishedFromAPackWithoutFiles() async {
+        let project = ModrinthProject(id: "fixture", kind: .resource, title: "Fixture", summary: "",
+                                      author: "", downloads: 0, icon: nil, gameVersions: [])
+        let responses: [(Any?, String)] = [
+            (nil, "Could not read the pack's versions from Modrinth. Try again."),
+            ([], "Fixture has no file to download."),
+        ]
+        for (response, message) in responses {
+            let store = PackStore(fetch: { _ in response })
+            switch await store.install(project, version: "26.3") {
+            case .success: XCTFail("Install required a valid file")
+            case let .failure(error): XCTAssertEqual(error.message, message)
+            }
+            XCTAssertNil(store.downloading[project.id])
+        }
+    }
+
     func testOldPackSearchCannotOverwriteNewResults() async {
         var pending: [String: CheckedContinuation<Any?, Never>] = [:]
         let store = PackStore(fetch: { url in

@@ -99,6 +99,7 @@ final class PackStore: ObservableObject {
     private static let api = "https://api.modrinth.com/v2"
 
     func search(_ kind: PackKind, query: String) async {
+        guard !Task.isCancelled else { return }
         searchRevision &+= 1
         let revision = searchRevision
         searching = true
@@ -139,10 +140,19 @@ final class PackStore: ObservableObject {
 
     /// Download `project`'s file for the game's Minecraft version into the project's pack folder.
     func install(_ project: ModrinthProject, version: String) async -> Result<Installed, PackError> {
+        let cancelled = PackError("The pack download was cancelled.")
+        guard !Task.isCancelled else { return .failure(cancelled) }
         guard downloading[project.id] == nil else { return .failure(PackError("This pack is already downloading.")) }
+        guard let url = URL(string: "\(Self.api)/project/\(project.id)/version") else {
+            return .failure(PackError("Modrinth returned an invalid project reference."))
+        }
         downloading[project.id] = 0
         defer { downloading[project.id] = nil }
-        let versions = await fetch(URL(string: "\(Self.api)/project/\(project.id)/version")!) as? [[String: Any]] ?? []
+        let response = await fetch(url)
+        guard !Task.isCancelled else { return .failure(cancelled) }
+        guard let versions = response as? [[String: Any]] else {
+            return .failure(PackError("Could not read the pack's versions from Modrinth. Try again."))
+        }
         // Newest first, as Modrinth lists them: one made for this Minecraft, else the newest of all.
         let fitting = versions.first { ($0["game_versions"] as? [String] ?? []).contains(version) }
         guard let chosen = fitting ?? versions.first,
@@ -195,7 +205,7 @@ final class PackStore: ObservableObject {
             let note = fitting == nil ? "It was made for Minecraft \(made), so it may not look right on \(version)." : nil
             return .success(Installed(file: destination.lastPathComponent, note: note))
         } catch {
-            return .failure(PackError(error.localizedDescription))
+            return .failure(Task.isCancelled ? cancelled : PackError(error.localizedDescription))
         }
     }
 
@@ -525,16 +535,25 @@ struct PacksPage: View {
     }
 
     private func download(_ project: ModrinthProject) async {
+        guard !Task.isCancelled else { return }
         Haptics.tap()
-        switch await store.install(project, version: link.version) {
+        let result = await store.install(project, version: link.version)
+        guard !Task.isCancelled else { return }
+        switch result {
         case let .success(installed):
             Haptics.done()
             let name = installed.file
             var said: String
-            if link.canList, let error = await choices.set(name, kind: project.kind, on: true) {
-                said = "Downloaded \(name), but it couldn't be switched on: \(error)"
+            if link.canList {
+                let error = await choices.set(name, kind: project.kind, on: true)
+                guard !Task.isCancelled else { return }
+                if let error {
+                    said = "Downloaded \(name), but it couldn't be switched on: \(error)"
+                } else {
+                    said = "\(name) is downloaded and on."
+                }
             } else {
-                said = link.canList ? "\(name) is downloaded and on." : "\(name) is downloaded. Switch it on in a moment."
+                said = "\(name) is downloaded. Switch it on in a moment."
             }
             if let note = installed.note {
                 said += " " + note

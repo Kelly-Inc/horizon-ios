@@ -403,6 +403,7 @@ pub(super) struct PackIds {
 #[derive(Clone, PartialEq, Eq)]
 struct LoadKey {
     path: std::path::PathBuf,
+    stamp: Option<u64>,
     resources: std::path::PathBuf,
     dimension: i32,
     dimension_name: String,
@@ -623,35 +624,50 @@ impl Game<'_> {
             {
                 renderer.drop_shader_packs();
                 self.pack_ids = None;
+                self.native_shaders.classic_source = None;
             }
             if let Some((dimension, programs, notes)) = renderer.take_shader_report() {
-                let path = Self::shader_packs_dir().join(&self.native_shaders.picked);
-                remember(&path, fingerprint(&path), !programs.is_empty());
-                if programs.is_empty() {
+                if let Some((path, stamp)) = &self.native_shaders.classic_source
+                    && path == &selected_path
+                    && *stamp == fingerprint(path)
+                {
+                    remember(path, *stamp, !programs.is_empty());
+                    if programs.is_empty() {
+                        self.pack_ids = None;
+                        failed = Some((
+                            selected.clone(),
+                            path.clone(),
+                            *stamp,
+                            dimension,
+                            notes.clone(),
+                        ));
+                    }
+                    record_report(&selected, dimension, &programs, &notes);
+                } else {
+                    renderer.drop_shader_packs();
                     self.pack_ids = None;
-                    failed = Some((selected.clone(), dimension, notes.clone()));
-                }
-                record_report(&selected, dimension, &programs, &notes);
-                for note in &notes {
-                    log::warn!("shader pack: {note}");
+                    self.native_shaders.classic_source = None;
                 }
             }
-            let desired = LoadKey {
-                path: selected_path,
-                resources: self.options.resources.clone(),
-                options_revision: OPTIONS_REVISION.with(Cell::get),
-                dimension,
-                dimension_name: self.dim.id().to_owned(),
-                context: renderer.shader_context_key(),
-            };
             PENDING_LOAD.with_borrow_mut(|pending| {
                 if let Some(load) = pending.as_ref()
-                    && load.key != desired
                     && load
                         .worker
                         .as_ref()
                         .is_none_or(|worker| worker.is_finished())
                 {
+                    let desired = LoadKey {
+                        stamp: fingerprint(&selected_path),
+                        path: selected_path,
+                        resources: self.options.resources.clone(),
+                        options_revision: OPTIONS_REVISION.with(Cell::get),
+                        dimension,
+                        dimension_name: self.dim.id().to_owned(),
+                        context: renderer.shader_context_key(),
+                    };
+                    if load.key == desired {
+                        return;
+                    }
                     match load.result.try_recv() {
                         Err(std::sync::mpsc::TryRecvError::Empty) => {}
                         _ => {
@@ -661,11 +677,11 @@ impl Game<'_> {
                 }
             });
         }
-        if let Some((name, dimension, notes)) = failed {
+        if let Some((name, path, stamp, dimension, notes)) = failed {
             // This report is a completed GPU job, never the pending notice.
             // Apply the same quarantine as the synchronous loader so a pack
             // that the device refuses is not retried on every app launch.
-            self.shader_pack_failed(&name, dimension, &notes.join("; "), &notes);
+            self.shader_pack_failed(&name, &path, stamp, dimension, &notes.join("; "), &notes);
         }
     }
 
@@ -732,13 +748,14 @@ impl Game<'_> {
             Dim::Nether => -1,
             Dim::End => 1,
         };
-        if (dev_pack().is_none() && selected.starts_with("horizon:"))
-            || horizon_shader_api::package::is_pack(&path)
-        {
+        let native = (dev_pack().is_none() && selected.starts_with("horizon:"))
+            || horizon_shader_api::package::is_pack(&path);
+        let stamp = if native { None } else { fingerprint(&path) };
+        if native {
             // One of Horizon's own packs (game/modding/native_shaders.rs).
             self.tick_native_shader_pack(&path);
         } else if let Some(renderer) = &mut self.renderer
-            && !refused(&path, fingerprint(&path))
+            && !refused(&path, stamp)
         {
             // Lava uses the solid terrain program. Supply its sprite layers before
             // taking the renderer inputs handed to the background source parser.
@@ -753,6 +770,7 @@ impl Game<'_> {
             );
             let key = LoadKey {
                 path: path.clone(),
+                stamp,
                 resources: self.options.resources.clone(),
                 options_revision: OPTIONS_REVISION.with(Cell::get),
                 dimension,
@@ -786,10 +804,11 @@ impl Game<'_> {
                         );
                         renderer.set_separate_ao(parsed.entity_ids.separate_ao);
                         self.pack_ids = parsed.post.complete.then_some(parsed.entity_ids);
+                        self.native_shaders.classic_source = Some((path.clone(), stamp));
                         match renderer.set_shader_pack(dimension, Some(parsed.post), &table) {
                             Ok(Some((programs, notes))) => {
                                 if !programs.is_empty() {
-                                    remember(&path, fingerprint(&path), true);
+                                    remember(&path, stamp, true);
                                 }
                                 record_report(&name, dimension, &programs, &notes)
                             }
@@ -797,25 +816,43 @@ impl Game<'_> {
                             Err(refused) => {
                                 let mut notes = refused.notes;
                                 notes.push(refused.reason.clone());
-                                self.shader_pack_failed(&name, dimension, &refused.reason, &notes);
-                                record_report(&name, dimension, &[], &notes);
+                                if self.shader_pack_failed(
+                                    &name,
+                                    &path,
+                                    stamp,
+                                    dimension,
+                                    &refused.reason,
+                                    &notes,
+                                ) {
+                                    record_report(&name, dimension, &[], &notes);
+                                }
                             }
                         }
                     }
+                    Err(_) if fingerprint(&path) != stamp => {
+                        self.pack_ids = None;
+                        self.native_shaders.classic_source = None;
+                        renderer.drop_shader_packs();
+                    }
                     Err(error) => {
-                        remember(&path, fingerprint(&path), false);
-                        if error.starts_with(SOURCE_PANIC) {
+                        remember(&path, stamp, false);
+                        let report = if error.starts_with(SOURCE_PANIC) {
                             self.shader_pack_failed(
                                 &name,
+                                &path,
+                                stamp,
                                 dimension,
                                 &error,
                                 std::slice::from_ref(&error),
-                            );
+                            )
                         } else {
                             self.pack_ids = None;
                             let _ = renderer.set_shader_pack(dimension, None, &[]);
+                            true
+                        };
+                        if report {
+                            record_report(&name, dimension, &[], &[error]);
                         }
-                        record_report(&name, dimension, &[], &[error]);
                     }
                 }
             } else if renderer.shader_pack_dimension() != Some(dimension) && !parser_busy() {
@@ -993,9 +1030,24 @@ impl Game<'_> {
     /// Turns off the pack `name` after loading it panicked or failed: nothing runs in its place,
     /// it is no longer the picked pack (so the next start does not load it again), and the chat
     /// says so.
-    fn shader_pack_failed(&mut self, name: &str, dimension: i32, error: &str, notes: &[String]) {
-        let path = Self::shader_packs_dir().join(name);
-        remember(&path, fingerprint(&path), false);
+    fn shader_pack_failed(
+        &mut self,
+        name: &str,
+        path: &std::path::Path,
+        stamp: Option<u64>,
+        dimension: i32,
+        error: &str,
+        notes: &[String],
+    ) -> bool {
+        if fingerprint(path) != stamp {
+            self.pack_ids = None;
+            self.native_shaders.classic_source = None;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.drop_shader_packs();
+            }
+            return false;
+        }
+        remember(path, stamp, false);
         log::error!("shader pack {name}: turned off: {error}");
         self.pack_ids = None;
         if let Some(renderer) = &mut self.renderer {
@@ -1026,6 +1078,7 @@ impl Game<'_> {
             format!("Shader pack {name} could not be loaded and was turned off"),
             0xFF5555,
         ));
+        true
     }
 
     /// Whether the game's vignette draws: the option, unless the loaded pack turns it off.
@@ -1564,6 +1617,7 @@ mod integration_tests {
             *pending = Some(PendingLoad {
                 key: LoadKey {
                     path: "shutdown.zip".into(),
+                    stamp: None,
                     resources: "resources".into(),
                     dimension: 0,
                     dimension_name: "minecraft:overworld".into(),
@@ -1673,6 +1727,7 @@ mod integration_tests {
         let (send, result) = std::sync::mpsc::channel();
         let key = LoadKey {
             path: "test.zip".into(),
+            stamp: None,
             resources: "resources".into(),
             dimension: 0,
             dimension_name: "minecraft:overworld".into(),

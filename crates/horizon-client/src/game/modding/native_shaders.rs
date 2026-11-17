@@ -9,7 +9,7 @@
 //! pick asks for its frame as no pack does (`picked_pack_shape`).
 
 use std::{
-    hash::{Hash, Hasher},
+    hash::Hasher,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -63,6 +63,8 @@ pub(super) fn refused(path: &Path, stamp: Option<u64>) -> bool {
 pub(super) struct NativeShaders {
     /// The resolved pack path, of either kind (`game/interface/shader_packs.rs`); empty: none.
     pub picked: String,
+    /// The classic shader bytes handed to the current renderer generation.
+    pub classic_source: Option<(PathBuf, Option<u64>)>,
     /// The pack's files when it was last read (`fingerprint`).
     stamp: Option<u64>,
     looked: Option<Instant>,
@@ -118,6 +120,7 @@ impl NativeShaders {
 
     pub fn select(&mut self, name: &str) {
         self.picked = name.to_owned();
+        self.classic_source = None;
         self.stamp = None;
         self.looked = None;
     }
@@ -347,35 +350,19 @@ fn not_drawn(m: &Manifest) -> Option<&'static str> {
     )
 }
 
+#[path = "native_shaders/source_fingerprint.rs"]
+mod source_fingerprint;
+
 /// A hash of the names, sizes and modification times of the pack's files and of its saved
 /// option values (`None` when the pack is unreadable).
 pub(super) fn fingerprint(path: &Path) -> Option<u64> {
-    fn walk(path: &Path, hasher: &mut std::hash::DefaultHasher) -> Option<()> {
-        let meta = std::fs::metadata(path).ok()?;
-        path.hash(hasher);
-        if meta.is_dir() {
-            let mut entries: Vec<_> = std::fs::read_dir(path)
-                .ok()?
-                .flatten()
-                .map(|e| e.path())
-                .collect();
-            entries.sort();
-            for entry in entries {
-                walk(&entry, hasher)?;
-            }
-        } else {
-            meta.len().hash(hasher);
-            meta.modified().ok()?.hash(hasher);
-        }
-        Some(())
-    }
     let mut hasher = std::hash::DefaultHasher::new();
-    walk(path, &mut hasher)?;
+    source_fingerprint::walk(path, &mut hasher)?;
     // The player's option values, when there are any.
     if let Ok(manifest) = Pack::read_manifest(path) {
         let values_pack = horizon_client::shader_pack_list::native_values_pack(path, &manifest.id);
         let values = horizon_client::shader_pack_list::values_path(&values_pack);
-        let _ = walk(&values, &mut hasher);
+        let _ = source_fingerprint::walk(&values, &mut hasher);
     }
     Some(hasher.finish())
 }

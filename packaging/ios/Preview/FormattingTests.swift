@@ -174,6 +174,27 @@ final class FormattingTests: XCTestCase {
         XCTAssertTrue(current.contains(marker), "Export must retain the newest error, not truncate it to fit headers")
     }
 
+    func testDiagnosticsExportKeepsReadableLogsWhenAnotherLogCannotBeOpened() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let launcher = root.appendingPathComponent("launcher")
+        let game = root.appendingPathComponent("game")
+        let logs = game.appendingPathComponent("logs")
+        try FileManager.default.createDirectory(at: launcher.appendingPathComponent("launcher-previous.log"),
+                                                withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        Diagnostics.record("launcher ready", folder: launcher)
+        try Data("[12:00:01] shader failed\naccess_token=private-fixture\n".utf8)
+            .write(to: logs.appendingPathComponent("latest.log"))
+
+        let report = try String(contentsOf: Diagnostics.export(folder: launcher, gameFolder: game), encoding: .utf8)
+        XCTAssertTrue(report.contains("--- Launcher previous ---\nLog unavailable during export.\n"))
+        XCTAssertTrue(report.contains("--- Game previous ---\nNo log recorded yet.\n"))
+        XCTAssertTrue(report.contains("launcher ready"))
+        XCTAssertTrue(report.contains("shader failed"))
+        XCTAssertFalse(report.contains("private-fixture"))
+    }
+
     func testDiagnosticsAreBoundedRedactedAndExportOnlyLogs() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer {try? FileManager.default.removeItem(at:root)}

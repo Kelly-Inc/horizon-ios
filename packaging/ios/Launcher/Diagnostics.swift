@@ -86,6 +86,23 @@ enum Diagnostics {
         guard let newline = suffix.firstIndex(of: "\n") else {return marker}
         return marker + suffix[suffix.index(after: newline)...]
     }
+
+    /// An unreadable source must not prevent exporting the other logs.
+    private static func exportSnapshot(_ url: URL) -> String {
+        let unavailable = "Log unavailable during export.\n"
+        do {
+            guard try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
+                return unavailable
+            }
+            return redactExport(try read(url))
+        } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
+            return "No log recorded yet.\n"
+        } catch {
+            // File errors can contain private paths. Keep the report text generic.
+            return unavailable
+        }
+    }
+
     static func export(folder: URL = directory, gameFolder: URL? = nil) throws -> URL {
         // Export reads bounded snapshots without holding the launcher writer lock.
         let fm = FileManager.default
@@ -100,9 +117,7 @@ enum Diagnostics {
         let budget = max(0, 4 * limit - overhead) / entries.count
         for (index, entry) in entries.enumerated() {
             output += headings[index]
-            let text = fm.fileExists(atPath:entry.1.path)
-                ? redactExport(try read(entry.1)) : "No log recorded yet.\n"
-            output += exportTail(text, maximum: budget)
+            output += exportTail(exportSnapshot(entry.1), maximum: budget)
         }
         try bounded(output, maximum: 4 * limit).write(to:destination,options:.atomic)
         return destination

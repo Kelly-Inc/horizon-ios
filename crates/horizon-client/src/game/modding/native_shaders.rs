@@ -18,7 +18,7 @@ use horizon_client::gfx::native_entity::{EntityKind, EntityRuns};
 use horizon_client::text::Text;
 use horizon_shader_api::{Manifest, Pack, Primaries, check};
 
-use super::Game;
+use super::{Game, shader_packs::PickedPack};
 
 const LOOK_EVERY: Duration = Duration::from_millis(500);
 const RED: u32 = 0xFF5555;
@@ -72,6 +72,7 @@ pub(super) struct NativeShaders {
     selection: String,
     resolved: PathBuf,
     resolved_at: Option<Instant>,
+    frame_pack: Option<Option<PickedPack>>,
     /// The runs of this frame's entity geometry that the pack's `[entity]` stage lights
     /// (`Game::lit_entity`), up to the renderer taking them (`Renderer::take_entity_runs`).
     pub entity_runs: std::cell::RefCell<EntityRuns>,
@@ -115,8 +116,16 @@ impl NativeShaders {
             }
             self.selection = picked.to_owned();
             self.resolved_at = Some(Instant::now());
+            self.frame_pack = None;
         }
         self.resolved.clone()
+    }
+
+    /// The selected pack's frame requirements, refreshed with its resolved path.
+    pub fn frame_pack(&mut self) -> Option<PickedPack> {
+        *self
+            .frame_pack
+            .get_or_insert_with(|| PickedPack::read(&self.resolved))
     }
 
     pub fn select(&mut self, name: &str) {
@@ -477,6 +486,50 @@ mod tests {
         assert_eq!(outcome(&pack), None);
         assert_eq!(state.check_classic_source(&pack, true, false), None);
         std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    #[test]
+    fn selected_frame_pack_refreshes_with_resolution_and_caches_missing_packs() {
+        use super::{LOOK_EVERY, NativeShaders};
+        use std::time::Instant;
+
+        let root = std::env::temp_dir().join(format!("horizon-frame-cache-{}", std::process::id()));
+        let path = root.join("classic");
+        let mut state = NativeShaders::default();
+        assert_eq!(state.resolve_path(&root, "classic", true), path);
+        assert!(state.frame_pack().is_none());
+
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(state.frame_pack().is_none());
+        state.resolved_at = Some(Instant::now() - LOOK_EVERY);
+        assert_eq!(state.resolve_path(&root, "classic", true), path);
+        assert!(state.frame_pack().unwrap().shaders_pack);
+
+        let manifest = path.join(horizon_shader_api::MANIFEST);
+        std::fs::write(
+            manifest,
+            format!(
+                "schema = 1\nid = \"fixture\"\nname = \"Fixture\"\nversion = \"1\"\napi = \"{}\"\n\
+                 [frame]\nblend = \"linear\"\n[[post]]\nfile = \"p.wgsl\"\n",
+                horizon_shader_api::API
+            ),
+        )
+        .unwrap();
+        assert!(state.frame_pack().unwrap().shaders_pack);
+        state.resolved_at = Some(Instant::now() - LOOK_EVERY);
+        state.resolve_path(&root, "classic", true);
+        assert_eq!(
+            state.frame_pack().unwrap().linear,
+            Some(horizon_shader_api::Blend::Linear)
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(state.frame_pack().unwrap().linear.is_some());
+        assert_eq!(
+            state.resolve_path(&root, "another", true),
+            root.join("another")
+        );
+        assert!(state.frame_pack().is_none());
     }
 
     fn manifest(extra: &str) -> Manifest {

@@ -23,24 +23,23 @@ impl<K: PartialEq> FrameAttempt<K> {
 }
 
 impl Game<'_> {
-    pub(super) fn renderer_for(
+    fn renderer_for(
         &self,
         window: Arc<Window>,
-        pack: &PackResources,
-        gui: &UiResources,
+        pack: shader_packs::PickedPack,
     ) -> Result<Renderer> {
         build_renderer(
             window,
             self.options.offscreen,
-            pack,
-            gui,
+            &self.pack,
+            &self.gui,
             self.renderer.as_ref(),
             None,
             self.settings.horizon.api,
             self.settings.horizon.translucent_batching,
             self.settings.vsync,
             &self.settings.horizon,
-            shader_packs::picked_pack_shape(&self.settings),
+            pack,
             self.renderer
                 .as_ref()
                 .map(|r| r.display_reading())
@@ -64,18 +63,19 @@ impl Game<'_> {
             picked,
             shader_packs::dev_pack().is_some(),
         );
-        let available = path.exists()
-            && path.file_name().is_none_or(|f| {
-                !shader_packs::active_pack(&f.to_string_lossy(), &self.settings.mods).is_empty()
-            });
-        let outcome = if available {
+        let pack = if shader_packs::pack_owned(picked, &path, &self.settings.mods) {
+            self.native_shaders.frame_pack()
+        } else {
+            None
+        };
+        let outcome = if pack.is_some() {
             native_shaders::outcome(&path)
         } else {
             Some(false)
         };
-        // The renderer's offer can change while the game runs (Vulkan's formats follow desktop
-        // HDR and the window's output), and the frame with it.
-        let request = shader_packs::picked_pack_shape(&self.settings).frame();
+        let pack = pack.filter(|_| outcome != Some(false)).unwrap_or_default();
+        // Display capabilities can still change between shader checks.
+        let request = pack.frame();
         let wanted = self
             .renderer
             .as_ref()
@@ -90,7 +90,7 @@ impl Game<'_> {
         {
             return;
         }
-        if let Err(e) = self.rebuild_renderer() {
+        if let Err(e) = self.rebuild_renderer(pack) {
             log::warn!("Horizon: the renderer for the new frame could not be made: {e}");
         }
     }
@@ -98,7 +98,7 @@ impl Game<'_> {
     /// The renderer made again on the same device from the resources loaded, keeping the
     /// pipelines that come out the same and the world the old one holds (`Renderer::take_world`):
     /// only what draws in the frame is made again, and no section is meshed again.
-    fn rebuild_renderer(&mut self) -> Result<()> {
+    fn rebuild_renderer(&mut self, pack: shader_packs::PickedPack) -> Result<()> {
         let Some(window) = self.window.clone() else {
             return Ok(());
         };
@@ -106,7 +106,7 @@ impl Game<'_> {
         if let Some(renderer) = &mut self.renderer {
             renderer.release_surface();
         }
-        let mut renderer = match self.renderer_for(window, &self.pack, &self.gui) {
+        let mut renderer = match self.renderer_for(window, pack) {
             Ok(renderer) => renderer,
             Err(error) => {
                 if let Some(renderer) = &mut self.renderer {
@@ -244,7 +244,7 @@ impl Game<'_> {
     }
 
     pub(super) fn new_renderer(&self, window: Arc<Window>) -> Result<Renderer> {
-        self.renderer_for(window, &self.pack, &self.gui)
+        self.renderer_for(window, shader_packs::picked_pack_shape(&self.settings))
     }
 
     /// A renderer made again from the resources loaded takes over: what named the old one's

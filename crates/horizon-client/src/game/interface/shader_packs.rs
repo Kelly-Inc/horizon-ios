@@ -92,11 +92,11 @@ pub(super) fn picked_pack(settings: &horizon_client::settings::Settings) -> &str
 
 /// What a renderer readies for the pick, unless it was refused with no version of it left
 /// drawing (`native_shaders::remember_look`), is missing or its owner is off.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct PickedPack {
-    /// It draws flat where the device can (`pack_draws_flat`): the sections are laid out so.
+    /// It draws flat where the device can: the sections are laid out for it.
     pub draws_flat: bool,
-    /// Its passes read the solid quads' vertices (`pack_reads_vertices`): they start wide.
+    /// Its passes read the solid quads' vertices: they start wide.
     pub starts_wide: bool,
     /// It is one of Horizon's own packs, with its `[frame] blend`: the frame is float.
     pub linear: Option<horizon_shader_api::Blend>,
@@ -128,40 +128,45 @@ pub(super) fn picked_pack_shape(settings: &horizon_client::settings::Settings) -
     } else {
         horizon_client::shader_pack_list::resolve(&dir, picked).1
     };
-    let owned = !picked.is_empty()
-        && path
-            .file_name()
-            .is_none_or(|f| !active_pack(&f.to_string_lossy(), &settings.mods).is_empty());
-    let active = owned && path.exists() && outcome(&path) != Some(false);
-    // One whose manifest doesn't read is about to be refused: it asks as no pack does.
-    let own = horizon_shader_api::package::is_pack(&path);
-    // Read once, for the frame and ray tracing alike; a pack refused before is neither.
-    let manifest = (owned && own && outcome(&path) != Some(false))
-        .then(|| horizon_shader_api::Pack::read_manifest(&path).ok())
-        .flatten();
-    let linear = (manifest.as_ref()).filter(|_| active).map(|m| m.blend);
-    PickedPack {
-        draws_flat: active && pack_draws_flat(&path),
-        starts_wide: active && pack_reads_vertices(&path),
-        linear,
-        ray_tracing: manifest.is_some_and(|m| m.ray_tracing.is_some()),
-        shaders_pack: active && !own,
+    if pack_owned(picked, &path, &settings.mods) && outcome(&path) != Some(false) {
+        PickedPack::read(&path).unwrap_or_default()
+    } else {
+        PickedPack::default()
     }
 }
 
-/// Whether the pack at `path` has passes that draw the terrain flat where the device can,
-/// reading translucent quads beside their section's solid ones: a `shaders/` pack, taken to
-/// draw terrain, or one of Horizon's own with a `[shadow]` pass.
-fn pack_draws_flat(path: &std::path::Path) -> bool {
-    !horizon_shader_api::package::is_pack(path)
-        || horizon_shader_api::Pack::read_manifest(path).is_ok_and(|m| m.shadow.is_some())
+impl PickedPack {
+    /// Read the requirements of an installed pack. Incompatible native manifests
+    /// request the default frame until the shader loader can report the problem.
+    pub(super) fn read(path: &std::path::Path) -> Option<Self> {
+        if !path.exists() {
+            return None;
+        }
+        if !horizon_shader_api::package::is_pack(path) {
+            return Some(Self {
+                draws_flat: true,
+                starts_wide: true,
+                shaders_pack: true,
+                ..Self::default()
+            });
+        }
+        Some(horizon_shader_api::Pack::read_manifest(path).map_or_else(
+            |_| Self::default(),
+            |manifest| Self {
+                draws_flat: manifest.shadow.is_some(),
+                linear: Some(manifest.blend),
+                ray_tracing: manifest.ray_tracing.is_some(),
+                ..Self::default()
+            },
+        ))
+    }
 }
 
-/// Whether the pack at `path` reads the solid quads as vertices, not their compact records: a
-/// `shaders/` pack, taken to draw terrain. Horizon's own read the records, `[displacement]`
-/// too (gfx/displace.rs).
-fn pack_reads_vertices(path: &std::path::Path) -> bool {
-    !horizon_shader_api::package::is_pack(path)
+pub(super) fn pack_owned(picked: &str, path: &std::path::Path, mods: &ModList) -> bool {
+    !picked.is_empty()
+        && path
+            .file_name()
+            .is_none_or(|f| !active_pack(&f.to_string_lossy(), mods).is_empty())
 }
 
 // A native mod can bundle a pack as `native-<mod-id>`; its Mods toggle controls it too.
@@ -1782,7 +1787,7 @@ mod rendered_item_tests {
 
 #[cfg(test)]
 mod native_pack_tests {
-    use super::{active_pack, pack_draws_flat, pack_reads_vertices, picked_pack_shape};
+    use super::{PickedPack, active_pack, picked_pack_shape};
     use horizon_client::mod_list::{Installed, ModList, NativePage};
 
     #[test]
@@ -1967,17 +1972,14 @@ mod native_pack_tests {
             }
             dir
         };
-        assert!(pack_draws_flat(&pack("shaders_pack", None)));
-        assert!(!pack_draws_flat(&pack("unshadowed", Some(""))));
-        assert!(pack_draws_flat(&pack("shadowed", Some("[shadow]\n"))));
-        // Only a `shaders/` pack reads the solid quads' vertices: a material, a shadow pass
-        // and `[displacement]` start in the compact layout.
-        assert!(pack_reads_vertices(&root.join("shaders_pack")));
-        assert!(!pack_reads_vertices(&root.join("shadowed")));
-        assert!(!pack_reads_vertices(&pack(
-            "displaced",
-            Some("[displacement]\n")
-        )));
+        let classic = PickedPack::read(&pack("shaders_pack", None)).unwrap();
+        assert!(classic.draws_flat && classic.starts_wide);
+        let unshadowed = PickedPack::read(&pack("unshadowed", Some(""))).unwrap();
+        assert!(!unshadowed.draws_flat && !unshadowed.starts_wide);
+        let shadowed = PickedPack::read(&pack("shadowed", Some("[shadow]\n"))).unwrap();
+        assert!(shadowed.draws_flat && !shadowed.starts_wide);
+        let displaced = PickedPack::read(&pack("displaced", Some("[displacement]\n"))).unwrap();
+        assert!(!displaced.starts_wide);
         std::fs::remove_dir_all(&root).ok();
     }
 

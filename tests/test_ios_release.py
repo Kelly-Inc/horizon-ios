@@ -17,6 +17,7 @@ spec = importlib.util.spec_from_file_location("ios_release", ROOT / "tools/ci/io
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 SHA = "a" * 40
+CLIENT_ID = "fixture-public-client"
 
 
 def binary(signed=False, platform=2, legacy=False, file_type=2, minimum=0x100000):
@@ -32,6 +33,14 @@ def binary(signed=False, platform=2, legacy=False, file_type=2, minimum=0x100000
         count += 1
     return struct.pack("<IIIIIIII", 0xFEEDFACF, 0x0100000C, 0, file_type,
                        count, len(commands), 0, 0) + commands
+
+
+def launcher_framework(version, build, executable="HorizonLauncherKit"):
+    path = "Payload/Horizon.app/Frameworks/HorizonLauncherKit.framework"
+    info = {"CFBundleShortVersionString": version, "CFBundleVersion": build,
+            "CFBundleExecutable": executable}
+    return {f"{path}/Info.plist": plistlib.dumps(info),
+            f"{path}/{executable}": binary(file_type=6)}
 
 
 class IOSReleaseTests(unittest.TestCase):
@@ -118,7 +127,7 @@ class IOSReleaseTests(unittest.TestCase):
             ipa = root / "ipa-artifact/Horizon-game-unsigned.ipa"
             env = dict(os.environ, GITHUB_SHA=SHA, GITHUB_RUN_NUMBER="91", GITHUB_RUN_ATTEMPT="3",
                        GITHUB_OUTPUT=str(root / "outputs"), IPA_ARTIFACT_ID="987654",
-                       IPA_BUILD_ATTEMPT="1")
+                       IPA_BUILD_ATTEMPT="1", HORIZON_MSA_CLIENT_ID=CLIENT_ID)
             for overrides in ({"IPA_ARTIFACT_ID": ""}, {"IPA_BUILD_ATTEMPT": ""},
                               {"IPA_BUILD_ATTEMPT": "4"}):
                 result = subprocess.run(["bash", "-ec", preflight["run"]],
@@ -129,7 +138,9 @@ class IOSReleaseTests(unittest.TestCase):
                                                                ("1", "3", False)]:
                 with self.subTest(artifact=artifact_attempt, build=build_attempt):
                     version, number = release.release_version("91", artifact_attempt)
-                    self.archive(ipa, info={"CFBundleShortVersionString": version, "CFBundleVersion": number})
+                    self.archive(ipa, launcher_framework(version, number),
+                                 {"CFBundleShortVersionString": version, "CFBundleVersion": number,
+                                  "HorizonMSAClientID": CLIENT_ID})
                     result = subprocess.run(["bash", "-ec", prepare["run"]], cwd=root,
                                             env=dict(env, IPA_BUILD_ATTEMPT=build_attempt),
                                             capture_output=True, text=True)
@@ -139,6 +150,25 @@ class IOSReleaseTests(unittest.TestCase):
                     else:
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("IPA version does not match", result.stderr)
+
+    def test_shipping_audit_requires_the_expected_launcher_path_and_client_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ipa = Path(directory) / "release.ipa"
+            version, build = "0.1.0", "42.2"
+            for extra, client_id, problem in [
+                ({}, CLIENT_ID, "Missing HorizonLauncherKit"),
+                (launcher_framework(version, build, "Renamed"), CLIENT_ID, "Missing HorizonLauncherKit"),
+                (launcher_framework(version, build), "", "Microsoft client ID"),
+                (launcher_framework(version, build), CLIENT_ID, None),
+            ]:
+                with self.subTest(problem=problem):
+                    self.archive(ipa, extra, {"HorizonMSAClientID": client_id})
+                    options = {"require_launcher": True, "expected_client_id": CLIENT_ID}
+                    if problem is not None:
+                        with self.assertRaisesRegex(ValueError, problem):
+                            release.audit(ipa, SHA, **options)
+                    else:
+                        self.assertEqual(release.audit(ipa, SHA, **options), (version, build))
 
     def test_stamp_updates_app_and_framework_preserving_other_fields(self):
         with tempfile.TemporaryDirectory() as directory:

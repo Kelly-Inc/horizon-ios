@@ -282,15 +282,19 @@ class MobileForkWorkflowTests(unittest.TestCase):
         self.assertEqual(command[1], "tools/ci/ios_release.py")
         command[0] = sys.executable
         command[1] = str(root / command[1])
-        workflow = {"$GITHUB_SHA": fixtures.SHA, "$GITHUB_RUN_NUMBER": "88", "$GITHUB_RUN_ATTEMPT": "1"}
+        workflow = {"$GITHUB_SHA": fixtures.SHA, "$GITHUB_RUN_NUMBER": "88", "$GITHUB_RUN_ATTEMPT": "1",
+                    "$HORIZON_MSA_CLIENT_ID": fixtures.CLIENT_ID}
         command = [workflow.get(part, part) for part in command]
         with tempfile.TemporaryDirectory() as directory:
             ipa = Path(directory) / "Horizon-game-unsigned.ipa"
             for contains_assets in (False, True):
-                extra = {"Payload/Horizon.app/horizon-resources.json": b"{}"} if contains_assets else {}
                 version, build = fixtures.release.release_version("88", "1")
+                extra = fixtures.launcher_framework(version, build)
+                if contains_assets:
+                    extra["Payload/Horizon.app/horizon-resources.json"] = b"{}"
                 fixtures.IOSReleaseTests().archive(ipa, extra,
-                    {"CFBundleShortVersionString": version, "CFBundleVersion": build})
+                    {"CFBundleShortVersionString": version, "CFBundleVersion": build,
+                     "HorizonMSAClientID": fixtures.CLIENT_ID})
                 result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, not contains_assets, result.stderr)
 

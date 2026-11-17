@@ -141,7 +141,8 @@ def audit_payload_layout(paths, app):
                 raise ValueError("An IPA file is also used as a directory")
 
 
-def audit(ipa, expected_commit=None, expected_version=None):
+def audit(ipa, expected_commit=None, expected_version=None, *,
+          require_launcher=False, expected_client_id=None):
     with zipfile.ZipFile(ipa) as archive:
         paths = {}
         binaries = {}
@@ -203,6 +204,15 @@ def audit(ipa, expected_commit=None, expected_version=None):
             raise ValueError("Invalid app version or build number")
         if framework_paths != frameworks.keys():
             raise ValueError("Missing framework Info.plist")
+        if require_launcher:
+            launcher_name = "HorizonLauncherKit"
+            launcher = frameworks.get(app / "Frameworks" / f"{launcher_name}.framework")
+            # The engine opens this exact relative path at runtime.
+            if launcher is None or launcher.get("CFBundleExecutable") != launcher_name:
+                raise ValueError("Missing HorizonLauncherKit launcher framework at the expected path")
+        if expected_client_id is not None:
+            if not expected_client_id or info.get("HorizonMSAClientID") != expected_client_id:
+                raise ValueError("IPA Microsoft client ID does not match the build configuration")
         for bundle, framework in frameworks.items():
             if (framework.get("CFBundleShortVersionString"), framework.get("CFBundleVersion")) != (version, build):
                 raise ValueError("Framework version does not match the app")
@@ -224,14 +234,18 @@ def audit(ipa, expected_commit=None, expected_version=None):
         return version, build
 
 
-def prepare(ipa, output, expected_commit, expected_version=None):
+def prepare(ipa, output, expected_commit, expected_version=None, *,
+            require_launcher=False, expected_client_id=None):
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ios-release-", dir=output) as staging:
         staged_ipa = Path(staging) / "artifact.ipa"
         staged_checksum = Path(staging) / "artifact.sha256"
         shutil.copyfile(ipa, staged_ipa)
         # Verify the bytes that will actually be published, even if the input changed during copying.
-        version, build = audit(staged_ipa, expected_commit, expected_version)
+        version, build = audit(
+            staged_ipa, expected_commit, expected_version, require_launcher=require_launcher,
+            expected_client_id=expected_client_id,
+        )
         with staged_ipa.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         target = output / f"Horizon-iOS-{version}-build{build}-unsigned.ipa"
@@ -251,21 +265,24 @@ def main():
     parser.add_argument("--stamp-app", type=Path)
     parser.add_argument("--run-number")
     parser.add_argument("--run-attempt")
-    parser.add_argument("--client-id", default="")
+    parser.add_argument("--client-id", help="Microsoft client ID to stamp or verify")
+    parser.add_argument("--require-launcher", action="store_true")
     parser.add_argument("--expect-commit", required=True)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     if args.stamp_app:
-        if args.ipa or args.output_dir or not args.run_number or not args.run_attempt:
+        if (args.ipa or args.output_dir or args.require_launcher
+                or not args.run_number or not args.run_attempt):
             parser.error("--stamp-app requires run number and attempt, without an IPA/output directory")
-        stamp_app(args.stamp_app, args.run_number, args.run_attempt, args.expect_commit, args.client_id)
+        stamp_app(args.stamp_app, args.run_number, args.run_attempt, args.expect_commit, args.client_id or "")
         return
     if not args.ipa:
         parser.error("an IPA or --stamp-app is required")
     expected = (release_version(args.run_number, args.run_attempt)
                 if args.run_number or args.run_attempt else None)
-    result = (prepare(args.ipa, args.output_dir, args.expect_commit, expected) if args.output_dir
-              else dict(zip(("version", "build"), audit(args.ipa, args.expect_commit, expected))))
+    checks = {"require_launcher": args.require_launcher, "expected_client_id": args.client_id}
+    result = (prepare(args.ipa, args.output_dir, args.expect_commit, expected, **checks) if args.output_dir
+              else dict(zip(("version", "build"), audit(args.ipa, args.expect_commit, expected, **checks))))
     for key, value in result.items():
         print(f"{key}={value}")
 

@@ -1,4 +1,5 @@
 import AVFoundation
+import CryptoKit
 import os
 import XCTest
 import UIKit
@@ -393,13 +394,16 @@ final class LauncherAsyncTests: XCTestCase {
         try Data("existing resource".utf8).write(to: existingResource)
         let temporary = root.appendingPathComponent("download")
         let downloaded = Data("new shader fixture".utf8)
+        let sha512 = SHA512.hash(data: downloaded).map { String(format: "%02X", $0) }.joined()
+        var hashes = ["sha512": sha512]
         try downloaded.write(to: temporary)
         let store = PackStore(fetch: { url in
             if url.path.hasSuffix("/search") {
                 return ["hits": [["project_id": "fixture", "title": "Fixture"]]]
             }
             return [["game_versions": ["26.3"], "files": [
-                ["filename": "shared.zip", "url": "https://example.invalid/shared.zip", "primary": true],
+                ["filename": "shared.zip", "url": "https://example.invalid/shared.zip", "primary": true,
+                 "size": downloaded.count, "hashes": hashes],
             ]]]
         }, transfer: { request in
             let url = try XCTUnwrap(request.url)
@@ -410,12 +414,32 @@ final class LauncherAsyncTests: XCTestCase {
         let shader = try XCTUnwrap(store.results.first)
         await store.search(.resource, query: "")
         XCTAssertEqual(store.results.first?.kind, .resource)
-        let installed = try await store.install(shader, version: "26.3").get()
+        let first = await store.install(shader, version: "26.3")
+        if case let .failure(error) = first { XCTFail(error.message) }
+        let installed = try first.get()
         XCTAssertEqual(installed.file, "shared (2).zip")
         XCTAssertEqual(try Data(contentsOf: shaders.appendingPathComponent(installed.file)), downloaded)
         XCTAssertEqual(try Data(contentsOf: existingShader), Data("existing shader".utf8))
         XCTAssertEqual(try Data(contentsOf: existingResource), Data("existing resource".utf8))
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+
+        var corrupted = downloaded
+        corrupted[0] ^= 1
+        for invalid in [corrupted, Data(downloaded.dropLast())] {
+            try invalid.write(to: temporary)
+            switch await store.install(shader, version: "26.3") {
+            case .success: XCTFail("An unverified pack was installed")
+            case let .failure(error): XCTAssertTrue(error.message.contains("checksum or size"))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+            XCTAssertEqual(try Set(FileManager.default.contentsOfDirectory(atPath: shaders.path)),
+                           ["shared.zip", "shared (2).zip"])
+        }
+        hashes = ["sha1": Insecure.SHA1.hash(data: downloaded).map { String(format: "%02x", $0) }.joined()]
+        try downloaded.write(to: temporary)
+        let legacy = try await store.install(shader, version: "26.3").get()
+        XCTAssertEqual(legacy.file, "shared (3).zip")
+        XCTAssertEqual(try Data(contentsOf: shaders.appendingPathComponent(legacy.file)), downloaded)
     }
 
     func testStaleGameFileCompletionDoesNotImportOrReplaceSharedArchive() async throws {

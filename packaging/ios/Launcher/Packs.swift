@@ -1,3 +1,4 @@
+import CryptoKit
 import SwiftUI
 import UIKit
 
@@ -28,6 +29,46 @@ struct ModrinthProject: Identifiable, Equatable {
     let downloads: Int
     let icon: URL?
     let gameVersions: [String]
+}
+
+private struct PackFileIntegrity: Sendable {
+    private enum Algorithm: Sendable { case sha512, sha1 }
+    private let algorithm: Algorithm
+    private let expectedHash: String
+    private let expectedSize: Int64
+
+    init?(metadata: [String: Any]) {
+        guard let size = metadata["size"] as? Int, size > 0,
+              let hashes = metadata["hashes"] as? [String: String] else { return nil }
+        let algorithm: Algorithm = hashes["sha512"] == nil ? .sha1 : .sha512
+        let key = algorithm == .sha512 ? "sha512" : "sha1"
+        let length = algorithm == .sha512 ? 128 : 40
+        guard let hash = hashes[key]?.lowercased(), hash.utf8.count == length,
+              hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+        self.algorithm = algorithm
+        expectedHash = hash
+        expectedSize = Int64(size)
+    }
+
+    func matches(_ url: URL) throws -> Bool {
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        var sha512 = SHA512()
+        var sha1 = Insecure.SHA1()
+        var count: Int64 = 0
+        while let chunk = try file.read(upToCount: 1 << 20), !chunk.isEmpty {
+            try Task.checkCancellation()
+            guard Int64(chunk.count) <= expectedSize - count else { return false }
+            count += Int64(chunk.count)
+            switch algorithm {
+            case .sha512: sha512.update(data: chunk)
+            case .sha1: sha1.update(data: chunk)
+            }
+        }
+        guard count == expectedSize else { return false }
+        let digest = algorithm == .sha512 ? Array(sha512.finalize()) : Array(sha1.finalize())
+        return digest.map { String(format: "%02x", $0) }.joined() == expectedHash
+    }
 }
 
 /// Packs from Modrinth (api.modrinth.com, v2): search, then the newest version made for the game's Minecraft
@@ -115,6 +156,9 @@ final class PackStore: ObservableObject {
         else {
             return .failure(PackError("\(project.title) has no file to download."))
         }
+        guard let integrity = PackFileIntegrity(metadata: file) else {
+            return .failure(PackError("Modrinth did not provide a valid checksum and size for this pack."))
+        }
         var request = URLRequest(url: link)
         request.setValue(Self.agent, forHTTPHeaderField: "User-Agent")
         do {
@@ -123,6 +167,16 @@ final class PackStore: ObservableObject {
             try Task.checkCancellation()
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 return .failure(PackError("Modrinth refused the download of \(project.title)."))
+            }
+            let verification = Task.detached(priority: .utility) { try integrity.matches(temporary) }
+            let matches = try await withTaskCancellationHandler {
+                try await verification.value
+            } onCancel: {
+                verification.cancel()
+            }
+            try Task.checkCancellation()
+            guard matches else {
+                return .failure(PackError("The downloaded pack did not match Modrinth's checksum or size. Try downloading it again."))
             }
             let directory = folder(project.kind)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

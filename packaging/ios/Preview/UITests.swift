@@ -117,7 +117,7 @@ final class LauncherLayoutTests: XCTestCase {
             return frame.width > frame.height
         }, evaluatedWith: app)
         waitForExpectations(timeout: 5)
-        let jump = app.images["touch-layout-5"]
+        let jump = app.descendants(matching: .any).matching(identifier: "touch-layout-5").firstMatch
         XCTAssertTrue(jump.waitForExistence(timeout: 5))
         app.buttons["touch-editor-reset"].tap()
         app.buttons["Reset Layout"].tap()
@@ -177,7 +177,7 @@ final class LauncherLayoutTests: XCTestCase {
         let save = app.buttons["touch-editor-save"]
         XCTAssertTrue(save.waitForExistence(timeout: 5))
         app.buttons["touch-editor-reset"].tap(); app.buttons["Reset Layout"].tap()
-        let jump = app.images["touch-layout-5"]
+        let jump = app.descendants(matching: .any).matching(identifier: "touch-layout-5").firstMatch
         XCTAssertTrue(jump.waitForExistence(timeout: 5))
         let original = jump.frame
         let oldSave = save.frame

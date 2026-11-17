@@ -190,6 +190,32 @@ struct TouchConfiguration: Codable, Equatable {
         let y = max(r.height / 2, min(size.height - r.height / 2, point.y))
         centres[String(button.rawValue)] = TouchCentre(x: x / size.width, y: y / size.height)
     }
+
+    mutating func resetLayout() {
+        centres.removeAll()
+        sizes.removeAll()
+        opacities.removeAll()
+        forwardLock = false
+        guard !customButtons.isEmpty else { return }
+
+        let appearance = CustomTouchButton()
+        // Custom actions have no built-in slots. Spread them out in an even
+        // grid so resetting several buttons does not stack them at one point.
+        let columns = Int(ceil(sqrt(Double(customButtons.count))))
+        let rows = (customButtons.count + columns - 1) / columns
+        for index in customButtons.indices {
+            let row = index / columns
+            let countInRow = min(columns, customButtons.count - row * columns)
+            let column = index % columns
+            customButtons[index].centre = TouchCentre(
+                x: 0.15 + 0.7 * (Double(column) + 0.5) / Double(countInRow),
+                y: rows == 1 ? 0.75 : 0.25 + 0.6 * (Double(row) + 0.5) / Double(rows)
+            )
+            customButtons[index].size = appearance.size
+            customButtons[index].opacity = appearance.opacity
+        }
+    }
+
     func snapshot() -> ([Float], UInt32) {
         let points = TouchButton.allCases.flatMap { b -> [Float] in
             guard let c = centres[String(b.rawValue)], c.valid else { return [.nan, .nan] }
@@ -477,8 +503,14 @@ private struct TouchLayoutEditor: View {
             }
         }
         .confirmationDialog("Reset all button positions?", isPresented: $confirmReset, titleVisibility: .visible) {
-            Button("Reset Layout", role: .destructive) { draft.centres = [:]; draft.sizes = [:]; draft.opacities = [:]; draft.forwardLock = false; selected = nil; dragStart = nil }
-        } message: { Text("Save to keep the default positions, or Cancel to keep your current layout.") }
+            Button("Reset Layout", role: .destructive) {
+                draft.resetLayout()
+                selected = nil
+                dragStart = nil
+                customDrag = nil
+                pinchScale = 1
+            }
+        } message: { Text("This resets positions, sizes, and opacity. Custom bindings are kept. Save to keep the changes.") }
     }
 }
 

@@ -97,6 +97,49 @@ final class TouchControlsTests: XCTestCase {
         let r = draft.rect(.forward, in: CGSize(width: 650, height: 300))
         XCTAssertEqual(r.minX, 0); XCTAssertEqual(r.maxY, 300)
     }
+
+    func testResetIncludesCustomGeometryButPreservesBindingsUntilSaved() {
+        let preferences = TouchPreferences(defaults: defaults)
+        var original = TouchConfiguration()
+        let canvas = CGSize(width: 650, height: 300)
+        original.move(.jump, to: CGPoint(x: 200, y: 70), in: canvas)
+        original.resize(.jump, factor: 1.5, in: canvas)
+        original.opacities[String(TouchButton.jump.rawValue)] = 0.5
+        original.showControls = false
+        var custom = CustomTouchButton()
+        custom.name = "Inventory chord"
+        custom.bindings = [340, 69, 0, 0]
+        custom.centre = TouchCentre(x: 0.9, y: 0.1)
+        custom.size = TouchSize(width: 0.4, height: 0.3)
+        custom.opacity = 0.2
+        custom.inMenu = false
+        custom.toggle = true
+        var second = custom
+        second.id = UUID()
+        original.customButtons = [custom, second]
+        preferences.save(original)
+
+        var draft = preferences.configuration
+        draft.resetLayout()
+        XCTAssertEqual(preferences.configuration, original)
+        XCTAssertTrue(draft.centres.isEmpty)
+        XCTAssertTrue(draft.sizes.isEmpty)
+        XCTAssertTrue(draft.opacities.isEmpty)
+        XCTAssertFalse(draft.showControls)
+        XCTAssertNotEqual(draft.customButtons[0].centre, draft.customButtons[1].centre)
+        let appearance = CustomTouchButton()
+        for (reset, before) in zip(draft.customButtons, original.customButtons) {
+            XCTAssertEqual(reset.size, appearance.size)
+            XCTAssertEqual(reset.opacity, appearance.opacity)
+            var unchanged = reset
+            unchanged.centre = before.centre
+            unchanged.size = before.size
+            unchanged.opacity = before.opacity
+            XCTAssertEqual(unchanged, before)
+        }
+        preferences.save(draft)
+        XCTAssertEqual(TouchPreferences(defaults: defaults).configuration, draft)
+    }
     func testHidingPaintNeverRemovesCoordinatesAndShowingRestoresVisibility() {
         let model = TouchPreferences(defaults: defaults)
         var draft = model.configuration

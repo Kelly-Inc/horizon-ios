@@ -142,6 +142,11 @@ final class GameFilesDownload: NSObject, ObservableObject {
         }
     }
 
+    var canCancel: Bool {
+        if case .downloading = state { return true }
+        return false
+    }
+
     /// Only automatic setup failures belong in the Play panel. Custom-link and
     /// local-file errors remain in their own setup UI.
     var automaticFailure: String? {
@@ -294,7 +299,10 @@ final class GameFilesDownload: NSObject, ObservableObject {
     }
 
     func cancel() {
-        if busy { trace("cancel_requested received=\(receivedBytes) expected=\(expectedBytes)") }
+        // The importer owns the archive once installation begins. Releasing
+        // the busy state sooner would let a second operation overlap it.
+        guard canCancel else { return }
+        trace("cancel_requested received=\(receivedBytes) expected=\(expectedBytes)")
         attempt = UUID()
         resolvingAutomatic = false
         session?.invalidateAndCancel()
@@ -543,7 +551,7 @@ struct GameFilesCard: View {
 
             if download.busy {
                 SecondaryButton(title: "Cancel", action: download.cancel)
-                    .disabled(download.state == .installing)
+                    .disabled(!download.canCancel)
             } else {
                 if missing {
                     PrimaryButton(title: "Download game files", icon: "arrow.down") {

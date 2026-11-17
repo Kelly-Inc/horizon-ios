@@ -908,6 +908,40 @@ final class AutomaticGameFilesTests: XCTestCase {
         XCTAssertFalse(model.busy, "Cancelled file hydration must allow a retry")
     }
 
+    func testCancellingInstallationDoesNotAllowAnOverlappingImport() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".zip")
+        try Data("local-import-fixture".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let installing = expectation(description: "Importer is holding the staged archive")
+        var complete: CheckedContinuation<[String: Any], Never>?
+        var imports = 0
+        let model = GameFilesDownload(importArchive: { _ in
+            imports += 1
+            guard imports == 1 else { return ["error": "Unexpected concurrent import"] }
+            return await withCheckedContinuation {
+                complete = $0
+                installing.fulfill()
+            }
+        })
+        let first = Task { await model.importPreparedFile(file) }
+        await fulfillment(of: [installing], timeout: 5)
+        guard let complete else {
+            first.cancel()
+            return
+        }
+        XCTAssertEqual(model.state, .installing)
+        XCTAssertFalse(model.canCancel)
+        model.cancel()
+        XCTAssertEqual(model.state, .installing)
+        await model.importPreparedFile(file)
+        XCTAssertEqual(imports, 1)
+
+        complete.resume(returning: ["ok": true, "kind": "resources"])
+        await first.value
+        XCTAssertFalse(model.busy)
+        if case .done = model.state {} else { XCTFail("Expected completed install, got \(model.state)") }
+    }
+
     func testAutomaticDownloadUsesResourceImporterAndKeepsCustomCredentials() async throws {
         let restore = temporarilyRemoveResourceMarker()
         defer { restore() }

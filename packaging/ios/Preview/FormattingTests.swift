@@ -445,6 +445,37 @@ final class PackMutationTests: XCTestCase {
 
 @MainActor
 final class AutomaticGameFilesTests: XCTestCase {
+    func testChangingDownloadOriginClearsThePreviousToken() {
+        let model = GameFilesDownload(diagnostic: { _ in })
+        for link in [
+            "https://other.example.invalid/archive",
+            "https://files.example.invalid:444/archive",
+            "http://files.example.invalid/archive",
+            "",
+        ] {
+            model.link = "https://files.example.invalid/initial"
+            model.token = "fixture"
+            model.link = "https://FILES.example.invalid:443/new-file"
+            XCTAssertEqual(model.token, "fixture")
+            model.link = link
+            XCTAssertTrue(model.token.isEmpty, link)
+        }
+    }
+
+    func testSavedCredentialCanOnlyBeReadForItsStoredOrigin() throws {
+        let origin = try XCTUnwrap(GameFilesOrigin(URL(string: "https://files.example.invalid/archive")))
+        let data = try JSONEncoder().encode(GameFilesCredential(origin: origin, token: "fixture"))
+        XCTAssertEqual(GameFilesCredential.token(from: data, for: origin), "fixture")
+        for link in [
+            "http://files.example.invalid/archive",
+            "https://files.example.invalid:444/archive",
+            "https://other.example.invalid/archive",
+        ] {
+            XCTAssertNil(GameFilesCredential.token(from: data, for: GameFilesOrigin(URL(string: link))), link)
+        }
+        XCTAssertNil(GameFilesCredential.token(from: Data("legacy-token".utf8), for: origin))
+    }
+
     func testCustomDownloadRejectsBearerTokenOverHTTP() {
         let model = GameFilesDownload(diagnostic: { _ in })
         model.link = "http://127.0.0.1:1/files.zip"

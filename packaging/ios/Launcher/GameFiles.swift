@@ -3,6 +3,34 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+struct GameFilesOrigin: Codable, Equatable {
+    let scheme: String
+    let host: String
+    let port: Int
+
+    init?(_ url: URL?) {
+        guard let url, let scheme = url.scheme?.lowercased(), let host = url.host, !host.isEmpty,
+              scheme == "https" || scheme == "http" else { return nil }
+        self.scheme = scheme
+        self.host = host.lowercased()
+        port = url.port ?? (scheme == "https" ? 443 : 80)
+    }
+}
+
+struct GameFilesCredential: Codable {
+    let origin: GameFilesOrigin
+    let token: String
+
+    static func token(from data: Data, for origin: GameFilesOrigin?) -> String? {
+        // Old Keychain entries contain just a token. Since the saved link was
+        // written separately, those entries do not prove which server owns it.
+        guard let origin, origin.scheme == "https",
+              let credential = try? JSONDecoder().decode(Self.self, from: data),
+              credential.origin == origin else { return nil }
+        return credential.token
+    }
+}
+
 /// Prepared game files downloaded automatically on first launch, or imported from a custom link.
 /// Both routes use the game's checked importer. Raw Java assets are prepared on a computer.
 @MainActor
@@ -16,8 +44,18 @@ final class GameFilesDownload: NSObject, ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
-    @Published var link: String = UserDefaults.standard.string(forKey: "gameFilesLink") ?? ""
-    @Published var token: String = Keychain.read() ?? ""
+    @Published var link: String {
+        didSet {
+            if Self.origin(of: oldValue) != Self.origin(of: link) {
+                token = ""
+            }
+        }
+    }
+    @Published var token: String
+
+    private static func origin(of link: String) -> GameFilesOrigin? {
+        GameFilesOrigin(URL(string: link.trimmingCharacters(in: .whitespacesAndNewlines)))
+    }
 
     typealias ImportArchive = @MainActor (String) async -> [String: Any]
     private let importArchive: ImportArchive
@@ -73,6 +111,9 @@ final class GameFilesDownload: NSObject, ObservableObject {
     init(importArchive: @escaping ImportArchive = { await Bridge.send($0) },
          automaticSource: @escaping @MainActor () async -> [String: Any] = { await Bridge.send("game-files-source") },
          diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) }) {
+        let savedLink = UserDefaults.standard.string(forKey: "gameFilesLink") ?? ""
+        self.link = savedLink
+        self.token = Keychain.read(for: Self.origin(of: savedLink)) ?? ""
         self.importArchive = importArchive
         self.automaticSource = automaticSource
         self.diagnostic = diagnostic
@@ -108,21 +149,20 @@ final class GameFilesDownload: NSObject, ObservableObject {
         resourcesOnly = false
         trace("custom_start")
         let text = link.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
-              scheme == "https" || scheme == "http", url.host != nil
+        guard let url = URL(string: text), let origin = GameFilesOrigin(url)
         else {
             trace("custom_source_rejected invalid_url")
             state = .failed("That is not a web link. It starts with https:// (or http:// on your own network).")
             return
         }
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard token.isEmpty || scheme == "https" else {
+        guard token.isEmpty || origin.scheme == "https" else {
             trace("custom_source_rejected insecure_credential")
             state = .failed("Use an HTTPS link to download with an access token.")
             return
         }
         do {
-            try Keychain.write(token.isEmpty ? nil : token)
+            try Keychain.write(token.isEmpty ? nil : GameFilesCredential(origin: origin, token: token))
         } catch {
             trace("credential_storage_failed \(Self.errorFacts(error))")
             state = .failed(error.localizedDescription)
@@ -312,10 +352,8 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
     /// Keep the authorization header on the same HTTPS origin only.
     nonisolated static func redirectRequest(_ request: URLRequest, from source: URL?) -> URLRequest {
         var request = request
-        if let source, let host = source.host, let destination = request.url,
-           source.scheme?.lowercased() == "https", destination.scheme?.lowercased() == "https",
-           host.lowercased() == destination.host?.lowercased(),
-           (source.port ?? 443) == (destination.port ?? 443) {
+        if let origin = GameFilesOrigin(source), origin.scheme == "https",
+           origin == GameFilesOrigin(request.url) {
             return request
         }
         request.setValue(nil, forHTTPHeaderField: "Authorization")
@@ -427,24 +465,24 @@ private enum Keychain {
         kSecAttrAccount as String: "game-files-token",
     ]
 
-    static func read() -> String? {
+    static func read(for origin: GameFilesOrigin?) -> String? {
         var item: CFTypeRef?
         var search = query
         search[kSecReturnData as String] = true
         guard SecItemCopyMatching(search as CFDictionary, &item) == errSecSuccess, let data = item as? Data else {
             return nil
         }
-        return String(data: data, encoding: .utf8)
+        return GameFilesCredential.token(from: data, for: origin)
     }
 
-    static func write(_ token: String?) throws {
-        guard let token else {
+    static func write(_ credential: GameFilesCredential?) throws {
+        guard let credential else {
             let status = SecItemDelete(query as CFDictionary)
             guard status == errSecSuccess || status == errSecItemNotFound else { throw storageError() }
             return
         }
         // Never remove a working credential before its replacement is saved.
-        let values: [String: Any] = [kSecValueData as String: Data(token.utf8),
+        let values: [String: Any] = [kSecValueData as String: try JSONEncoder().encode(credential),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock]
         var status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
         if status == errSecItemNotFound {

@@ -6,11 +6,40 @@ import UIKit
 @testable import LauncherPreview
 
 final class GameAudioTests: XCTestCase {
+    #if compiler(>=6.4)
+    func testModernAudioResumptionIgnoresLegacyEventsAndMissingContext() async throws {
+        guard #available(iOS 27.0, *) else { throw XCTSkip("Requires iOS 27 audio notifications") }
+        let queue = DispatchQueue(label: "horizon.audio.modern.test")
+        let notifications = NotificationCenter()
+        let transitions = OSAllocatedUnfairLock(initialState: [Bool]())
+        let audio = GameAudio(queue: queue, notifications: notifications) { active in
+            transitions.withLock { $0.append(active) }
+        }
+        XCTAssertEqual(GameAudio.ResumptionEvent.system.name, AVAudioSession.resumptionRecommendationNotification)
+        func drain() async {
+            await withCheckedContinuation { continuation in
+                queue.async { continuation.resume() }
+            }
+        }
+
+        audio.start()
+        await drain()
+        notifications.post(name: AVAudioSession.interruptionNotification, object: nil,
+                           userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue])
+        notifications.post(name: AVAudioSession.resumptionRecommendationNotification, object: nil)
+        await drain()
+        XCTAssertEqual(transitions.withLock { $0 }, [true])
+        audio.stop()
+        await drain()
+        XCTAssertEqual(transitions.withLock { $0 }, [true, false])
+    }
+    #endif
+
     func testAudioTransitionsAreSerializedAndQuitIgnoresAnOlderInterruption() async {
         let queue = DispatchQueue(label: "horizon.audio.test")
         let notifications = NotificationCenter()
         let transitions = OSAllocatedUnfairLock(initialState: [Bool]())
-        let audio = GameAudio(queue: queue, notifications: notifications) { active in
+        let audio = GameAudio(queue: queue, notifications: notifications, resumption: .interruptionEnded) { active in
             XCTAssertFalse(Thread.isMainThread)
             transitions.withLock { $0.append(active) }
         }

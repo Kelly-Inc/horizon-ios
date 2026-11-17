@@ -34,6 +34,7 @@ use crate::Result;
 const MAX_PACKED: u64 = 2 << 30;
 const MAX_UNPACKED: u64 = 4 << 30;
 const MAX_ENTRIES: usize = 50_000;
+const WORLD_IMPORT_STAGING: &str = ".horizon-world-importing";
 
 #[derive(Debug, Default)]
 struct HomeGate {
@@ -505,10 +506,24 @@ impl Pack {
                 }
                 // A world is never written over: what would be overwritten is the player's own.
                 Kind::World => {
-                    let dest = unique(&home.join(folder).join(&self.item));
-                    let (files, bytes) = self.unpack(&dest)?;
+                    let saves = home.join(folder);
+                    fs::create_dir_all(&saves)?;
+                    clear_world_staging(&saves)?;
+                    let staging = saves.join(WORLD_IMPORT_STAGING);
+                    fs::create_dir(&staging)?;
+                    // The world list only checks the immediate children of saves. Put
+                    // the partial tree one level deeper, on the destination volume.
+                    let scratch = staging.join("world");
+                    let published = (|| -> Result<_> {
+                        let (files, bytes) = self.unpack(&scratch)?;
+                        let dest = unique(&saves.join(&self.item));
+                        fs::rename(&scratch, &dest)?;
+                        Ok((dest, files, bytes))
+                    })();
+                    let _ = clear_world_staging(&saves);
+                    let installed = published?;
                     fs::remove_file(&archive)?;
-                    (dest, files, bytes)
+                    installed
                 }
                 Kind::Resources => {
                     let scratch = home.join("resources.unpacking");
@@ -542,6 +557,24 @@ impl Pack {
     }
 }
 
+/// Remove the one private extraction tree left by a failed or interrupted world import.
+/// Don't follow a link or remove any other files beside it.
+fn clear_world_staging(saves: &Path) -> io::Result<()> {
+    let staging = saves.join(WORLD_IMPORT_STAGING);
+    match fs::symlink_metadata(&staging) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(io::Error::other("world import staging is not a directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    match fs::remove_dir_all(staging.join("world")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::remove_dir(staging)
+}
+
 /// Move a finished tree into place, with the old one put aside rather than deleted: the battery can
 /// die between the two renames, and `resources.previous` is something [`recover`] can put back,
 /// while a half-deleted folder is not. The copy is what costs the disk, and it goes as soon as the
@@ -568,6 +601,10 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     with_home_access(home, || {
+        // A world extraction has no publish-ready state before its final rename.
+        if let Err(error) = clear_world_staging(&home.join(Kind::World.folder())) {
+            log::warn!("Horizon: could not clear unfinished world import: {error}");
+        }
         let scratch = home.join("resources.unpacking");
         let staged = home.join("resources.staged");
         let dest = home.join(Kind::Resources.folder());
@@ -1671,6 +1708,7 @@ mod tests {
                 !home.join(partial).exists(),
                 "failed extraction left {partial} visible"
             );
+            assert!(!home.join("saves").join(WORLD_IMPORT_STAGING).exists());
             assert!(
                 archive.exists(),
                 "failed import consumed the original archive"
@@ -1685,6 +1723,48 @@ mod tests {
             );
             fs::remove_dir_all(home).unwrap();
         }
+    }
+
+    #[test]
+    fn interrupted_world_stays_off_the_list_and_can_be_reimported() {
+        let home = temp_home("interrupted-world");
+        let saves = home.join("saves");
+        let staging = saves.join(WORLD_IMPORT_STAGING);
+        let scratch = staging.join("world");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("level.dat"), "partial world").unwrap();
+        let existing = saves.join("My World");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("level.dat"), "original world").unwrap();
+        let archive = home.join("world.zip");
+        write_archive(
+            &archive,
+            &[
+                ("My World/level.dat", "imported"),
+                ("My World/region/r.0.0.mca", "region"),
+            ],
+        );
+
+        let listed = crate::title::list_worlds(&saves);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].folder, "My World");
+        assert_eq!(recover(&home).unwrap(), None);
+        assert!(!staging.exists());
+        assert!(archive.is_file());
+
+        let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
+        assert_eq!(installed.path, saves.join("My World (2)"));
+        assert_eq!(
+            fs::read(existing.join("level.dat")).unwrap(),
+            b"original world"
+        );
+        assert_eq!(
+            fs::read(installed.path.join("region/r.0.0.mca")).unwrap(),
+            b"region"
+        );
+        assert!(!staging.exists());
+        assert!(!archive.exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

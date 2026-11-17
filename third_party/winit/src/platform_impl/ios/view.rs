@@ -15,7 +15,7 @@ use objc2_ui_kit::{
 };
 
 use super::app_state::{self, EventWrapper};
-use super::gesture_delta::GestureDelta;
+use super::gesture_delta::{GestureDelta, PanDelta};
 use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
 use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
@@ -34,7 +34,7 @@ pub struct WinitViewState {
 
     rotation_delta: GestureDelta<1>,
     pinch_delta: GestureDelta<1>,
-    pan_delta: GestureDelta<2>,
+    pan_delta: PanDelta,
     ime_allowed: Cell<bool>,
     hidden_input: Retained<UIView>,
     held_keys: RefCell<HashMap<usize, KeyEvent>>,
@@ -247,7 +247,11 @@ declare_class!(
             let translation = recognizer.translationInView(Some(self));
 
             let Some(phase) = gesture_phase(recognizer.state()) else { return };
-            let Some([dx, dy]) = self.ivars().pan_delta.update(phase, [translation.x, translation.y]) else { return };
+            let Some([dx, dy]) = self.ivars().pan_delta.update(
+                phase,
+                [translation.x, translation.y],
+                self.contentScaleFactor(),
+            ) else { return };
 
             let gesture_event = EventWrapper::StaticEvent(Event::WindowEvent {
                 window_id: RootWindowId(window.id()),
@@ -369,7 +373,7 @@ impl WinitView {
 
             rotation_delta: GestureDelta::default(),
             pinch_delta: GestureDelta::default(),
-            pan_delta: GestureDelta::default(),
+            pan_delta: PanDelta::default(),
             ime_allowed: Cell::new(false),
             hidden_input: unsafe { UIView::new(mtm) },
             held_keys: RefCell::new(HashMap::new()),

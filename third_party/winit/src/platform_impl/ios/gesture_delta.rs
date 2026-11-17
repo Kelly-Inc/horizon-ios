@@ -37,9 +37,65 @@ impl<const N: usize> GestureDelta<N> {
     }
 }
 
+/// Pan samples come from UIKit in view points. Winit delivers physical pixels.
+#[derive(Default)]
+pub(super) struct PanDelta {
+    motion: GestureDelta<2>,
+    scale: Cell<f64>,
+}
+
+impl PanDelta {
+    pub(super) fn reset(&self) {
+        self.motion.reset();
+    }
+
+    pub(super) fn update(
+        &self,
+        phase: TouchPhase,
+        translation: [f64; 2],
+        display_scale: f64,
+    ) -> Option<[f64; 2]> {
+        if phase == TouchPhase::Started {
+            // Keep the conversion stable until the gesture ends. A scale change
+            // must not turn an unchanged translation into motion or change the
+            // number of pixels undone on cancellation.
+            self.scale.set(display_scale);
+        }
+        self.motion
+            .update(phase, translation)
+            .map(|delta| delta.map(|axis| axis * self.scale.get()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pan_reports_pixels_and_keeps_scale_through_cancellation() {
+        let pan = PanDelta::default();
+        assert_eq!(
+            pan.update(TouchPhase::Started, [4.0, 8.0], 2.0),
+            Some([0.0, 0.0])
+        );
+        assert_eq!(
+            pan.update(TouchPhase::Moved, [5.5, 7.0], 2.0),
+            Some([3.0, -2.0])
+        );
+        assert_eq!(
+            pan.update(TouchPhase::Moved, [5.5, 7.0], 3.0),
+            Some([0.0, 0.0])
+        );
+        assert_eq!(
+            pan.update(TouchPhase::Cancelled, [7.0, 9.0], 3.0),
+            Some([-3.0, 2.0])
+        );
+        pan.update(TouchPhase::Started, [0.0, 0.0], 3.0);
+        assert_eq!(
+            pan.update(TouchPhase::Ended, [1.0, 0.5], 3.0),
+            Some([3.0, 1.5])
+        );
+    }
 
     #[test]
     fn cancelled_pinch_reverses_only_the_delivered_scale() {

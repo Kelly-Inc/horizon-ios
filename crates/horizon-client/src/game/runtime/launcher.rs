@@ -530,14 +530,14 @@ impl Loading {
                     let answer = self.launcher_options(&request.line);
                     request.answer(&answer.to_string());
                 }
-                "shader-pack" => {
+                "shader-pack" | "shader-pack-set" => {
                     let words: Vec<&str> = request.line.split_whitespace().collect();
                     let answer = match super::shader_packs::command(
                         &mut self.settings,
                         &words,
                         &request.line,
                     ) {
-                        Ok(value) => value.unwrap_or_default(),
+                        Ok(value) => value.map(|(response, _)| response).unwrap_or_default(),
                         Err(e) => json!({ "error": e.to_string() }),
                     };
                     request.answer(&answer.to_string());

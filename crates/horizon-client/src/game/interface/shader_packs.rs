@@ -240,34 +240,28 @@ pub(super) fn record_reload_error(name: &str, dimension: i32, errors: &[String])
     }
     record_report(name, dimension, &previous, &notes);
 }
+#[path = "shader_packs/selection.rs"]
+mod selection;
+
 pub(super) fn command(
     settings: &mut horizon_client::settings::Settings,
     words: &[&str],
     line: &str,
-) -> horizon_client::Result<Option<Value>> {
-    if words.first() != Some(&"shader-pack") {
+) -> horizon_client::Result<Option<(Value, bool)>> {
+    let Some(verb @ ("shader-pack" | "shader-pack-set")) = words.first().copied() else {
         return Ok(None);
-    }
+    };
     let root = std::env::current_dir()?;
     let packs = horizon_client::shader_pack_list::scan(&root.join("shaderpacks"));
-    let arg = line
-        .trim_start()
-        .strip_prefix("shader-pack")
-        .unwrap_or("")
-        .trim();
-    match arg {
-        "" | "list" => {}
-        "off" => {
-            settings.horizon.shader_pack.clear();
-            settings.horizon.save(&root);
+    let arg = line.trim_start().strip_prefix(verb).unwrap_or("").trim();
+    let replacement = selection::change(verb, arg, &settings.horizon.shader_pack)?;
+    let changed = replacement.is_some();
+    if let Some(name) = replacement {
+        if !name.is_empty() && !packs.iter().any(|pack| pack.file == name) {
+            return Err(format!("no shader pack {name} in shaderpacks/").into());
         }
-        name => {
-            if !packs.iter().any(|pack| pack.file == name) {
-                return Err(format!("no shader pack {name} in shaderpacks/").into());
-            }
-            settings.horizon.shader_pack = name.to_owned();
-            settings.horizon.save(&root);
-        }
+        settings.horizon.shader_pack = name;
+        settings.horizon.save(&root);
     }
     settings.shader_packs = packs;
     let selected =
@@ -283,9 +277,10 @@ pub(super) fn command(
         .iter()
         .map(|pack| json!({"name": pack.file, "title":pack.title, "problem":null}))
         .collect();
-    Ok(Some(
+    Ok(Some((
         json!({"packs":list,"selected":selected,"runtime":report}),
-    ))
+        changed,
+    )))
 }
 
 /// Prefer the connection's current block tags, including a local integrated server's.
@@ -570,13 +565,10 @@ impl Game<'_> {
         words: &[&str],
         line: &str,
     ) -> horizon_client::Result<Option<Value>> {
-        let response = command(&mut self.settings, words, line)?;
-        let argument = line
-            .trim_start()
-            .strip_prefix("shader-pack")
-            .unwrap_or("")
-            .trim();
-        if response.is_some() && !matches!(argument, "" | "list") {
+        let Some((response, changed)) = command(&mut self.settings, words, line)? else {
+            return Ok(None);
+        };
+        if changed {
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
             }
@@ -584,7 +576,7 @@ impl Game<'_> {
             self.pack_ids = None;
             REPORT.with_borrow_mut(Option::take);
         }
-        Ok(response)
+        Ok(Some(response))
     }
 
     /// Settle shader jobs without rendering, including while the launcher covers the game.

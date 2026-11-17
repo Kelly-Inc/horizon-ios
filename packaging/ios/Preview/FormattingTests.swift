@@ -472,8 +472,14 @@ final class PackMutationTests: XCTestCase {
         let submitted = expectation(description: "new shader activation submitted")
         let choices = PackChoices(request: { command in
             if command == "shader-pack list" { return ["selected": current] }
-            writes.append(command)
-            if command == "shader-pack b.zip" {
+            let prefix = "shader-pack-set "
+            guard command.hasPrefix(prefix),
+                  let selection = (try? JSONSerialization.jsonObject(with: Data(command.dropFirst(prefix.count).utf8))) as? [String: Any],
+                  let name = selection["name"] as? String, let enabled = selection["enabled"] as? Bool else {
+                return ["error": "expected structured shader selection"]
+            }
+            writes.append("\(name):\(enabled)")
+            if name == "b.zip" && enabled {
                 await withCheckedContinuation {
                     ack = $0
                     submitted.fulfill()
@@ -492,7 +498,7 @@ final class PackMutationTests: XCTestCase {
         let staleError = await staleOff.value
         XCTAssertNil(activationError)
         XCTAssertNil(staleError)
-        XCTAssertEqual(writes, ["shader-pack b.zip"])
+        XCTAssertEqual(writes, ["b.zip:true"])
         XCTAssertEqual(choices.shaderPack, "b.zip")
     }
 

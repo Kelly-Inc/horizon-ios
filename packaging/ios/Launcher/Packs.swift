@@ -345,7 +345,9 @@ final class PackChoices: ObservableObject {
                   let list = String(data: data, encoding: .utf8) else { return "That pack name can't be saved." }
             answer = await request("options-set resourcePacks \(list)")
         case .shader:
-            answer = await request(on ? "shader-pack \(name)" : "shader-pack off")
+            guard let data = try? JSONSerialization.data(withJSONObject: ["name": name, "enabled": on]),
+                  let selection = String(data: data, encoding: .utf8) else { return "That shader name can't be saved." }
+            answer = await request("shader-pack-set \(selection)")
         }
         if let error = answer.error { return error }
         // Confirm the result before another mutation, or a deletion, can use it.

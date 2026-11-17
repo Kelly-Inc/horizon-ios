@@ -265,11 +265,14 @@ impl Game<'_> {
         self.border_renderer.invalidate();
         self.renderer = Some(renderer);
         self.forget_atlas_slots();
+        let shader_mesh_changed = self.clear_shader_mesh_state();
         if !world_kept {
             self.clear_lod();
             self.pending_uploads.clear();
             let context = self.worker_context();
             self.streaming.reload_resources(&mut self.world, context);
+        } else if shader_mesh_changed {
+            self.all_sections_changed();
         }
         self.native_shaders = native_shaders::NativeShaders::picking(&std::mem::take(
             &mut self.native_shaders.picked,

@@ -16,6 +16,7 @@ use super::{Dim, Game};
 use horizon_client_render::render_geometry::EntitySpan;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 /// The values the player chose for pack `name`'s options (`shaderpacks/<name>.txt`).
 fn chosen_shader_options(name: &str) -> BTreeMap<String, String> {
@@ -589,7 +590,9 @@ impl Game<'_> {
                 renderer.drop_shader_packs();
             }
             self.native_shaders = super::native_shaders::NativeShaders::picking("");
-            self.pack_ids = None;
+            if self.clear_shader_mesh_state() {
+                self.all_sections_changed();
+            }
             REPORT.with_borrow_mut(Option::take);
         }
         Ok(Some(response))
@@ -690,6 +693,36 @@ impl Game<'_> {
         }
     }
 
+    /// Keep the mesher's three classic shader flags in sync as one change.
+    fn update_classic_mesh_flags(&mut self) -> bool {
+        let (shader_pack, lighting, separate_ao) =
+            self.pack_ids.as_ref().map_or((false, false, false), |ids| {
+                (true, !ids.old_lighting, ids.separate_ao)
+            });
+        let changed = (shader_pack, lighting, separate_ao)
+            != (
+                self.streaming.shader_pack,
+                self.streaming.shader_pack_lighting,
+                self.streaming.separate_ao,
+            );
+        self.streaming.shader_pack = shader_pack;
+        self.streaming.shader_pack_lighting = lighting;
+        self.streaming.separate_ao = separate_ao;
+        changed
+    }
+
+    /// Drop mesh settings from a pack that no longer draws. The caller invalidates
+    /// the existing meshes, or folds that into a resource reload already in progress.
+    pub(super) fn clear_shader_mesh_state(&mut self) -> bool {
+        self.pack_ids = None;
+        let classic_changed = self.update_classic_mesh_flags();
+        let translucent_changed = !self.streaming.translucent_layers.is_empty();
+        if translucent_changed {
+            self.streaming.translucent_layers = Arc::from([]);
+        }
+        classic_changed || translucent_changed
+    }
+
     /// Loads the pack for the current dimension when it changed, and returns this frame's
     /// inputs to the pack's uniforms.
     pub(super) fn shader_pack_inputs(
@@ -698,26 +731,8 @@ impl Game<'_> {
         partial: f32,
         sky: &horizon_client::environment::Sky,
     ) -> PackInputs {
-        // A `shaders/` pack lights the faces itself unless `oldLighting=true`: sections mesh
-        // without the game's face shading (the pack loaded or dropped below shows next frame).
-        let pack_lighting = self.pack_ids.as_ref().is_some_and(|ids| !ids.old_lighting);
-        if self.streaming.shader_pack_lighting != pack_lighting {
-            self.streaming.shader_pack_lighting = pack_lighting;
-            self.all_sections_changed();
-        }
         self.poll_shader_workers();
         let completed = poll_parser();
-        // Any `shaders/` pack (its `oldLighting` too) draws fluid tops split as Iris does.
-        let shader_pack = self.pack_ids.is_some();
-        if self.streaming.shader_pack != shader_pack {
-            self.streaming.shader_pack = shader_pack;
-            self.all_sections_changed();
-        }
-        let separate_ao = self.pack_ids.as_ref().is_some_and(|ids| ids.separate_ao);
-        if self.streaming.separate_ao != separate_ao {
-            self.streaming.separate_ao = separate_ao;
-            self.all_sections_changed();
-        }
         let selected = picked_pack(&self.settings).to_owned();
         let path = self.native_shaders.resolve_path(
             &Self::shader_packs_dir(),
@@ -733,11 +748,14 @@ impl Game<'_> {
         if self.native_shaders.picked != picked {
             REPORT.with_borrow_mut(Option::take);
             self.native_shaders.select(&picked);
-            self.set_translucent_layers(Vec::new());
-            self.pack_ids = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
             }
+            if self.clear_shader_mesh_state() {
+                self.all_sections_changed();
+            }
+        } else if self.update_classic_mesh_flags() {
+            self.all_sections_changed();
         }
         if picked.is_empty() {
             return PackInputs::default();

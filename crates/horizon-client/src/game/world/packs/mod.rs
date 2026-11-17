@@ -746,6 +746,9 @@ impl Game<'_> {
         // A pack that may replace leaf models falls back to `Off` before the
         // reload marks every section dirty.
         self.streaming.leaf_culling = self.effective_leaf_culling();
+        // Shader sprite IDs belong to the previous atlas. Start mesh jobs with
+        // vanilla settings until the shader binds to the new resources.
+        self.clear_shader_mesh_state();
         let context = self.worker_context();
         self.streaming.reload_resources(&mut self.world, context);
         self.pending_uploads.clear();

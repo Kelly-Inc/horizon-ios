@@ -7,6 +7,7 @@ import re
 import shutil
 import stat
 import struct
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -120,7 +121,7 @@ def bundle_executable(bundle, info, binaries, file_type, label):
     return binary[1]
 
 
-def audit(ipa, expected_commit=None):
+def audit(ipa, expected_commit=None, expected_version=None):
     with zipfile.ZipFile(ipa) as archive:
         paths = set()
         binaries = {}
@@ -197,21 +198,29 @@ def audit(ipa, expected_commit=None):
                 raise ValueError("Invalid source commit")
             if info.get("HorizonBuildCommit") != expected_commit:
                 raise ValueError("IPA source commit does not match this workflow")
+        if expected_version is not None and (version, build) != expected_version:
+            raise ValueError("IPA version does not match this workflow run")
         return version, build
 
 
-def prepare(ipa, output, expected_commit):
-    version, build = audit(ipa, expected_commit)
+def prepare(ipa, output, expected_commit, expected_version=None):
     output.mkdir(parents=True, exist_ok=True)
-    target = output / f"Horizon-iOS-{version}-build{build}-unsigned.ipa"
-    shutil.copyfile(ipa, target)
-    digest_state = hashlib.sha256()
-    with target.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
-            digest_state.update(chunk)
-    digest = digest_state.hexdigest()
-    checksum = target.with_suffix(target.suffix + ".sha256")
-    checksum.write_text(f"{digest}  {target.name}\n", encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix=".ios-release-", dir=output) as staging:
+        staged_ipa = Path(staging) / "artifact.ipa"
+        staged_checksum = Path(staging) / "artifact.sha256"
+        shutil.copyfile(ipa, staged_ipa)
+        # Verify the bytes that will actually be published, even if the input changed during copying.
+        version, build = audit(staged_ipa, expected_commit, expected_version)
+        with staged_ipa.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        target = output / f"Horizon-iOS-{version}-build{build}-unsigned.ipa"
+        checksum = target.with_suffix(target.suffix + ".sha256")
+        staged_checksum.write_text(f"{digest}  {target.name}\n", encoding="utf-8")
+        # Both files are ready. If publication stops between the renames, the
+        # IPA may be present without a checksum, but never with the old one.
+        checksum.unlink(missing_ok=True)
+        staged_ipa.replace(target)
+        staged_checksum.replace(checksum)
     return {"ipa": str(target), "checksum": str(checksum), "version": version, "build": build}
 
 
@@ -232,12 +241,10 @@ def main():
         return
     if not args.ipa:
         parser.error("an IPA or --stamp-app is required")
-    if args.run_number or args.run_attempt:
-        expected = release_version(args.run_number, args.run_attempt)
-        if audit(args.ipa, args.expect_commit) != expected:
-            raise ValueError("IPA version does not match this workflow run")
-    result = (prepare(args.ipa, args.output_dir, args.expect_commit) if args.output_dir
-              else dict(zip(("version", "build"), audit(args.ipa, args.expect_commit))))
+    expected = (release_version(args.run_number, args.run_attempt)
+                if args.run_number or args.run_attempt else None)
+    result = (prepare(args.ipa, args.output_dir, args.expect_commit, expected) if args.output_dir
+              else dict(zip(("version", "build"), audit(args.ipa, args.expect_commit, expected))))
     for key, value in result.items():
         print(f"{key}={value}")
 

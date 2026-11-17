@@ -7,6 +7,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 from tests.test_ci_concurrency import yaml
@@ -218,6 +219,58 @@ class IOSReleaseTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), ipa.read_bytes())
             self.assertEqual(Path(result["checksum"]).read_text(),
                              hashlib.sha256(ipa.read_bytes()).hexdigest() + "  " + target.name + "\n")
+
+    def test_prepare_preserves_the_existing_pair_on_copy_or_audit_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ipa = root / "input.ipa"
+            self.archive(ipa)
+            output = root / "out"
+            result = release.prepare(ipa, output, SHA)
+            target, checksum = Path(result["ipa"]), Path(result["checksum"])
+            before = target.read_bytes(), checksum.read_bytes()
+
+            def interrupted_copy(_, destination):
+                Path(destination).write_bytes(b"partial")
+                raise OSError("simulated interrupted copy")
+
+            with mock.patch.object(release.shutil, "copyfile", side_effect=interrupted_copy):
+                with self.assertRaisesRegex(OSError, "interrupted copy"):
+                    release.prepare(ipa, output, SHA)
+            self.assertEqual((target.read_bytes(), checksum.read_bytes()), before)
+
+            def copy_replaced_input(_, destination):
+                self.archive(destination, info={"HorizonBuildCommit": "b" * 40})
+
+            with mock.patch.object(release.shutil, "copyfile", side_effect=copy_replaced_input):
+                with self.assertRaisesRegex(ValueError, "source commit"):
+                    release.prepare(ipa, output, SHA)
+            self.assertEqual((target.read_bytes(), checksum.read_bytes()), before)
+            self.assertEqual(set(output.iterdir()), {target, checksum})
+
+    def test_interrupted_pair_publication_never_leaves_an_old_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ipa = root / "input.ipa"
+            self.archive(ipa)
+            output = root / "out"
+            result = release.prepare(ipa, output, SHA)
+            target, checksum = Path(result["ipa"]), Path(result["checksum"])
+            self.archive(ipa, {"Payload/Horizon.app/build.txt": b"replacement"})
+            replace = Path.replace
+
+            def fail_checksum(source, destination):
+                if destination == checksum:
+                    raise OSError("simulated checksum publication failure")
+                return replace(source, destination)
+
+            with mock.patch.object(Path, "replace", fail_checksum):
+                with self.assertRaisesRegex(OSError, "checksum publication failure"):
+                    release.prepare(ipa, output, SHA)
+            self.assertEqual(target.read_bytes(), ipa.read_bytes())
+            self.assertFalse(checksum.exists())
+            self.assertEqual(release.prepare(ipa, output, SHA), result)
+            self.assertIn(hashlib.sha256(target.read_bytes()).hexdigest(), checksum.read_text())
 
     def test_rejects_private_assets_profiles_and_paths(self):
         for name in ["horizon-resources.json", "horizon-data.bin", "embedded.mobileprovision",

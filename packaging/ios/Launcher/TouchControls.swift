@@ -602,11 +602,8 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private var overflowed = false
     private var discardingInput = false
     var inputContext: UInt64 = 0
-    private var primaryTouch: UITouch?
-    private var hotbarTouch: UITouch?
     private var hotbarHold: UILongPressGestureRecognizer?
     private var heldGestureSlot: Int?
-    private var hotbarSlot = -1
     private var suppressTap = false
 
     init(configuration: @escaping () -> TouchConfiguration = { TouchPreferences.shared.configuration },
@@ -629,7 +626,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         if let surface { for recognizer in recognizers { surface.removeGestureRecognizer(recognizer) } }
         surface = view
         let tap = TouchSurfaceTap(target: self, action: #selector(tapped(_:)))
-        let double = UITapGestureRecognizer(target: self, action: #selector(doubleTapped(_:)))
+        let double = TouchSurfaceTap(target: self, action: #selector(doubleTapped(_:)))
         double.numberOfTapsRequired = 2
         let hold = UILongPressGestureRecognizer(target: self, action: #selector(held(_:)))
         hold.minimumPressDuration = configuration().holdDuration
@@ -671,9 +668,6 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         customHolds.reset()
         customPressed.removeAll()
         pending.removeAll()
-        primaryTouch = nil
-        hotbarTouch = nil
-        hotbarSlot = -1
         heldGestureSlot = nil
         suppressTap = false
     }
@@ -820,21 +814,21 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         let closeRect = CGRect(x: gui.width - auxiliarySize - 4, y: 4, width: auxiliarySize, height: auxiliarySize)
         if closeShown && closeRect.contains(p) { return false }
         if keyboardShown && closeRect.offsetBy(dx: -auxiliarySize - 4, dy: 0).contains(p) { return false }
-        hotbarSlot = slot(location)
+        let candidateSlot = slot(location)
         suppressTap = false
-        if gestureRecognizer is TouchHotbarTracker { return playing && hotbarSlot >= 0 }
-        if gestureRecognizer is TouchSurfaceTap || gestureRecognizer is UILongPressGestureRecognizer {
-            return noWorld || configuration.mouseGestures || hotbarSlot >= 0 || (gestureRecognizer as? UILongPressGestureRecognizer)?.numberOfTouchesRequired == 2
+        if gestureRecognizer is TouchHotbarTracker { return candidateSlot >= 0 }
+        if let tap = gestureRecognizer as? TouchSurfaceTap, tap.numberOfTapsRequired == 2 {
+            return candidateSlot >= 0
         }
-        if let tap = gestureRecognizer as? UITapGestureRecognizer, tap.numberOfTapsRequired == 2 {
-            return configuration.hotbarGestures
+        if gestureRecognizer is TouchSurfaceTap || gestureRecognizer is UILongPressGestureRecognizer {
+            return noWorld || configuration.mouseGestures || candidateSlot >= 0 || (gestureRecognizer as? UILongPressGestureRecognizer)?.numberOfTouchesRequired == 2
         }
         return noWorld || configuration.mouseGestures
     }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
     @objc private func hotbarMoved(_ sender: TouchHotbarTracker) {
-        guard TouchPreferences.shared.configuration.slideableHotbar, playing else { return }
+        guard configuration().slideableHotbar, playing else { return }
         let next = slot(sender.location(in: surface))
         if next >= 0 && (sender.state == .began || next != sender.lastSlot) {
             emit(6, phase: sender.state.rawValue, slot: next, modifiers: sender.modifierFlags)
@@ -843,13 +837,14 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     }
     @objc private func tapped(_ sender: TouchSurfaceTap) {
         guard sender.state == .recognized, sender.clickEligible, !suppressTap else { return }
-        emit(1, phase: sender.state.rawValue, location: point(sender.location(in: surface)), slot: hotbarSlot,
+        let selectedSlot = sender.hotbarSlot(using: slot) ?? -1
+        emit(1, phase: sender.state.rawValue, location: point(sender.location(in: surface)), slot: selectedSlot,
              modifiers: sender.modifierFlags, touch: sender.touchIdentity)
     }
-    @objc private func doubleTapped(_ sender: UITapGestureRecognizer) {
-        guard sender.state == .recognized, playing, let surface else { return }
-        let current = slot(sender.location(in: surface))
-        if current >= 0 && current == hotbarSlot { emit(3, phase: sender.state.rawValue, slot: current, modifiers: sender.modifierFlags) }
+    @objc private func doubleTapped(_ sender: TouchSurfaceTap) {
+        guard sender.state == .recognized, sender.clickEligible,
+              let first = sender.hotbarSlot(using: slot) else { return }
+        emit(3, phase: sender.state.rawValue, slot: first, modifiers: sender.modifierFlags)
     }
     @objc private func held(_ sender: UILongPressGestureRecognizer) {
         guard let surface else { return }
@@ -882,20 +877,51 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
 /// in addition to UIKit's own tap recognition. Moving out and back is a drag.
 final class TouchSurfaceTap: UITapGestureRecognizer {
     private var clickRange = CGRect.zero
+    private weak var finger: UITouch?
+    private(set) var tapOrigins: [CGPoint] = []
     private(set) var clickEligible = true
     private(set) var touchIdentity: UInt64 = 0
+    func hotbarSlot(using resolve: (CGPoint) -> Int) -> Int? {
+        guard tapOrigins.count == numberOfTapsRequired, let start = tapOrigins.first else { return nil }
+        let first = resolve(start)
+        guard first >= 0, tapOrigins.dropFirst().allSatisfy({ resolve($0) == first }) else { return nil }
+        return first
+    }
+    func trackTapStart(_ touch: UITouch) {
+        guard finger == nil, tapOrigins.count < numberOfTapsRequired else { return }
+        finger = touch
+        touchIdentity = UInt64(UInt(bitPattern: Unmanaged.passUnretained(touch).toOpaque()))
+        let p = touch.location(in: view)
+        tapOrigins.append(p)
+        clickRange = CGRect(x: p.x - 2, y: p.y - 2, width: 5, height: 5)
+    }
+    func trackTapEnd(_ touches: Set<UITouch>) {
+        if let finger, touches.contains(finger) { self.finger = nil }
+    }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        if let touch = touches.first {
-            touchIdentity = UInt64(UInt(bitPattern: Unmanaged.passUnretained(touch).toOpaque()))
-            let p = touch.location(in: view)
-            clickRange = CGRect(x: p.x - 2, y: p.y - 2, width: 5, height: 5)
-            clickEligible = true
-        }
+        if let touch = touches.first { trackTapStart(touch) }
         super.touchesBegan(touches, with: event)
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
-        if let touch = touches.first, !clickRange.contains(touch.location(in: view)) { clickEligible = false }
+        if let finger, touches.contains(finger), !clickRange.contains(finger.location(in: view)) {
+            clickEligible = false
+        }
         super.touchesMoved(touches, with: event)
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        trackTapEnd(touches)
+        super.touchesEnded(touches, with: event)
+    }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        trackTapEnd(touches)
+        super.touchesCancelled(touches, with: event)
+    }
+    override func reset() {
+        finger = nil
+        tapOrigins.removeAll()
+        touchIdentity = 0
+        clickEligible = true
+        super.reset()
     }
 }
 
@@ -959,7 +985,9 @@ final class TouchHotbarTracker: UIGestureRecognizer {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         if let finger, touches.contains(finger) { state = .ended }
     }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { state = .cancelled }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let finger, touches.contains(finger) { state = .cancelled }
+    }
     override func reset() { finger = nil; lastSlot = -1; super.reset() }
     override func location(in view: UIView?) -> CGPoint { finger?.location(in: view) ?? .zero }
 }

@@ -80,6 +80,37 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertTrue(poll(2).isEmpty)
     }
 
+    @MainActor func testHotbarTapsKeepTheirOwnOriginsAndDoubleTapStaysInOneSlot() {
+        let bridge = TouchGestureBridge(configuration: { TouchConfiguration() })
+        let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: view)
+        func poll() -> [[Double]] {
+            bridge.poll(screen: 1, flags: 1, width: 600, height: 300,
+                        scale: Double(UIScreen.main.scale), capacity: 64)
+        }
+        _ = poll()
+        let original = PositionedTouch(CGPoint(x: 300, y: 299))
+        let otherFinger = PositionedTouch(CGPoint(x: 320, y: 299))
+        let sameSlot = PositionedTouch(CGPoint(x: 301, y: 299))
+        func slot(_ point: CGPoint) -> Int {
+            TouchHotbar.slot(point: point, pixels: view.bounds.size, scale: 1)
+        }
+        let tap = TouchSurfaceTap()
+        tap.trackTapStart(original)
+        _ = bridge.gestureRecognizer(UITapGestureRecognizer(), shouldReceive: otherFinger)
+        tap.trackTapStart(otherFinger)
+        XCTAssertEqual(tap.hotbarSlot(using: slot), 4)
+
+        for second in [otherFinger, sameSlot] {
+            let double = TouchSurfaceTap()
+            double.numberOfTapsRequired = 2
+            double.trackTapStart(original)
+            double.trackTapEnd([original])
+            double.trackTapStart(second)
+            XCTAssertEqual(double.hotbarSlot(using: slot), second === sameSlot ? 4 : nil)
+        }
+    }
+
     @MainActor func testTitleTapsIgnoreHiddenGameplayHitboxesAndGesturePreference() {
         var config = TouchConfiguration()
         config.mouseGestures = false

@@ -115,6 +115,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
     // it during transfer, before an oversized archive fills the sandbox.
     private nonisolated static let maximumArchiveBytes: Int64 = 2 << 30
     private var resourcesOnly = false
+    private var rejectedMarker: GameFolder.ResourceMarker?
     private var resolvingAutomatic = false
     private var attempt = UUID()
     private var session: URLSession?
@@ -196,10 +197,11 @@ final class GameFilesDownload: NSObject, ObservableObject {
         await startAutomatic()
     }
 
-    func startAutomatic() async {
+    func startAutomatic(replacingRejectedFiles: Bool = false) async {
         guard !busy else { return }
         automaticAttempted = true
         resourcesOnly = true
+        rejectedMarker = replacingRejectedFiles ? GameFolder.resourceMarker(at: GameFolder.resources) : nil
         resolvingAutomatic = true
         attempt = UUID()
         startedAt = ProcessInfo.processInfo.systemUptime
@@ -212,7 +214,11 @@ final class GameFilesDownload: NSObject, ObservableObject {
         resolvingAutomatic = false
         guard !Task.isCancelled else { trace("source_lookup_cancelled"); state = .idle; return }
         // A cable/manual import can finish while the source request is pending.
-        guard !GameFolder.hasGameFiles else { trace("already_installed"); state = .done("Game files are already installed."); return }
+        guard !keepInstalledGameFiles() else {
+            trace("already_installed")
+            state = .done("Game files are already installed.")
+            return
+        }
         guard let text = answer["url"] as? String, let url = URL(string: text),
               ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
             trace("source_lookup_failed detail=\(Diagnostics.redact(answer.error ?? "missing_or_invalid_url"))")
@@ -221,6 +227,12 @@ final class GameFilesDownload: NSObject, ObservableObject {
         }
         // A custom link's token belongs only to that link, never the public source.
         begin(url: url, token: nil)
+    }
+
+    private func keepInstalledGameFiles() -> Bool {
+        guard let current = GameFolder.resourceMarker(at: GameFolder.resources) else { return false }
+        // Keep a newer installation, even when this attempt was asked to repair the old one.
+        return current != rejectedMarker
     }
 
     /// Import through the same resource-only validator as automatic setup.
@@ -335,7 +347,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
             trace("transfer_complete received=\(receivedBytes) expected=\(expectedBytes)")
             defer { try? FileManager.default.removeItem(at: file) }
             // A manual/cable import can also finish after the HTTP transfer began.
-            guard !resourcesOnly || !GameFolder.hasGameFiles else {
+            guard !resourcesOnly || !keepInstalledGameFiles() else {
                 state = .done("Game files are already installed.")
                 break
             }
@@ -535,8 +547,9 @@ private enum Keychain {
 /// Get the game files: the link, the token, the progress and what happened.
 struct GameFilesCard: View {
     @ObservedObject var download: GameFilesDownload
-    /// The game has none yet: say so first.
+    /// Whether the player needs to install or repair the game files.
     var missing: Bool
+    var repairing = false
     var setupHelp: (() -> Void)? = nil
 
     var body: some View {
@@ -562,8 +575,8 @@ struct GameFilesCard: View {
                     .disabled(!download.canCancel)
             } else {
                 if missing {
-                    PrimaryButton(title: "Download game files", icon: "arrow.down") {
-                        Task { await download.startAutomatic() }
+                    PrimaryButton(title: repairing ? "Reinstall game files" : "Download game files", icon: "arrow.down") {
+                        Task { await download.startAutomatic(replacingRejectedFiles: repairing) }
                     }
                     .accessibilityIdentifier("launcher-download-game-files")
                 }
@@ -636,6 +649,7 @@ struct GameFilesRecovery: View {
     @ObservedObject var download: GameFilesDownload
     let version: String
     let signedIn: Bool
+    var repairing = false
     var configureManually: (() -> Void)? = nil
     @State private var choosingFile = false
     @State private var fileIssue: String?
@@ -684,7 +698,7 @@ struct GameFilesRecovery: View {
                     Link("Read game-file transfer instructions", destination: URL(string: "https://github.com/heyskylo/horizon-ios/blob/main/docs/native-client.md#carry-your-game-files-to-a-phone")!)
                 }
                 Section("Automatic setup or download link") {
-                    GameFilesCard(download: download, missing: true)
+                    GameFilesCard(download: download, missing: true, repairing: repairing)
                 }
             }
             .navigationTitle("Game files needed")

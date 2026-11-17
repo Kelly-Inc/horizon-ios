@@ -9,17 +9,32 @@ enum GameFolder {
     static var screenshots: URL { documents.appendingPathComponent("screenshots") }
     static var resources: URL { documents.appendingPathComponent("resources") }
 
-    /// Whether imported game files are in place (`import::resources_root`'s second stop).
-    static var hasGameFiles: Bool {
-        containsGameFiles(at: resources)
+    struct ResourceMarker: Equatable {
+        let volume: UInt64?
+        let file: UInt64?
+        let modified: Date?
+        let size: UInt64?
     }
 
+    /// Whether imported game files are in place (`import::resources_root`'s second stop).
+    static var hasGameFiles: Bool { resourceMarker(at: resources) != nil }
+
     static func containsGameFiles(at resources: URL) -> Bool {
+        resourceMarker(at: resources) != nil
+    }
+
+    static func resourceMarker(at resources: URL) -> ResourceMarker? {
         // Match the engine's is_file(): follow a link to a regular manifest,
         // but reject directories, broken links and other non-file entries.
         let marker = resources.appendingPathComponent("horizon-resources.json").resolvingSymlinksInPath()
-        let attributes = try? FileManager.default.attributesOfItem(atPath: marker.path)
-        return attributes?[.type] as? FileAttributeType == .typeRegular
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: marker.path),
+              attributes[.type] as? FileAttributeType == .typeRegular else { return nil }
+        return ResourceMarker(
+            volume: (attributes[.systemNumber] as? NSNumber)?.uint64Value,
+            file: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+            modified: attributes[.modificationDate] as? Date,
+            size: (attributes[.size] as? NSNumber)?.uint64Value
+        )
     }
 }
 
@@ -126,6 +141,17 @@ final class GameLink: ObservableObject {
         self.send = send
     }
 
+    /// First-time setup or an engine-reported failure to load the installed files.
+    var needsGameFiles: Bool {
+        if case .needsFiles = phase { return true }
+        return phase == .waiting && !GameFolder.hasGameFiles
+    }
+
+    var repairingGameFiles: Bool {
+        if case .needsFiles = phase { return GameFolder.hasGameFiles }
+        return false
+    }
+
     var ready: Bool { phase == .title }
     /// Whether the worlds and servers can be read: they are files, so before the game starts too.
     var canList: Bool { phase == .title || phase == .waiting }
@@ -225,11 +251,7 @@ final class GameLink: ObservableObject {
         guard launching == nil else { return nil }
         // Every entry point (Play, world creation/opening and joining a server)
         // offers setup before starting an engine with missing resources.
-        if case .needsFiles = phase {
-            requestingGameFiles = true
-            return nil
-        }
-        if phase == .waiting && !GameFolder.hasGameFiles {
+        if needsGameFiles {
             requestingGameFiles = true
             return nil
         }

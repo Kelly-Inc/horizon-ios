@@ -997,6 +997,62 @@ final class AutomaticGameFilesTests: XCTestCase {
         }
     }
 
+    func testRejectedFilesCanBeReinstalledFromTheLauncher() async throws {
+        guard let url = ProcessInfo.processInfo.environment["HORIZON_DOWNLOAD_FIXTURE_URL"] else {
+            throw XCTSkip("Requires the loopback download fixture")
+        }
+        let restore = temporarilyRemoveResourceMarker()
+        defer { restore() }
+        let marker = GameFolder.resources.appendingPathComponent("horizon-resources.json")
+        try FileManager.default.createDirectory(at: GameFolder.resources, withIntermediateDirectories: true)
+        try Data("rejected fixture".utf8).write(to: marker)
+        let link = GameLink(send: { _ in ["phase": "needs_files", "reason": "Damaged tables"] })
+        await link.refresh()
+        XCTAssertTrue(link.needsGameFiles)
+        XCTAssertTrue(link.repairingGameFiles)
+
+        let model = GameFilesDownload(importArchive: { line in
+            XCTAssertTrue(line.hasPrefix("import-game-files "))
+            XCTAssertEqual(try? Data(contentsOf: marker), Data("rejected fixture".utf8))
+            try? Data("installed fixture".utf8).write(to: marker, options: .atomic)
+            return ["ok": true, "kind": "resources"]
+        }, automaticSource: { ["url": url] })
+        await model.startAutomatic(replacingRejectedFiles: link.repairingGameFiles)
+        for _ in 0..<100 where model.busy {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(try Data(contentsOf: marker), Data("installed fixture".utf8))
+        if case .done = model.state {} else { XCTFail("Reinstall did not finish: \(model.state)") }
+    }
+
+    func testReinstallKeepsFilesReplacedDuringTransfer() async throws {
+        guard let url = ProcessInfo.processInfo.environment["HORIZON_DOWNLOAD_FIXTURE_URL"] else {
+            throw XCTSkip("Requires the loopback download fixture")
+        }
+        let restore = temporarilyRemoveResourceMarker()
+        defer { restore() }
+        let marker = GameFolder.resources.appendingPathComponent("horizon-resources.json")
+        try FileManager.default.createDirectory(at: GameFolder.resources, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: marker)
+        let modified = try FileManager.default.attributesOfItem(atPath: marker.path)[.modificationDate]
+        var imports = 0
+        let model = GameFilesDownload(importArchive: { _ in
+            imports += 1
+            return ["ok": true, "kind": "resources"]
+        }, automaticSource: { ["url": url + "?delay=1"] })
+        await model.startAutomatic(replacingRejectedFiles: true)
+        try Data("new".utf8).write(to: marker, options: .atomic)
+        if let modified {
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: marker.path)
+        }
+        for _ in 0..<100 where model.busy {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(imports, 0)
+        XCTAssertEqual(model.state, .done("Game files are already installed."))
+        XCTAssertEqual(try Data(contentsOf: marker), Data("new".utf8))
+    }
+
     func testFilesArrivingDuringTransferDoNotGetReplaced() async throws {
         let restore = temporarilyRemoveResourceMarker()
         defer { restore() }

@@ -82,6 +82,7 @@ struct HomeView: View {
         .sheet(isPresented: $link.requestingGameFiles) {
             GameFilesRecovery(download: download, version: link.version,
                               signedIn: account.profile != nil,
+                              repairing: link.repairingGameFiles,
                               configureManually: {
                                   tab = .settings
                                   link.requestingGameFiles = false
@@ -184,7 +185,7 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 28) {
             launchPanel
             if needsFiles {
-                GameFilesCard(download: download, missing: true,
+                GameFilesCard(download: download, missing: true, repairing: link.repairingGameFiles,
                               setupHelp: { link.requestingGameFiles = true })
             }
         }
@@ -257,10 +258,7 @@ struct HomeView: View {
     }
 
     private var playLabel: String { link.launching ?? (needsFiles ? "Game files needed" : "Play") }
-    private var needsFiles: Bool {
-        if case .needsFiles = link.phase { return true }
-        return link.phase == .waiting && !GameFolder.hasGameFiles
-    }
+    private var needsFiles: Bool { link.needsGameFiles }
 
     private var accountSheet: some View {
         NavigationStack {

@@ -140,7 +140,10 @@ struct SettingsPage: View {
         VStack(alignment: .leading, spacing: 16) {
             TouchControlsSettings()
             SectionHeader(title: "Game files")
-            GameFilesCard(download: download, missing: !GameFolder.hasGameFiles)
+            GameFilesCard(
+                download: download, missing: !GameFolder.hasGameFiles || link.repairingGameFiles,
+                repairing: link.repairingGameFiles
+            )
 
             SectionHeader(title: "About")
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }

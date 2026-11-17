@@ -387,7 +387,8 @@ impl Pack {
     /// Read every entry out into `into`, which is created here. Anything that goes wrong removes
     /// `into` again: the game must never see a half tree.
     fn unpack(&mut self, into: &Path) -> Result<(usize, u64)> {
-        fs::create_dir_all(into)?;
+        // If removing interrupted staging failed, never merge the incoming archive with it.
+        fs::create_dir(into)?;
         let result = self.unpack_entries(into);
         if result.is_err() {
             // CRC, decompression and filesystem failures also leave partial
@@ -523,7 +524,7 @@ impl Pack {
                     }
                     fs::rename(&scratch, &staged)?;
                     let dest = home.join(folder);
-                    publish(&staged, &dest)?;
+                    publish(&staged, &dest, |from, to| fs::rename(from, to))?;
                     fs::remove_file(&archive)?;
                     (dest, files, bytes)
                 }
@@ -565,16 +566,37 @@ fn clear_world_staging(saves: &Path) -> io::Result<()> {
 /// die between the two renames, and `resources.previous` is something [`recover`] can put back,
 /// while a half-deleted folder is not. The copy is what costs the disk, and it goes as soon as the
 /// new tree is in place.
-fn publish(scratch: &Path, dest: &Path) -> Result<()> {
+fn publish(
+    scratch: &Path,
+    dest: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
     let previous = dest.with_file_name(format!(
         "{}.previous",
         dest.file_name().unwrap_or_default().to_string_lossy()
     ));
-    let _ = fs::remove_dir_all(&previous);
     if dest.exists() {
-        fs::rename(dest, &previous)?;
+        match fs::remove_dir_all(&previous) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        rename(dest, &previous)?;
     }
-    fs::rename(scratch, dest)?;
+    if let Err(error) = rename(scratch, dest) {
+        // A prior interrupted attempt may already have moved the old tree
+        // aside. Keep it until the new tree has actually taken its place.
+        if previous.is_dir()
+            && !dest.exists()
+            && let Err(rollback) = rename(&previous, dest)
+        {
+            return Err(format!(
+                "could not install game files: {error}; could not restore the previous game files: {rollback}"
+            )
+            .into());
+        }
+        return Err(error.into());
+    }
     horizon_core::prepared_files::invalidate(dest);
     let _ = fs::remove_dir_all(&previous);
     Ok(())
@@ -1861,6 +1883,73 @@ mod tests {
                 assert!(!home.join("resources").exists());
             }
             assert!(!home.join("resources.unpacking").exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn extraction_refuses_to_mix_new_files_with_an_existing_staging_tree() {
+        let home = temp_home("staging-occupied");
+        let scratch = home.join("resources.unpacking");
+        fs::create_dir(&scratch).unwrap();
+        fs::write(scratch.join("existing"), "keep").unwrap();
+        let archive = home.join("game.zip");
+        write_archive(&archive, PREPARED);
+
+        assert!(Pack::open(&archive).unwrap().unpack(&scratch).is_err());
+        assert_eq!(fs::read(scratch.join("existing")).unwrap(), b"keep");
+        assert!(!scratch.join("horizon-resources.json").exists());
+        assert!(archive.is_file());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn failed_resource_swap_restores_previous_files_and_preserves_failed_rollback() {
+        for refuse_rollback in [false, true] {
+            let home = temp_home("swap-error");
+            let dest = home.join("resources");
+            let staged = home.join("resources.staged");
+            let previous = home.join("resources.previous");
+            fs::create_dir(&dest).unwrap();
+            fs::create_dir(&staged).unwrap();
+            fs::write(dest.join("horizon-resources.json"), "old").unwrap();
+            fs::write(staged.join("horizon-resources.json"), "new").unwrap();
+
+            let error = publish(&staged, &dest, |from, to| {
+                if from == staged || (refuse_rollback && from == previous) {
+                    return Err(io::Error::other("simulated rename failure"));
+                }
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("simulated rename failure"));
+            assert_eq!(
+                fs::read(staged.join("horizon-resources.json")).unwrap(),
+                b"new"
+            );
+
+            if refuse_rollback {
+                assert!(error.to_string().contains("could not restore"));
+                assert!(!dest.exists());
+                assert_eq!(
+                    fs::read(previous.join("horizon-resources.json")).unwrap(),
+                    b"old"
+                );
+                // The next attempt fails as well, this time before it can
+                // replace anything. It must still have the backup to restore.
+                publish(&staged, &dest, |from, to| {
+                    if from == staged {
+                        return Err(io::Error::other("simulated retry failure"));
+                    }
+                    fs::rename(from, to)
+                })
+                .unwrap_err();
+            }
+            assert_eq!(
+                fs::read(dest.join("horizon-resources.json")).unwrap(),
+                b"old"
+            );
+            assert!(!previous.exists());
             fs::remove_dir_all(home).unwrap();
         }
     }

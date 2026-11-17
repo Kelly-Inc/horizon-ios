@@ -10,20 +10,45 @@ enum Diagnostics {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("HorizonDiagnostics", isDirectory: true)
     }
-    private static let patterns: [NSRegularExpression] = [#"https?://[^\s]+"#, #"\beyJ[A-Za-z0-9_.-]+"#, #"[A-Za-z0-9_./+=-]{129,}"#, #"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#, #"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"#, #"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"#, #"/(?:Users|var/mobile)/[^\s]+"#].compactMap {try? NSRegularExpression(pattern:$0,options:.caseInsensitive)}
+    private static let sensitive = [
+        "accesstoken", "refreshtoken", "idtoken", "token =", "token :", "user code",
+        "access_token", "refresh_token", "id_token", "token:", "token=", "token\"",
+        "authorization", "bearer", "password", "secret", "cookie", "xbl3.0",
+        "device_code", "user_code", "sessionid", "session_id", "api_key", "accesskey",
+    ]
+    // Each marker is a literal required by its pattern. Avoid expensive searches
+    // for email addresses and other identifiers on ordinary status lines.
+    private static let patterns: [(regex: NSRegularExpression, marker: String?, minimumBytes: Int)] = [
+        (#"https?://[^\s]+"#, "://", 0),
+        (#"\beyJ[A-Za-z0-9_.-]+"#, "eyj", 4),
+        (#"[A-Za-z0-9_./+=-]{129,}"#, nil, 129),
+        (#"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}"#, "@", 0),
+        (#"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"#, ".", 7),
+        (#"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"#, "-", 36),
+        (#"/(?:Users|var/mobile)/[^\s]+"#, "/", 0),
+    ].compactMap { pattern, marker, minimumBytes in
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
+        return (regex, marker, minimumBytes)
+    }
     private static let entryStart = try? NSRegularExpression(pattern: #"^(?:\[\d{2}:\d{2}:\d{2}\]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"#)
     private static func beginsEntry(_ line: String) -> Bool {
         entryStart?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
     }
     static func redact(_ text: String) -> String {
         guard text.utf8.count <= entryLimit else { return "[oversized log entry omitted]" }
-        let sensitive = ["accesstoken", "refreshtoken", "idtoken", "token =", "token :", "user code", "access_token", "refresh_token", "id_token", "token:", "token=", "token\"", "authorization", "bearer", "password", "secret", "cookie", "xbl3.0", "device_code", "user_code", "sessionid", "session_id", "api_key", "accesskey"]
-        if sensitive.contains(where: {text.lowercased().contains($0)}) {return "[redacted sensitive log message]"}
+        let lowercase = text.lowercased()
+        if sensitive.contains(where: { lowercase.contains($0) }) {
+            return "[redacted sensitive log message]"
+        }
         return text.components(separatedBy: .newlines).map { line in
-            if sensitive.contains(where: { line.lowercased().contains($0) }) { return "[redacted sensitive log line]" }
+            let lowercaseLine = line.lowercased()
+            let bytes = line.utf8.count
             var safe = line
-            for regex in patterns {
-                safe = regex.stringByReplacingMatches(in:safe,range:NSRange(safe.startIndex...,in:safe),withTemplate:"[redacted]")
+            for rule in patterns where bytes >= rule.minimumBytes {
+                if let marker = rule.marker, !lowercaseLine.contains(marker) { continue }
+                safe = rule.regex.stringByReplacingMatches(
+                    in: safe, range: NSRange(safe.startIndex..., in: safe), withTemplate: "[redacted]"
+                )
             }
             return safe
         }.joined(separator: "\n")
@@ -76,8 +101,10 @@ enum Diagnostics {
                 return "[oversized log line omitted]"
             }
             // Rust entries start with [time]; launcher entries start with an ISO date.
-            if beginsEntry(line) {hidingContinuation = false}
-            if hidingContinuation { return "[redacted continuation]" }
+            if hidingContinuation {
+                guard beginsEntry(line) else { return "[redacted continuation]" }
+                hidingContinuation = false
+            }
             let safe = redact(line)
             if safe == "[redacted sensitive log message]" { hidingContinuation = true }
             return safe

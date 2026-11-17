@@ -307,6 +307,22 @@ final class FormattingTests: XCTestCase {
         XCTAssertFalse(GameFolder.containsGameFiles(at: root))
     }
 
+    func testRedactionKeepsOrdinaryTextWhileMaskingEachIdentifierFormat() {
+        for identifier in [
+            "HTTPS://example.invalid/private",
+            "eYjFixtureValue",
+            String(repeating: "x", count: 129),
+            "fixture@example.invalid",
+            "203.0.113.4:25565",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "/Users/fixture/Documents",
+        ] {
+            XCTAssertEqual(Diagnostics.redact("Shader diagnostic \(identifier)"),
+                           "Shader diagnostic [redacted]")
+        }
+        XCTAssertEqual(Diagnostics.redact("Shader diagnostic completed"), "Shader diagnostic completed")
+    }
+
     func testSensitiveContinuationsDoNotEndAtAnArbitraryBracket() {
         let text = "[12:00:00] [Render thread/INFO]: access_token:\n[opaque-fixture-value]\n[12:00:01] [Render thread/INFO]: shader ready\n"
         let safe = Diagnostics.redactExport(text)

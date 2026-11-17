@@ -53,6 +53,20 @@ pub(super) fn sync(
     }
 }
 
+/// Follow the main game or loading screen. The phone cover is shown only after the
+/// renderer successfully attaches to an external display.
+pub(super) fn sync_primary(
+    mut renderer: Option<&mut Renderer>,
+    window: Option<&Arc<Window>>,
+    shown: &mut Shown,
+    playing: bool,
+    split: bool,
+) {
+    let screen = horizon_airplay::screen(playing, split);
+    sync(renderer.as_deref_mut(), window, shown, screen);
+    horizon_airplay::rendering(playing && renderer.is_some_and(|r| r.targeted()));
+}
+
 impl Game<'_> {
     /// The game draws on an AirPlay display, so the phone's window is not where it is played.
     pub(super) fn on_airplay(&self) -> bool {
@@ -63,13 +77,12 @@ impl Game<'_> {
         if self.splitscreen.guest {
             return;
         }
-        let screen =
-            horizon_airplay::screen(!horizon_ios_launcher::covered(), self.splitscreen.active);
-        sync(
+        sync_primary(
             self.renderer.as_mut(),
             self.window.as_ref(),
             &mut self.airplay,
-            screen,
+            !horizon_ios_launcher::covered(),
+            self.splitscreen.active,
         );
     }
 }

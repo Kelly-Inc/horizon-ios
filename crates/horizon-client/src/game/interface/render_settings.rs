@@ -264,6 +264,7 @@ impl Game<'_> {
         // And has no wall for the world border.
         self.border_renderer.invalidate();
         self.renderer = Some(renderer);
+        self.airplay = None;
         self.forget_atlas_slots();
         let shader_mesh_changed = self.clear_shader_mesh_state();
         if !world_kept {

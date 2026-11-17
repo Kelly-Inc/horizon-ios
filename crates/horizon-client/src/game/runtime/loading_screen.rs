@@ -195,6 +195,7 @@ impl Loading {
         ) {
             Ok(r) => {
                 self.renderer = Some(r);
+                self.airplay = None;
                 horizon_ios_launcher::present();
             }
             Err(e) => {
@@ -267,6 +268,7 @@ impl Loading {
         ) {
             Ok(r) => {
                 self.renderer = Some(r);
+                self.airplay = None;
                 // The GPU holds the atlas now: keep its copy compressed until the world
                 // renderer reads it at the handoff, as the game does after its first frame.
                 if let Some(gui) = &mut self.gui {
@@ -368,11 +370,12 @@ impl Loading {
             ));
             return;
         }
-        airplay::sync(
+        airplay::sync_primary(
             self.renderer.as_mut(),
             self.window.as_ref(),
             &mut self.airplay,
-            horizon_airplay::screen(true, false),
+            true,
+            false,
         );
         self.poll_menu_realms(event_loop);
         if let Some(w) = &self.window {

@@ -761,6 +761,7 @@ impl Game<'_> {
                 renderer.resize(old.config.width, old.config.height);
             }
             self.renderer = Some(renderer);
+            self.airplay = None;
             self.apply_ui_settings();
         }
         // Horizon's own shader pack is built again: its sprite tags name the old atlas's

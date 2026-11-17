@@ -77,17 +77,23 @@ pub fn register() {
     ios::register();
 }
 
-/// The first player's view of the AirPlay display, if one is connected: all of it, or its top half while
-/// `split`. Called every frame: `cover_phone` says whether the phone shows the cover over everything (while
-/// the game draws on the display) or what is under it (the launcher, which needs its touches).
-pub fn screen(cover_phone: bool, split: bool) -> Option<Screen> {
+/// The first player's external view while the game is visible, or its top half while split.
+pub fn screen(playing: bool, split: bool) -> Option<Screen> {
     #[cfg(target_os = "ios")]
-    return ios::screen(cover_phone, split);
+    return ios::screen(playing, split);
     #[cfg(not(target_os = "ios"))]
     {
-        let _ = (cover_phone, split);
+        let _ = (playing, split);
         None
     }
+}
+
+/// Update the covers after the primary renderer has attempted to attach.
+pub fn rendering(on_display: bool) {
+    #[cfg(target_os = "ios")]
+    ios::rendering(on_display);
+    #[cfg(not(target_os = "ios"))]
+    let _ = on_display;
 }
 
 /// The second player's view: the bottom half, while [`screen`] splits the display.
@@ -155,6 +161,8 @@ mod ios {
         halves: Option<(View, View)>,
         cover: Option<Cover>,
         idle: Retained<UILabel>,
+        playing: bool,
+        rendering: bool,
     }
 
     thread_local! {
@@ -234,6 +242,8 @@ mod ios {
                 halves: None,
                 cover: None,
                 idle,
+                playing: false,
+                rendering: false,
             })
         });
     }
@@ -337,25 +347,51 @@ mod ios {
         )
     }
 
-    pub(super) fn screen(cover: bool, split: bool) -> Option<Screen> {
+    fn update_covers(state: &mut State) {
+        let on_display = state.playing && state.rendering;
+        state.idle.setHidden(on_display);
+        if !on_display {
+            state.view.view.bringSubviewToFront(&state.idle);
+        }
+        if on_display && state.cover.is_none() {
+            state.cover = cover_phone(MainThreadMarker::from(&*state.view.view));
+        }
+        if let Some(cover) = &state.cover {
+            let shown = on_display && !PHONE_GAME.with(Cell::get);
+            cover.view.setHidden(!shown);
+            if shown && let Some(window) = cover.view.superview() {
+                window.bringSubviewToFront(&cover.view);
+            }
+        }
+    }
+
+    pub(super) fn rendering(on_display: bool) {
+        STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            if let Some(state) = state.as_mut()
+                && state.rendering != on_display
+            {
+                state.rendering = on_display;
+                update_covers(state);
+            }
+        });
+    }
+
+    pub(super) fn screen(playing: bool, split: bool) -> Option<Screen> {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
             let state = state.as_mut()?;
-            if cover && state.cover.is_none() {
-                state.cover = cover_phone(MainThreadMarker::from(&*state.view.view));
+            if state.playing != playing {
+                state.playing = playing;
+                let message = if playing {
+                    "Game is playing on your iPhone or iPad"
+                } else {
+                    "Game is not running"
+                };
+                state.idle.setText(Some(&NSString::from_str(message)));
             }
-            state.idle.setHidden(cover);
-            if !cover {
-                state.view.view.bringSubviewToFront(&state.idle);
-            }
-            let playing = cover;
-            let cover = cover && !PHONE_GAME.with(Cell::get);
-            if let Some(c) = &state.cover {
-                c.view.setHidden(!cover);
-                // The launcher or the keyboard may have put a view over it since.
-                if cover && let Some(window) = c.view.superview() {
-                    window.bringSubviewToFront(&c.view);
-                }
+            if !playing {
+                state.rendering = false;
             }
             if split && state.halves.is_none() {
                 state.halves = Some(halves(state));
@@ -363,6 +399,7 @@ mod ios {
                 top.view.removeFromSuperview();
                 bottom.view.removeFromSuperview();
             }
+            update_covers(state);
             let view = state.halves.as_ref().map_or(&state.view, |(top, _)| top);
             playing.then(|| screen_of(state, view))
         })

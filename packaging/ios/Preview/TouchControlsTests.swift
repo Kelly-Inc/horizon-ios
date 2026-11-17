@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 @testable import LauncherPreview
 
 final class TouchControlsTests: XCTestCase {
@@ -26,6 +27,57 @@ final class TouchControlsTests: XCTestCase {
         _ = bridge.poll(screen: 91, flags: 1, width: 600, height: 300, scale: 1, capacity: 64)
         XCTAssertFalse(bridge.gestureRecognizer(scroll, shouldReceive: touch),
                        "A menu-only recognizer must not cancel world camera fingers")
+    }
+
+    @MainActor func testScreenChangeCancelsTheActiveUIKitRecognizer() throws {
+        let bridge = TouchGestureBridge(configuration: { TouchConfiguration() })
+        let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: view)
+        let recognizers = try XCTUnwrap(view.gestureRecognizers)
+        let tracker = try XCTUnwrap(recognizers.compactMap { $0 as? TouchHotbarTracker }.first)
+        func poll(screen: UInt64, flags: UInt32 = 0) -> [[Double]] {
+            bridge.poll(screen: screen, flags: flags, width: 600, height: 300, scale: 1, capacity: 64)
+        }
+        XCTAssertTrue(recognizers.allSatisfy { !$0.isEnabled })
+        _ = poll(screen: 1)
+        tracker.state = .began
+        XCTAssertEqual(tracker.state, .began)
+        XCTAssertTrue(poll(screen: 2).isEmpty)
+        XCTAssertNotEqual(tracker.state, .began)
+        XCTAssertTrue(recognizers.allSatisfy { $0.isEnabled })
+
+        bridge.suspend()
+        XCTAssertTrue(recognizers.allSatisfy { !$0.isEnabled })
+        XCTAssertTrue(poll(screen: 2, flags: 2).isEmpty)
+        XCTAssertTrue(recognizers.allSatisfy { !$0.isEnabled })
+        XCTAssertEqual(poll(screen: 2).map { $0[0] }, [0])
+        XCTAssertTrue(recognizers.allSatisfy { $0.isEnabled })
+    }
+
+    @MainActor func testLongPressReleasesItsOriginalActionAndCannotEndOnANewScreen() {
+        let bridge = TouchGestureBridge(configuration: { TouchConfiguration() })
+        let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: view)
+        func poll(_ screen: UInt64) -> [[Double]] {
+            bridge.poll(screen: screen, flags: 1, width: 600, height: 300,
+                        scale: Double(UIScreen.main.scale), capacity: 64)
+        }
+        _ = poll(1)
+        let hold = FixedGestureHold()
+        hold.point = CGPoint(x: 300, y: 299)
+        _ = bridge.perform(NSSelectorFromString("held:"), with: hold)
+        XCTAssertEqual(poll(1).map { [$0[0], $0[1], $0[4]] }, [[2, 1, 4]])
+        hold.phase = .ended
+        hold.point = CGPoint(x: 300, y: 100)
+        _ = bridge.perform(NSSelectorFromString("held:"), with: hold)
+        XCTAssertEqual(poll(1).map { [$0[0], $0[1], $0[4]] }, [[2, 3, 4]])
+
+        hold.phase = .began
+        _ = bridge.perform(NSSelectorFromString("held:"), with: hold)
+        XCTAssertTrue(poll(2).isEmpty)
+        hold.phase = .cancelled
+        _ = bridge.perform(NSSelectorFromString("held:"), with: hold)
+        XCTAssertTrue(poll(2).isEmpty)
     }
 
     @MainActor func testTitleTapsIgnoreHiddenGameplayHitboxesAndGesturePreference() {
@@ -541,7 +593,9 @@ final class TouchControlsTests: XCTestCase {
 
 private final class FixedGestureHold: UILongPressGestureRecognizer {
     var phase: UIGestureRecognizer.State = .began
+    var point = CGPoint.zero
     override var state: UIGestureRecognizer.State { get { phase } set { phase = newValue } }
+    override func location(in view: UIView?) -> CGPoint { point }
 }
 
 private final class PositionedTouch: UITouch {

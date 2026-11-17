@@ -600,10 +600,12 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     private var pending: [(Double, [Double], UInt64, UInt32, UInt64)] = []
     private var needsEngineReset = false
     private var overflowed = false
+    private var discardingInput = false
     var inputContext: UInt64 = 0
     private var primaryTouch: UITouch?
     private var hotbarTouch: UITouch?
     private var hotbarHold: UILongPressGestureRecognizer?
+    private var heldGestureSlot: Int?
     private var hotbarSlot = -1
     private var suppressTap = false
 
@@ -639,6 +641,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         let hotbar = TouchHotbarTracker(target: self, action: #selector(hotbarMoved(_:)))
         recognizers = [tap, double, hold, keyboard, scroll, hotbar]
         for recognizer in recognizers {
+            recognizer.isEnabled = active
             recognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
             recognizer.cancelsTouchesInView = false
             recognizer.delegate = self
@@ -658,6 +661,12 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     }
 
     private func discardInput() {
+        discardingInput = true
+        defer { discardingInput = false }
+        // Clearing the event queue alone leaves UIKit tracking the old touch.
+        // Disabling the recognizers cancels those in-flight gestures.
+        setRecognizersEnabled(false)
+        if active && !overflowed { setRecognizersEnabled(true) }
         for button in customViews.values { button.release(notify: false) }
         customHolds.reset()
         customPressed.removeAll()
@@ -665,7 +674,14 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         primaryTouch = nil
         hotbarTouch = nil
         hotbarSlot = -1
+        heldGestureSlot = nil
         suppressTap = false
+    }
+
+    private func setRecognizersEnabled(_ enabled: Bool) {
+        for recognizer in recognizers where recognizer.isEnabled != enabled {
+            recognizer.isEnabled = enabled
+        }
     }
 
     func poll(screen: UInt64, flags: UInt32, width: Double, height: Double, scale: Double, capacity: Int, withContext: Bool = false) -> [[Double]] {
@@ -686,6 +702,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
             overflowed = false
         }
         self.screen = screen; active = enabled; playing = flags & 1 != 0
+        setRecognizersEnabled(enabled)
         noWorld = flags & 8 != 0
         controlsHidden = flags & 16 != 0; moreOpen = flags & 32 != 0
         closeShown = flags & 64 != 0; keyboardShown = flags & 128 != 0; hideCustomPaint = flags & 256 != 0
@@ -765,7 +782,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     }
     private func emit(_ kind: Double, phase: Int, location: CGPoint = .zero, slot: Int = -1,
                       modifiers: UIKeyModifierFlags = [], touch: UInt64 = 0) {
-        guard !overflowed, active || (kind == 7 && phase == 3) else { return }
+        guard !discardingInput, !overflowed, active || (kind == 7 && phase == 3) else { return }
         // If an event storm exhausts the bounded queue, cancel the old gesture
         // state rather than lose an up edge and leave a button held forever.
         if pending.count >= 128 {
@@ -785,7 +802,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         pending.append((ProcessInfo.processInfo.systemUptime, [kind, Double(phase), location.x, location.y, Double(slot)], inputContext, bits, touch))
     }
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        guard active, gui.width > 0, gui.height > 0, let surface,
+        guard active, !discardingInput, !overflowed, gui.width > 0, gui.height > 0, let surface,
               surface.window?.rootViewController?.presentedViewController == nil else { return false }
         // Menu scrolling cancels UIKit touches. During play those same touches
         // own camera movement, so rejecting them in the handler is too late.
@@ -836,8 +853,18 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     }
     @objc private func held(_ sender: UILongPressGestureRecognizer) {
         guard let surface else { return }
-        if sender.state == .began { suppressTap = true }
-        emit(2, phase: sender.state.rawValue, slot: slot(sender.location(in: surface)), modifiers: sender.modifierFlags)
+        if sender.state == .began {
+            guard active, !discardingInput, !overflowed else { return }
+            suppressTap = true
+            let slot = slot(sender.location(in: surface))
+            heldGestureSlot = slot
+            emit(2, phase: sender.state.rawValue, slot: slot, modifiers: sender.modifierFlags)
+        } else if [.ended, .cancelled, .failed].contains(sender.state), let slot = heldGestureSlot {
+            // A hold can move across the hotbar. Release the same action
+            // that began, even if the finger is over a different target now.
+            heldGestureSlot = nil
+            emit(2, phase: sender.state.rawValue, slot: slot, modifiers: sender.modifierFlags)
+        }
     }
     @objc private func keyboardHeld(_ sender: UILongPressGestureRecognizer) {
         if sender.state == .began { emit(5, phase: sender.state.rawValue, modifiers: sender.modifierFlags) }

@@ -79,6 +79,17 @@ impl Root {
             directory,
         })
     }
+
+    /// Configured roots may have aliases; managed descendants still use `open`
+    /// and the held directory's no-follow traversal.
+    fn configured(root: &Path) -> Result<Self, Error> {
+        checked(root, true)?;
+        match root.canonicalize() {
+            Ok(root) => Self::open(&root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::open(root),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 struct Entry {
@@ -357,7 +368,7 @@ impl Storage {
                 }
             }
         }
-        let data = Root::open(&backend::data_dir())?;
+        let data = Root::configured(&backend::data_dir())?;
         let played: HashSet<_> = instances::list()
             .into_iter()
             .filter_map(|instance| instance.resolve_version(None).ok())
@@ -408,7 +419,7 @@ impl Storage {
             if backend::in_use(&version) {
                 continue;
             }
-            let root = Root::open(&instance.home)?;
+            let root = Root::configured(&instance.home)?;
             old_logs(&mut entries, &root)?;
             unused_jars(&mut entries, &root)?;
             for relative in [".horizon-cache", "wasm-cache", "cache"] {
@@ -653,7 +664,7 @@ impl Storage {
         self.lease.bytes()?;
         if clear.is_some() || all {
             use horizon_platform::mod_package::runtime_leases::{
-                cleanup::Cleanup, Error as LeaseError,
+                Error as LeaseError, cleanup::Cleanup,
             };
             match Cleanup::existing(&backend::data_dir()) {
                 Ok(cleanup) => {
@@ -812,8 +823,8 @@ fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
 
 fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
     use horizon_platform::mod_package::{
-        mod_list::{DIR, NATIVE_DIR},
         Package,
+        mod_list::{DIR, NATIVE_DIR},
     };
     let folder = Entry::fixed(home, Path::new("jars"), Category::OtherCaches)?.path;
     if checked(&folder, true)?.is_none() {
@@ -894,7 +905,9 @@ mod eviction_tests {
                 Some(sha),
             ),
             (
-                format!("native/prebuilt/{sha}-horizon-prebuilt-v3-x86_64-unknown-linux-gnu-server"),
+                format!(
+                    "native/prebuilt/{sha}-horizon-prebuilt-v3-x86_64-unknown-linux-gnu-server"
+                ),
                 Some(sha),
             ),
             (
@@ -902,21 +915,57 @@ mod eviction_tests {
                 Some(sha),
             ),
             (
-                format!("native/prebuilt/{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu-server"),
+                format!(
+                    "native/prebuilt/{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu-server"
+                ),
                 Some(sha),
             ),
-            (format!("native/prebuilt/{sha}-horizon-prebuilt-v3-unknown-target"), None),
-            (format!("native/prebuilt/{sha}-horizon-prebuilt-v4-unknown-target"), None),
-            (format!("native/prebuilt/{sha}-horizon-prebuilt-v30-x86_64-unknown-linux-gnu"), None),
-            (format!("native/prebuilt/{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu-server-server"), None),
-            (format!("native/prebuilt/{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu.tar.gz"), None),
-            (format!("native/prebuilt/not-{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu"), None),
+            (
+                format!("native/prebuilt/{sha}-horizon-prebuilt-v3-unknown-target"),
+                None,
+            ),
+            (
+                format!("native/prebuilt/{sha}-horizon-prebuilt-v4-unknown-target"),
+                None,
+            ),
+            (
+                format!("native/prebuilt/{sha}-horizon-prebuilt-v30-x86_64-unknown-linux-gnu"),
+                None,
+            ),
+            (
+                format!(
+                    "native/prebuilt/{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu-server-server"
+                ),
+                None,
+            ),
+            (
+                format!(
+                    "native/prebuilt/{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu.tar.gz"
+                ),
+                None,
+            ),
+            (
+                format!("native/prebuilt/not-{sha}-horizon-prebuilt-v4-x86_64-unknown-linux-gnu"),
+                None,
+            ),
             // A build's SDK slices, and a developer install's laid-out game.
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu"), Some(sha)),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu-server"), Some(sha)),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.developer"), Some(sha)),
+            (
+                format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu"),
+                Some(sha),
+            ),
+            (
+                format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu-server"),
+                Some(sha),
+            ),
+            (
+                format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.developer"),
+                Some(sha),
+            ),
             (format!("native/prebuilt/{sha}-unknown-target"), None),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.partial"), None),
+            (
+                format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.partial"),
+                None,
+            ),
             (
                 format!("native/internals-sync/catalog-{sha}-x86_64-unknown-linux-gnu"),
                 Some(sha),
@@ -932,10 +981,24 @@ mod eviction_tests {
         }
         // What an interrupted unpack or download left is known as such, and nothing else is.
         for (path, leftover) in [
-            (format!("native/prebuilt/.{sha}-horizon-prebuilt-v6-x86_64-unknown-linux-gnu.tar.gz.partial"), true),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.lock"), true),
-            ("native/prebuilt/runtime-x86_64-unknown-linux-gnu.tar.xz.download".to_owned(), true),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu"), false),
+            (
+                format!(
+                    "native/prebuilt/.{sha}-horizon-prebuilt-v6-x86_64-unknown-linux-gnu.tar.gz.partial"
+                ),
+                true,
+            ),
+            (
+                format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.lock"),
+                true,
+            ),
+            (
+                "native/prebuilt/runtime-x86_64-unknown-linux-gnu.tar.xz.download".to_owned(),
+                true,
+            ),
+            (
+                format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu"),
+                false,
+            ),
             (format!("native/source/{sha}.partial"), false),
         ] {
             let entry = Entry::fixed(&root, Path::new(&path), Category::BuildFiles).unwrap();
@@ -1002,12 +1065,14 @@ mod eviction_tests {
             ("versions/native-legacy", 4),
         ] {
             let file = home.seed(&format!("{folder}/payload"));
-            assert!(std::process::Command::new("fallocate")
-                .args(["-l", &format!("{gib}G")])
-                .arg(file)
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                std::process::Command::new("fallocate")
+                    .args(["-l", &format!("{gib}G")])
+                    .arg(file)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         assert_eq!(backend::data_dir().canonicalize().unwrap(), home.0);
         let leased = home.0.join("versions/native-leased");
@@ -1044,7 +1109,10 @@ mod eviction_tests {
             .map(|row| row.freed_bytes)
             .sum();
         let residual = allocated_bytes(&home.0).unwrap();
-        println!("allocated_before={before} inventoried_before={} freed={freed} allocated_residual={residual}", first.total_bytes);
+        println!(
+            "allocated_before={before} inventoried_before={} freed={freed} allocated_residual={residual}",
+            first.total_bytes
+        );
         assert!(before >= 40 * (1 << 30));
         assert!(freed >= 28 * (1 << 30));
         assert!(residual >= 12 * (1 << 30));
@@ -1052,10 +1120,11 @@ mod eviction_tests {
         assert!(leased.join("payload").exists());
         assert!(legacy.join("payload").exists());
         assert!(home.0.join("native/patched/proof/payload").exists());
-        assert!(second.rows.iter().any(|row| row
-            .kept
-            .iter()
-            .any(|kept| kept.bytes >= 4 * (1 << 30) && !kept.reason.is_empty())));
+        assert!(second.rows.iter().any(|row| {
+            row.kept
+                .iter()
+                .any(|kept| kept.bytes >= 4 * (1 << 30) && !kept.reason.is_empty())
+        }));
         assert!(matches!(Cache::acquire(&home.0), Err(Error::Busy)));
     }
 }

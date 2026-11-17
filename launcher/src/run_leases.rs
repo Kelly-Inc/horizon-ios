@@ -127,7 +127,7 @@ pub(crate) fn shared(command: &Command) -> Result<Vec<Claim>, Error> {
         for relative in [".horizon-cache", "wasm-cache", "cache"] {
             crate::storage::mark_used(&home.join(relative))?;
         }
-        use horizon_platform::mod_package::{mod_list, Package};
+        use horizon_platform::mod_package::{Package, mod_list};
         for folder in [mod_list::DIR, mod_list::NATIVE_DIR] {
             for path in horizon_platform::mod_package::find(&home.join(folder)) {
                 if let Ok(package) = Package::read(&path) {
@@ -212,6 +212,11 @@ const GAME: &str = "HORIZON_LAUNCHER_GAME_COMMAND";
 
 /// Preserve the engine-owned argument grammar before wrappers obscure it.
 pub(crate) fn snapshot(command: &mut Command) {
+    // Only Horizon's game ([`mark`]ed) has that grammar: Minecraft: Java Edition's arguments
+    // read as Horizon's fail to pair up (#17950).
+    if override_value(command, SOURCE).flatten().is_none() {
+        return;
+    }
     let words: Vec<_> = std::iter::once(command.get_program().to_owned())
         .chain(command.get_args().map(std::ffi::OsStr::to_owned))
         .collect();
@@ -545,8 +550,8 @@ pub(crate) fn publish_existing() -> Result<(), Error> {
 }
 
 /// Held from before an executable becomes visible through its completion publication.
-pub(crate) fn installation(
-) -> Result<horizon_platform::mod_package::runtime_leases::Publication, Error> {
+pub(crate) fn installation()
+-> Result<horizon_platform::mod_package::runtime_leases::Publication, Error> {
     use horizon_platform::mod_package::{
         locks::{LockMode, Release},
         runtime_leases::Registry,

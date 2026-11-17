@@ -6,6 +6,62 @@ use crate::{
 };
 
 #[test]
+fn command_tree_roots_and_references_must_name_real_nodes() {
+    let node = |kind: u8, children: Vec<i32>, redirect: Option<i32>| CommandNode {
+        kind,
+        executable: false,
+        restricted: false,
+        children,
+        redirect,
+        name: "x".into(),
+        parser: (kind == 2).then_some((0, Vec::new())),
+        suggestions: None,
+    };
+    let read = |nodes: Vec<CommandNode>, root| {
+        let mut w = Writer::new();
+        Commands::write(&Commands { nodes, root }, &mut w);
+        Commands::read(&mut Reader::new(&w.data))
+    };
+    assert!(read(Vec::new(), 0).is_err());
+    for root in [-1, 1, i32::MAX] {
+        assert!(read(vec![node(0, Vec::new(), None)], root).is_err());
+    }
+    for kind in [1, 2, 3] {
+        assert!(read(vec![node(kind, Vec::new(), None)], 0).is_err());
+    }
+    for missing in [-1, 2, i32::MAX] {
+        assert!(
+            read(
+                vec![node(0, vec![missing], None), node(1, Vec::new(), None)],
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            read(
+                vec![node(0, vec![1], None), node(1, Vec::new(), Some(missing))],
+                0
+            )
+            .is_err()
+        );
+    }
+    // The root need not be entry zero. Ordinary redirects back to it
+    // (execute ... run) remain valid; neither edge set is cyclic alone.
+    assert!(read(vec![node(1, Vec::new(), None), node(0, vec![0], None)], 1).is_ok());
+    assert!(
+        read(
+            vec![
+                node(0, vec![1], None),
+                node(1, vec![2], None),
+                node(1, Vec::new(), Some(0))
+            ],
+            0
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn a_command_tree_with_a_cycle_is_refused() {
     let node = |kind: u8, name: &str, children: Vec<i32>, redirect: Option<i32>| CommandNode {
         kind,
@@ -966,6 +1022,32 @@ fn move_entity_deltas_decode_like_vec_delta_codec() {
     assert_eq!(
         VecDelta::Stepped(vec![([4096, 0, 0], 1), ([4096, 0, 0], 2)]).end(base),
         [12.0, 64.0, -3.5]
+    );
+}
+
+#[test]
+fn move_entity_half_steps_follow_java_rounding() {
+    // Pinned 26.3 VecDeltaCodec.encode -> Java double rounding, checked
+    // against the actual private client JAR through a reflection oracle.
+    let unit = 1.0 / 4096.0;
+    assert_eq!(
+        VecDelta::apply([-0.5 * unit, -1.5 * unit, 0.5 * unit], [1; 3]),
+        [unit, 0.0, 2.0 * unit]
+    );
+    let below_half = f64::from_bits(0.5f64.to_bits() - 1) * unit;
+    assert_eq!(
+        VecDelta::apply([below_half, -below_half, 0.0], [1, 1, 0]),
+        [unit, unit, 0.0]
+    );
+    let base = [-0.5 * unit, 0.123_456_789, -1.5 * unit];
+    assert_eq!(
+        VecDelta::Stepped(vec![([0, 0, 0], 1), ([1, 0, 1], 2)]).end(base),
+        [unit, base[1], 0.0]
+    );
+    // Java's long addition wraps after its double-to-long rounding saturates.
+    assert_eq!(
+        VecDelta::apply([f64::INFINITY, f64::NEG_INFINITY, f64::NAN], [1, -1, 1]),
+        [i64::MIN as f64 * unit, i64::MAX as f64 * unit, unit]
     );
 }
 

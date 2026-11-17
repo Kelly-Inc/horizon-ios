@@ -74,7 +74,7 @@ fn checked_current_api_builds_post_tonemap_and_linear_variants() {
             Default::default(),
         )
         .unwrap();
-        assert_eq!(built.tonemaps(), tonemap);
+        assert_eq!(built.capabilities().tone_curve, tonemap);
         assert_eq!(labels, ["stage.wgsl"]);
     }
 

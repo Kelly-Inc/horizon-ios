@@ -4488,9 +4488,8 @@ impl Mob {
         visible: bool,
     ) -> bool {
         let effect = horizon_client_core::potions::namespaced(effect);
-        let mut incoming = crate::effects::EffectInstance::new(effect, ticks, amplifier);
-        incoming.ambient = ambient;
-        incoming.visible = visible;
+        let incoming = crate::effects::EffectInstance::new(effect, ticks, amplifier)
+            .with_flags(ambient, visible);
         self.add_effect_instance(effect, incoming)
     }
 
@@ -6029,7 +6028,10 @@ mod magic_absorb_tests {
         }
         assert_eq!(
             m.extra.effects,
-            vec![crate::mobs::StoredEffect::new("minecraft:speed", 3, 0)]
+            vec![crate::mobs::StoredEffect {
+                show_icon: false,
+                ..crate::mobs::StoredEffect::new("minecraft:speed", 3, 0)
+            }]
         );
         assert!(m.extra.ambient_effects.contains(&"minecraft:speed"));
         assert!(m.extra.hidden_effects.contains(&"minecraft:speed"));

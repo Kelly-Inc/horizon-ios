@@ -1,4 +1,5 @@
 # Prepared-data regressions retained by the mobile fork; selected explicitly by daily policy.
+horizon-client game::screens::tests::airplay_pause_icon_draws_when_hovered_or_keyboard_focused lib daily resources
 horizon-client game::agent::tests::crosshair_state_reports_boat_and_cart_targets_before_blocks lib daily resources
 horizon-client game::boats::native_move_threshold_tests::boat_position_threshold_keeps_residual_velocity_and_unblocked_tiny_moves lib daily resources
 horizon-client game::commands::data::retained_orb_uuid_tests::saved_orb_uuid_comes_from_registered_identity_without_or_despite_raw lib daily resources

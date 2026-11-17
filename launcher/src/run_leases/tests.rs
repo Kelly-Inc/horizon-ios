@@ -10,16 +10,20 @@ fn spawn_errors_distinguish_missing_working_directory_and_program() {
     let error = spawn_program(Command::new("/usr/bin/true").current_dir(&missing_cwd)).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert!(error.to_string().contains("working directory"));
-    assert!(error
-        .to_string()
-        .contains(&missing_cwd.display().to_string()));
+    assert!(
+        error
+            .to_string()
+            .contains(&missing_cwd.display().to_string())
+    );
     let missing_program = root.path().join("Application Support/missing-helper");
     let error = spawn_program(Command::new(&missing_program).current_dir(root.path())).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert!(error.to_string().contains("execute"));
-    assert!(error
-        .to_string()
-        .contains(&missing_program.display().to_string()));
+    assert!(
+        error
+            .to_string()
+            .contains(&missing_program.display().to_string())
+    );
 }
 
 #[test]
@@ -180,12 +184,14 @@ fn routed_lifetime(stop: bool) {
     fs::create_dir_all(&home).unwrap();
     fs::write(install.join(".installed"), b"").unwrap();
     // Copy from a separate process, avoiding a writable image fd in libtest's concurrent forks.
-    assert!(Command::new("cp")
-        .arg(std::env::current_exe().unwrap())
-        .arg(install.join("actor"))
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new("cp")
+            .arg(std::env::current_exe().unwrap())
+            .arg(install.join("actor"))
+            .status()
+            .unwrap()
+            .success()
+    );
     let mut supervisor = Actor(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "run_leases::tests::routing_actor", "--nocapture"])
@@ -338,6 +344,8 @@ fn data_directory_leaf_never_leases_ancestors_outside_data() {
     if let Some(root) = std::env::var_os(ENV) {
         let data = std::path::PathBuf::from(root).join("data");
         fs::create_dir_all(&data).unwrap();
+        // Registry entry consumes an authoritative path; shared() resolves the same root.
+        let data = data.canonicalize().unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command.current_dir(&data).env("HORIZON_HOME", &data);
         let _claims = shared(&command).unwrap();
@@ -350,16 +358,50 @@ fn data_directory_leaf_never_leases_ancestors_outside_data() {
         return;
     }
     let root = tempfile::tempdir().unwrap();
-    assert!(Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "run_leases::tests::data_directory_leaf_never_leases_ancestors_outside_data"
-        ])
-        .env(ENV, root.path())
-        .env("HORIZON_LAUNCHER_HOME", root.path().join("data"))
-        .env("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1")
-        .env("HORIZON_NO_AUDIO", "1")
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run_leases::tests::data_directory_leaf_never_leases_ancestors_outside_data"
+            ])
+            .env(ENV, root.path())
+            .env("HORIZON_LAUNCHER_HOME", root.path().join("data"))
+            .env("HORIZON_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("HORIZON_NO_AUDIO", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn a_java_editions_command_is_not_read_as_horizons() {
+    // Minecraft: Java Edition's command, as `backend::java_game` gives it (#17950): Horizon's
+    // option grammar pairs it up and finds `release` with no value.
+    let root = tempfile::tempdir().unwrap();
+    let mut java = Command::new("java");
+    java.args([
+        "-Xmx2G",
+        "-Djava.library.path=natives",
+        "-cp",
+        "client.jar",
+        "net.minecraft.client.main.Main",
+        "--username",
+        "Steve",
+        "--versionType",
+        "release",
+    ])
+    .current_dir(root.path())
+    .env("HORIZON_HOME", root.path().join("logs"));
+    let java = crate::launch::wrap(java, &crate::launch::Launch::default());
+    shared(&java)
+        .map_err(crate::native_mods::cache_error)
+        .unwrap();
+    assert!(override_value(&java, GAME).is_none());
+    // Horizon's own game keeps the command its leases are read from.
+    let mut game = Command::new(root.path().join("horizon-client"));
+    game.current_dir(root.path());
+    mark(&mut game, root.path());
+    let game = crate::launch::wrap(game, &crate::launch::Launch::default());
+    assert!(override_value(&game, GAME).is_some());
 }

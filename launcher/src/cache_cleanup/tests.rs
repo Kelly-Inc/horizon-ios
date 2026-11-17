@@ -50,11 +50,13 @@ fn late_cargo_is_refused_before_removal_and_can_start_after_completion() {
     plan.clear_observed(&directory, &|_| {}, &|| {
         if !output.exists() {
             assert!(matches!(held.try_lock(), Err(fs::TryLockError::WouldBlock)));
-            assert!(fs::read_dir(&home.0).unwrap().any(|entry| entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".trash-")));
+            assert!(fs::read_dir(&home.0).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".trash-")
+            }));
         }
     })
     .unwrap();
@@ -85,11 +87,13 @@ fn swapped_directory_and_file_links_never_delete_external_data() {
     std::os::unix::fs::symlink(&precious, &selected).unwrap();
     assert!(plan.clear(&directory).is_err());
     assert_eq!(fs::read(precious).unwrap(), b"old compiler output");
-    assert!(selected
-        .symlink_metadata()
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        selected
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]

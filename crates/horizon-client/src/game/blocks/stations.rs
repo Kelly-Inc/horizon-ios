@@ -1948,25 +1948,17 @@ impl Game<'_> {
             push(&mut lines, text, c);
         }
         details.end(lines.len());
-        let max_damage = stack.max_damage(item_info);
-        let damage = stack.effective_damage(item_info);
         if display.shows("minecraft:damage")
-            && max_damage > 0
-            && damage > 0
-            && stack
-                .data()
-                .is_none_or(|d| d.other("minecraft:unbreakable").is_none())
             && advanced
+            && let Some((left, max)) = stations::durability(self.items(), stack)
         {
             // `item.durability`, in the selected language.
             lines.push((
                 horizon_client::text::Text::translate(
                     "item.durability",
                     &[
-                        horizon_client::text::Text::literal(
-                            max_damage.saturating_sub(damage).to_string(),
-                        ),
-                        horizon_client::text::Text::literal(max_damage.to_string()),
+                        horizon_client::text::Text::literal(left.to_string()),
+                        horizon_client::text::Text::literal(max.to_string()),
                     ],
                 ),
                 u32::MAX,

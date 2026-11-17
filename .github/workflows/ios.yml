@@ -80,7 +80,9 @@ jobs:
             --expect-commit "$GITHUB_SHA" --client-id "$HORIZON_MSA_CLIENT_ID"
           rm -rf game-xcode && mkdir -p game-xcode/Payload
           cp -a build-ios/HorizonGame.app game-xcode/Payload/
-          ( cd game-xcode && zip -qry ../Horizon-game-unsigned.ipa Payload )
+          # Zip updates an existing archive in place, retaining files removed since the last build.
+          ( cd game-xcode && zip -qry Horizon-game-unsigned.ipa Payload )
+          mv -f game-xcode/Horizon-game-unsigned.ipa Horizon-game-unsigned.ipa
       - name: Preserve the Xcode failure log
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

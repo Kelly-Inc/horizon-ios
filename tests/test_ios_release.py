@@ -3,6 +3,7 @@ import importlib.util
 import io
 import os
 import plistlib
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -169,6 +170,49 @@ class IOSReleaseTests(unittest.TestCase):
                             release.audit(ipa, SHA, **options)
                     else:
                         self.assertEqual(release.audit(ipa, SHA, **options), (version, build))
+
+    def packaging_command(self):
+        jobs = yaml.safe_load((ROOT / ".github/workflows/ios.yml").read_text())["jobs"]
+        bundle = next(step["run"] for step in jobs["ipa"]["steps"] if step.get("name") == "Bundle it")
+        return bundle[bundle.index("rm -rf game-xcode"):]
+
+    @unittest.skipUnless(shutil.which("zip"), "requires the workflow's zip command")
+    def test_repackaging_replaces_the_archive_without_stale_members(self):
+        package = self.packaging_command()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "build-ios/HorizonGame.app"
+            app.mkdir(parents=True)
+            current = app / "Current.txt"
+            removed = app / "Old.txt"
+            current.write_text("first build")
+            removed.write_text("first build only")
+            subprocess.run(["bash", "-ec", package], cwd=root, check=True)
+            removed.unlink()
+            current.write_text("second build")
+            subprocess.run(["bash", "-ec", package], cwd=root, check=True)
+            with zipfile.ZipFile(root / "Horizon-game-unsigned.ipa") as archive:
+                self.assertEqual(archive.read("Payload/HorizonGame.app/Current.txt"), b"second build")
+                self.assertNotIn("Payload/HorizonGame.app/Old.txt", archive.namelist())
+
+    @unittest.skipUnless(shutil.which("zip"), "requires the workflow's zip command")
+    def test_failed_repackaging_does_not_replace_the_previous_archive(self):
+        package = self.packaging_command()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "build-ios/HorizonGame.app"
+            app.mkdir(parents=True)
+            (app / "Current.txt").write_text("first build")
+            subprocess.run(["bash", "-ec", package], cwd=root, check=True)
+            output = root / "Horizon-game-unsigned.ipa"
+            previous = output.read_bytes()
+            mock_zip = root / "zip"
+            mock_zip.write_text('#!/bin/sh\nprintf incomplete > "$2"\nexit 1\n')
+            mock_zip.chmod(0o755)
+            result = subprocess.run(["bash", "-ec", package], cwd=root,
+                                    env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"]))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output.read_bytes(), previous)
 
     def test_stamp_updates_app_and_framework_preserving_other_fields(self):
         with tempfile.TemporaryDirectory() as directory:

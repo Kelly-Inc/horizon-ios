@@ -3,7 +3,7 @@
 The current app is the `HorizonGame` target: the `horizon-official` Rust executable plus
 `HorizonLauncherKit`, the native Swift launcher. The authoritative build and artifact audit
 steps are in [the iOS workflow](../../.github/workflows/ios.yml). It uploads the
-`horizon-ios-game` artifact containing `Horizon-game-unsigned.ipa`.
+`horizon-ios-game-<attempt>` artifact containing `Horizon-game-unsigned.ipa`.
 
 Use the workflow’s `Build the game` and `Bundle it` steps together to reproduce the
 current distributable. The old shell target is retained for diagnostics only.
@@ -28,10 +28,10 @@ HORIZON_GAME_PREBUILT=1 xcodebuild -project packaging/ios/HorizonIOS.xcodeproj \
   CONFIGURATION_BUILD_DIR="$PWD/build-ios" build
 ```
 
-Use the workflow's stamping, packaging and audit steps before distributing an IPA;
-the raw Xcode output above has not had its release version and source identity stamped.
-Microsoft sign-in configuration must agree in the Rust executable and native launcher;
-the workflow supplies `HORIZON_MSA_CLIENT_ID` to both.
+Use the workflow's stamping, packaging and audit steps before distributing an IPA. The
+stamping step records the release version and source commit. The workflow supplies
+`HORIZON_MSA_CLIENT_ID` when compiling Rust and writes the same ID to the app's Info.plist.
+For a custom client ID, use it in both steps.
 
 An unsigned IPA needs signing before installation. For a development install, open
 `packaging/ios/HorizonIOS.xcodeproj`, select the **Horizon game** scheme and set a
@@ -61,8 +61,10 @@ each, so nothing in the render path has to care.
 
 - It works in `$HOME/Documents`, which on iOS is the app's data container (`entry.rs` `into_app_sandbox`). Saves
   land in `Documents/saves`, settings in `Documents/options.txt`, pack caches in `Documents/.horizon-cache`.
-- The log is `Library/Application Support/horizon/logs/latest.log` -- the container Xcode's *Devices and
-  Simulators* window downloads, and the way to read what happened when nothing appeared.
+- To save launcher and game diagnostics from the device, open **Settings**, scroll to
+  **Logs**, and choose **Export log file**. The launcher opens Files so you can save a copy.
+  Developers can also use Xcode's **Devices and Simulators** window to download the app container
+  and read `Library/Application Support/horizon/logs/latest.log`.
 - `Options::read` looks for `horizon-resources.json` in three places, in this order: a `resources` folder
   **beside the executable**, which on a phone means inside the bundle; then `Documents/resources`, which is
   where an import unpacks; then `Documents/.local/horizon-client/26.3`, the desktop fallback, which the Files
@@ -81,7 +83,8 @@ A published `.ipa` carries no assets: `horizon-resources.json` in a bundle is a 
 `.github/workflows/ios.yml`, and the bundle a phone installs is read-only while the game runs anyway. So the
 native launcher can download a prepared archive from the configured source, accept a
 custom download link, or import a ZIP through Files. Preparation of raw Java files
-runs off-device. The shared game's recovery import screen also supports the routes below.
+runs on a computer. Use **Reinstall game files** when the engine rejects an existing
+installation. The shared game's recovery screen also supports the routes below.
 
 On the computer, with the same `horizon-client` a player already has:
 
@@ -174,18 +177,20 @@ resources, and `tools/ci/ios_release.py` stamps and audits the final app and IPA
 A successful trusted `main` push publishes a regular release containing an unsigned IPA
 and its `.sha256` checksum. `tools/ci/publish-ios-release.sh` explicitly clears the
 prerelease flag and only updates a tag whose source commit matches the build.
-The app's build number is the workflow run number and attempt (for example `42.1`),
-and its source commit is recorded in `Info.plist`. Release tags use `ios-build-42.1`;
-assets are named `Horizon-iOS-<version>-build42.1-unsigned.ipa`.
+The app's build number is `<run>.<attempt>`. Its source commit is recorded in
+`Info.plist`. Release tags use `ios-build-<run>.<attempt>` and assets use
+`Horizon-iOS-<version>-build<run>.<attempt>-unsigned.ipa`.
 
 PRs and fork builds only upload temporary Actions artifacts. A manual run on `main`
 can publish by selecting **publish_release**; other manual runs remain artifact-only.
-The publishing job alone receives `contents: write`, uses the same successful run's
-artifact, verifies its source commit, and audits every Mach-O binary for signatures.
-It also rejects provisioning profiles, certificates, private files and prepared game
-data. No extra publishing token or signing certificate is required.
+The publishing job receives `contents: write` and retrieves the successful build's
+artifact by ID. The audit verifies its source commit, launcher framework, client ID,
+and configured minimum iOS version. It also checks each bundled Mach-O for the iOS
+device target and absence of signatures, and rejects signing material, private files,
+and prepared game data.
 
-Files upload to a draft release before it becomes public. A release-only retry can
-resume a partial draft, but cannot overwrite a published build or reuse a tag pointing
-at another commit. Downloaded IPAs still need the user's own signing method before
-installation. Only the newest eligible release is marked as `latest`; retries of older builds cannot replace it.
+The job verifies the GitHub asset digests for the IPA and its checksum before making
+a draft public. A release-only retry can resume a partial upload for the same build.
+The release job compares an existing tag to the build commit before uploading and
+again before publishing. It marks only the newest eligible release as `latest`.
+Downloaded IPAs need signing before installation.

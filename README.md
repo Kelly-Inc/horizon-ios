@@ -42,7 +42,7 @@ The deployment target is **iOS/iPadOS 16.0 or later** on ARM64 devices. That is 
 
 Online mode servers require a Microsoft account that owns Minecraft: Java Edition, with multiplayer permitted for that account.
 
-Prepared game files come from the [download source configured in the build](crates/horizon-client/src/import/download.rs). If automatic setup fails, **Settings → Game files** provides a retry and a custom download-link option for a prepared ZIP. See [resource preparation](docs/native-client.md) for the upstream preparation workflow.
+The mobile launcher downloads a prepared ZIP from the [source configured in the build](crates/horizon-client/src/import/download.rs). If setup fails, **Settings → Game files** offers a retry and a custom link for a prepared ZIP. If the engine rejects installed files, choose **Reinstall game files**. Microsoft sign-in on iOS sets up your game session. To download from Mojang and prepare files, use the desktop launcher and then [transfer the prepared ZIP](docs/native-client.md#carry-your-game-files-to-a-phone).
 
 ## Resource packs and shaders
 

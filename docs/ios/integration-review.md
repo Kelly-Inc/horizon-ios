@@ -6,7 +6,8 @@ This is a broad integration because the native branch also carries upstream engi
 
 The launcher has three native destinations: Play, Packs and Settings. Worlds and Servers remain available through Minecraft's menus. Its account control is circular, Microsoft profile names are read-only, and the option controls operate before game resources are installed. Pack mutations, searches, archive replacement and account handover guard asynchronous completion and surface failures.
 
-No signing material, prepared resources or session credentials belong to this change. The native `HorizonMSAClientID` is empty in source; the iOS workflow fills it from the `HORIZON_MSA_CLIENT_ID` repository variable. A client ID already present in the fork's Rust Microsoft implementation is not changed here.
+For the current mobile client ID and release configuration, see
+[Microsoft authentication](../microsoft-account.md) and [iOS packaging](../../packaging/ios/README.md).
 
 ## Review and verification boundaries
 

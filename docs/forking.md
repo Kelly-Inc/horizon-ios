@@ -49,6 +49,9 @@ gate guards.
 
 ## Microsoft sign-in in a fork
 
+This section records upstream Horizon's guidance for other distributors. For the
+current mobile build configuration, see [Microsoft authentication](microsoft-account.md).
+
 Horizon's Microsoft sign-in runs under one Azure app registration, whose client ID release builds
 read from the repository variable `HORIZON_MSA_CLIENT_ID` (docs/microsoft-account.md). That
 registration, and Mojang's approval of it for the Minecraft services, are for Horizon's own builds
@@ -63,6 +66,3 @@ only. They do not pass to forks, ports or derived launchers, whatever their lice
   Horizon's client ID.
 - Horizon may restrict, rotate or revoke its client ID at any time, which breaks every build that
   uses it, and reports misuse to Microsoft, Mojang and the hosting platform.
-
-A build made from source without a client ID of its own says that sign-in is not configured; that is
-the expected state for a fork until its own app is approved.

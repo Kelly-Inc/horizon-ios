@@ -24,22 +24,20 @@ creating the game window and uses scene callbacks for activation, focus, and occ
 
 ## Launcher and Microsoft sign-in
 
-The bundled launcher is enabled. Quit Game at the title reopens it, and the Play and Servers
-pages expose the account card. iPad launcher presentation supports landscape. The game skips
-covered rendering while continuing to poll the launcher bridge.
+Open the account button on the launcher to add or switch Microsoft accounts, use the offline
+profile, or edit the offline name. Open local worlds and multiplayer servers from the game's title
+screen. **Quit Game** returns to the launcher. The iPad launcher supports landscape.
 
 Sign-in uses Microsoft's device authorization flow, followed by Xbox Live, XSTS, Minecraft
-entitlement and profile checks. Secrets remain in Keychain and the game receives the session
-in memory. Sign-out/cancellation invalidates pending credential writes; a failed Keychain write
-must not publish a signed-in profile. Token renewal does not recursively call handover.
+entitlement and profile checks. The launcher stores credentials separately for each profile
+in Keychain. Play refreshes an expired session for the selected account and waits for the game
+to accept it. If Microsoft requires sign-in again, the saved profile stays in the account list.
 
-`HorizonMSAClientID` is intentionally empty in source control. A distributor must configure its
-own personal-account public-client registration and obtain any required Minecraft API approval.
-The iOS workflow fills the value from repository variable `HORIZON_MSA_CLIENT_ID`; a local build
-can configure its own public client ID before packaging. No client secret belongs in this app.
-See [the account design and setup guide](microsoft-account.md) and
+The mobile workflow supplies the public Horizon application ID through `HORIZON_MSA_CLIENT_ID`
+and stamps `HorizonMSAClientID` into the app's Info.plist. For a custom build, use the same public
+client ID in the Rust executable and the app plist. The native account sheet reads the plist value.
+See [Microsoft account configuration](microsoft-account.md) and
 [Microsoft's device authorization documentation](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).
-An Entra registration alone is not proof that Minecraft Services accepts the application.
 
 ## Server resource packs and item tooltips
 

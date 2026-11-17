@@ -346,6 +346,33 @@ final class FormattingTests: XCTestCase {
         XCTAssertTrue(current.contains(marker), "Export must retain the newest error, not truncate it to fit headers")
     }
 
+    func testLauncherRotationKeepsUsefulEntriesAroundAnOldSensitiveMessage() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let current = root.appendingPathComponent("launcher.log")
+        let previous = root.appendingPathComponent("launcher-previous.log")
+        let old = """
+        2026-11-17T12:00:00Z First shader failure
+        2026-11-17T12:00:01Z access_token:
+        short-fixture-value
+        2026-11-17T12:00:02Z Last shader failure
+        """ + "\n"
+        let filler = String(repeating: "x", count: Diagnostics.limit - old.utf8.count - 1)
+        try Data((filler + "\n" + old).utf8).write(to: current)
+
+        Diagnostics.record("New launch", folder: root)
+        let rotated = try String(contentsOf: previous, encoding: .utf8)
+        let next = try String(contentsOf: current, encoding: .utf8)
+        XCTAssertTrue(rotated.contains("[oversized log line omitted]"))
+        XCTAssertTrue(rotated.contains("First shader failure"))
+        XCTAssertTrue(rotated.contains("Last shader failure"))
+        XCTAssertFalse(rotated.contains("short-fixture-value"))
+        XCTAssertTrue(next.contains("New launch"))
+        XCTAssertFalse(next.contains("Last shader failure"))
+        XCTAssertLessThanOrEqual(rotated.utf8.count, Diagnostics.limit)
+    }
+
     func testDiagnosticsExportKeepsReadableLogsWhenAnotherLogCannotBeOpened() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

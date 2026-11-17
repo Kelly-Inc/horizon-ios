@@ -4,6 +4,7 @@ import UIKit
 /// Only diagnostic text is exported; never account stores, options or game data.
 enum Diagnostics {
     static let limit = 1024 * 1024
+    private static let entryLimit = 32 * 1024
     private static let lock = NSLock()
     static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -15,6 +16,7 @@ enum Diagnostics {
         entryStart?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
     }
     static func redact(_ text: String) -> String {
+        guard text.utf8.count <= entryLimit else { return "[oversized log entry omitted]" }
         let sensitive = ["accesstoken", "refreshtoken", "idtoken", "token =", "token :", "user code", "access_token", "refresh_token", "id_token", "token:", "token=", "token\"", "authorization", "bearer", "password", "secret", "cookie", "xbl3.0", "device_code", "user_code", "sessionid", "session_id", "api_key", "accesskey"]
         if sensitive.contains(where: {text.lowercased().contains($0)}) {return "[redacted sensitive log message]"}
         return text.components(separatedBy: .newlines).map { line in
@@ -41,13 +43,14 @@ enum Diagnostics {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let current = folder.appendingPathComponent("launcher.log")
             let previous = folder.appendingPathComponent("launcher-previous.log")
-            let data = bounded("\(ISO8601DateFormatter().string(from: Date())) \(redact(message))\n", maximum: 32 * 1024)
+            let data = bounded("\(ISO8601DateFormatter().string(from: Date())) \(redact(message))\n", maximum: entryLimit)
             if !FileManager.default.fileExists(atPath: current.path) { try Data().write(to: current) }
             let size = (try current.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
             if size + data.count > limit {
                 let tail = try read(current)
-                try bounded(redact(tail)).write(to: previous, options: .atomic)
-                try Data().write(to: current)
+                try bounded(redactExport(tail)).write(to: previous, options: .atomic)
+                try data.write(to: current, options: .atomic)
+                return
             }
             let file = try FileHandle(forWritingTo: current);defer {try? file.close()}
             try file.seekToEnd();try file.write(contentsOf: data)
@@ -68,11 +71,16 @@ enum Diagnostics {
     static func redactExport(_ text:String) -> String {
         var hidingContinuation = false
         return text.components(separatedBy:.newlines).map { line in
+            if line.utf8.count > entryLimit {
+                hidingContinuation = true
+                return "[oversized log line omitted]"
+            }
             // Rust entries start with [time]; launcher entries start with an ISO date.
             if beginsEntry(line) {hidingContinuation = false}
+            if hidingContinuation { return "[redacted continuation]" }
             let safe = redact(line)
-            if safe == "[redacted sensitive log message]" {hidingContinuation = true;return safe}
-            return hidingContinuation ? "[redacted continuation]" : safe
+            if safe == "[redacted sensitive log message]" { hidingContinuation = true }
+            return safe
         }.joined(separator:"\n")
     }
 
@@ -94,7 +102,7 @@ enum Diagnostics {
             guard try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else {
                 return unavailable
             }
-            return redactExport(try read(url))
+            return try read(url)
         } catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {
             return "No log recorded yet.\n"
         } catch {
@@ -103,21 +111,37 @@ enum Diagnostics {
         }
     }
 
+    private static func launcherSnapshots(_ folder: URL) -> (previous: String, current: String) {
+        // Capture both files under the writer lock so a rotation cannot split
+        // the snapshot. Redaction and formatting happen after releasing it.
+        lock.lock()
+        defer { lock.unlock() }
+        return (
+            exportSnapshot(folder.appendingPathComponent("launcher-previous.log")),
+            exportSnapshot(folder.appendingPathComponent("launcher.log"))
+        )
+    }
+
     static func export(folder: URL = directory, gameFolder: URL? = nil) throws -> URL {
-        // Export reads bounded snapshots without holding the launcher writer lock.
         let fm = FileManager.default
         let exportDir = folder.appendingPathComponent("Export", isDirectory: true)
         try fm.createDirectory(at: exportDir, withIntermediateDirectories: true)
         let destination = exportDir.appendingPathComponent("Horizon-diagnostics.txt")
         var output = "Horizon mobile diagnostics\nVersion: \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "unknown") Build: \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") ?? "unknown")\niOS: \(ProcessInfo.processInfo.operatingSystemVersionString)\nSensitive lines and common identifiers are redacted. Review before sharing.\n"
         let gameHome = gameFolder ?? ProcessInfo.processInfo.environment["HORIZON_HOME"].map {URL(fileURLWithPath:$0)} ?? fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("horizon")
-        let entries = [("Launcher previous",folder.appendingPathComponent("launcher-previous.log")),("Launcher current",folder.appendingPathComponent("launcher.log")),("Game previous",gameHome.appendingPathComponent("logs/previous.log")),("Game current",gameHome.appendingPathComponent("logs/latest.log"))]
+        let launcher = launcherSnapshots(folder)
+        let entries = [
+            ("Launcher previous", launcher.previous),
+            ("Launcher current", launcher.current),
+            ("Game previous", exportSnapshot(gameHome.appendingPathComponent("logs/previous.log"))),
+            ("Game current", exportSnapshot(gameHome.appendingPathComponent("logs/latest.log"))),
+        ]
         let headings = entries.map { "\n--- \($0.0) ---\n" }
         let overhead = output.utf8.count + headings.reduce(0) { $0 + $1.utf8.count }
         let budget = max(0, 4 * limit - overhead) / entries.count
         for (index, entry) in entries.enumerated() {
             output += headings[index]
-            output += exportTail(exportSnapshot(entry.1), maximum: budget)
+            output += exportTail(redactExport(entry.1), maximum: budget)
         }
         try bounded(output, maximum: 4 * limit).write(to:destination,options:.atomic)
         return destination

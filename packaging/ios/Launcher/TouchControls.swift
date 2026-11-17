@@ -406,7 +406,11 @@ private struct TouchLayoutEditor: View {
                             .zIndex(selected == button ? 1 : 0)
                             .accessibilityLabel(button.title)
                             .accessibilityIdentifier("touch-layout-\(button.rawValue)")
-                            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                            .onTapGesture {
+                                selected = button
+                                dragStart = nil
+                            }
+                            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .named("touch-layout-canvas")).onChanged { value in
                                 if selected != button || dragStart == nil {
                                     selected = button; dragStart = CGPoint(x: r.midX, y: r.midY)
                                 }
@@ -436,7 +440,7 @@ private struct TouchLayoutEditor: View {
                         .contentShape(Rectangle())
                         .accessibilityLabel("Move editing toolbar")
                         .accessibilityIdentifier("touch-toolbar-handle")
-                        .gesture(DragGesture().onChanged { value in
+                        .gesture(DragGesture(coordinateSpace: .named("touch-layout-canvas")).onChanged { value in
                             let origin = toolbarStart ?? toolbarCentre ?? CGPoint(x: width / 2, y: height / 2)
                             toolbarStart = origin
                             toolbarCentre = CGPoint(
@@ -484,7 +488,12 @@ private struct TouchLayoutEditor: View {
             }
             .frame(width: width, height: height)
             .coordinateSpace(name: "touch-layout-canvas")
-            .onChange(of: geometry.size) { _ in toolbarCentre = nil; toolbarStart = nil }
+            .onChange(of: geometry.size) { _ in
+                toolbarCentre = nil
+                toolbarStart = nil
+                dragStart = nil
+                pinchScale = 1
+            }
         }
         .ignoresSafeArea()
         .background(Color.black)

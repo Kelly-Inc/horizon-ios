@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 
 final class LauncherLayoutTests: XCTestCase {
     private func launch(signedIn: Bool, optionsResponse: String? = nil, gameFilesURL: String? = nil, holdImport: Bool = false) -> XCUIApplication {
@@ -115,10 +116,18 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertFalse(output.label.contains("1:3:-1"),"Custom controls must not also generate surface clicks")
     }
 
-    func testTouchEditorLandscapeSaveCancelResetAndPortraitReturn() {
-        XCUIDevice.shared.orientation = .portrait
+    func testTouchEditorLandscapeSaveCancelResetAndOrientationReturn() {
+        let onPad = UIDevice.current.userInterfaceIdiom == .pad
+        XCUIDevice.shared.orientation = onPad ? .landscapeLeft : .portrait
         let app = launch(signedIn: false)
-        app.tabBars.buttons["Settings"].tap()
+        let settings = app.buttons.matching(NSPredicate(
+            format: "identifier == %@ OR label == %@", "launcher-nav-settings", "Settings"
+        )).firstMatch
+        guard settings.waitForExistence(timeout: 5) else {
+            XCTFail("Settings was unavailable. \(app.debugDescription)")
+            return
+        }
+        settings.tap()
         let edit = app.buttons["touch-edit-layout"]
         XCTAssertTrue(edit.waitForExistence(timeout: 5)); edit.tap()
         let save = app.buttons["touch-editor-save"]
@@ -133,6 +142,9 @@ final class LauncherLayoutTests: XCTestCase {
         app.buttons["touch-editor-reset"].tap()
         app.buttons["Reset Layout"].tap()
         let original = jump.frame
+        jump.tap()
+        XCTAssertTrue(app.buttons["touch-editor-select"].label.contains("Jump"))
+        XCTAssertEqual(jump.frame, original)
         let editorShot = XCTAttachment(screenshot: app.screenshot()); editorShot.name = "Landscape touch editor"; editorShot.lifetime = .keepAlways; add(editorShot)
         let target = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.72, dy: 0.72))
         jump.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).press(forDuration: 0.1, thenDragTo: target)
@@ -141,7 +153,7 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertTrue(edit.waitForExistence(timeout: 5))
         expectation(for: NSPredicate { _, _ in
             let frame = app.windows.firstMatch.frame
-            return frame.height > frame.width
+            return onPad ? frame.width > frame.height : frame.height > frame.width
         }, evaluatedWith: app)
         waitForExpectations(timeout: 5)
         edit.tap(); XCTAssertTrue(save.waitForExistence(timeout: 5))

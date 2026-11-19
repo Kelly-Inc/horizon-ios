@@ -332,6 +332,9 @@ impl Title {
                         &lang::get_or("gui.done", "Done"),
                         true,
                         41,
+                    ),
+                ]
+            }
             Mode::WorldRequest { .. } => {
                 let area = world_request_layout((w, h));
                 vec![

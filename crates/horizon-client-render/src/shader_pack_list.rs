@@ -36,11 +36,9 @@ pub struct Entry {
 
 impl Entry {
     /// Saves the player's option values, for the pack in the folder `dir`.
-    pub fn save_values(&self, dir: &Path) {
+    pub fn save_values(&self, dir: &Path) -> std::io::Result<()> {
         let path = values_pack(&dir.join(&self.file), &self.key);
-        if let Err(e) = save_values(&path, &self.options, &self.values) {
-            log::warn!("shader pack options of {}: {e}", self.file);
-        }
+        save_values(&path, &self.options, &self.values)
     }
 
     /// The option `i` one value on (`back`: one before), or at its default (`reset`). Whether
@@ -201,7 +199,10 @@ pub fn resolve(dir: &Path, picked: &str) -> (String, PathBuf) {
             if dir.join(picked).exists() {
                 return None;
             }
-            let stem = picked.strip_suffix(".hshader")?;
+            let (stem, extension) = picked.rsplit_once('.')?;
+            if !extension.eq_ignore_ascii_case(horizon_shader_api::package::EXTENSION) {
+                return None;
+            }
             native
                 .iter()
                 .find(|(_, m)| {
@@ -286,7 +287,10 @@ pub fn load_values(pack: &Path, options: &[PackOption]) -> Vec<f64> {
     let saved: std::collections::HashMap<&str, f64> = text
         .lines()
         .filter_map(|l| l.split_once('='))
-        .filter_map(|(k, v)| Some((k.trim(), v.trim().parse().ok()?)))
+        .filter_map(|(k, v)| {
+            let value: f64 = v.trim().parse().ok()?;
+            value.is_finite().then_some((k.trim(), value))
+        })
         .collect();
     options
         .iter()
@@ -310,7 +314,7 @@ fn save_values(pack: &Path, options: &[PackOption], values: &[f64]) -> std::io::
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, text)
+    crate::config_file::write_atomic(&path, text.as_bytes())
 }
 
 fn clamp(kind: &OptionKind, v: f64) -> f64 {
@@ -328,15 +332,21 @@ fn step_value(kind: &OptionKind, v: f64, back: bool) -> f64 {
     match kind {
         OptionKind::Bool { .. } => f64::from(u8::from(v == 0.0)),
         OptionKind::Float { min, max, step, .. } => {
+            let last = float_steps(*min, *max, *step).max(1.0);
             let (min, max, step) = (f64::from(*min), f64::from(*max), f64::from(*step));
-            if !back && v >= max - step * 0.01 {
+            if !back && v >= max {
                 min
-            } else if back && v <= min + step * 0.01 {
+            } else if back && v <= min {
                 max
             } else {
-                // On the grid of steps from the minimum, so float error never piles up.
-                let n = ((v - min) / step).round() + dir;
-                (min + n * step).clamp(min, max)
+                // The final stop can be closer to the previous stop than one
+                // step. Give it its own index instead of rounding it down.
+                let stop = if v >= max {
+                    last
+                } else {
+                    ((v - min) / step).round()
+                };
+                float_stop_value(min, max, step, stop + dir, last)
             }
         }
         OptionKind::Int { min, max, .. } => {
@@ -393,18 +403,37 @@ fn slider_position(kind: &OptionKind, v: f64) -> Option<f32> {
 /// minimum (the last one the maximum, when the range isn't a whole number of steps), an int
 /// whole.
 fn slider_value(kind: &OptionKind, at: f32) -> Option<f64> {
+    if !at.is_finite() {
+        return None;
+    }
     let at = f64::from(at.clamp(0.0, 1.0));
     match kind {
         OptionKind::Float { min, max, step, .. } => {
             let steps = float_steps(*min, *max, *step);
             let (min, max, step) = (f64::from(*min), f64::from(*max), f64::from(*step));
-            Some(on_f32((min + (at * steps).round() * step).min(max)))
+            Some(float_stop_value(
+                min,
+                max,
+                step,
+                (at * steps).round(),
+                steps,
+            ))
         }
         OptionKind::Int { min, max, .. } => {
             let (min, max) = (f64::from(*min), f64::from(*max));
             Some((min + at * (max - min)).round())
         }
         _ => None,
+    }
+}
+
+/// The final stop is the declared maximum, even if rounding slack made
+/// the step grid end a little below it.
+fn float_stop_value(min: f64, max: f64, step: f64, stop: f64, last: f64) -> f64 {
+    if stop >= last {
+        max
+    } else {
+        on_f32((min + stop * step).clamp(min, max))
     }
 }
 
@@ -502,13 +531,13 @@ mod tests {
         );
         let mut entry = scan(&packs).remove(0);
         entry.values[0] = 0.5;
-        entry.save_values(&packs);
+        entry.save_values(&packs).unwrap();
         assert_eq!(
             load_values(&native_values_pack(&path, &manifest.id), &manifest.options),
             [0.5]
         );
         entry.reset_options();
-        entry.save_values(&packs);
+        entry.save_values(&packs).unwrap();
         assert_eq!(scan(&packs)[0].values, [1.0]);
         assert_eq!(
             std::fs::read_to_string(packs.join("warm-1.hshader.txt")).unwrap(),
@@ -574,13 +603,13 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        install(&dir, "z.hshader", "newest");
+        install(&dir, "z.HSHADER", "newest");
         install(&dir, "a.hshader", "oldest");
-        std::fs::write(dir.join("warm-previous.hshader.txt"), "strength=2\n").unwrap();
-        let (key, path) = resolve(&dir, "warm-previous.hshader");
+        std::fs::write(dir.join("warm-previous.HSHADER.txt"), "strength=2\n").unwrap();
+        let (key, path) = resolve(&dir, "warm-previous.HSHADER");
         assert_eq!(key, "horizon:warm");
         assert_eq!(path, dir.join("a.hshader"));
-        assert_eq!(resolve(&dir, "z.hshader"), (key.clone(), path));
+        assert_eq!(resolve(&dir, "z.HSHADER"), (key.clone(), path));
         assert_eq!(scan(&dir).len(), 1);
         assert_eq!(scan(&dir)[0].values, [2.0]);
         // A classic folder named like a native ID keeps its filename identity.
@@ -670,10 +699,78 @@ mod tests {
         assert_eq!(text, "b=2\n");
         std::fs::write(values_path(&pack), "a=9\nb=1\nzzz=4\n").unwrap();
         assert_eq!(load_values(&pack, &options), [2.0, 1.0]);
+        std::fs::write(values_path(&pack), "a=NaN\nb=inf\n").unwrap();
+        assert_eq!(load_values(&pack, &options), [1.0, 0.0]);
         save_values(&pack, &options, &[1.0, 0.0]).unwrap();
         assert_eq!(std::fs::read_to_string(values_path(&pack)).unwrap(), "");
         assert_eq!(load_values(&pack, &options), [1.0, 0.0]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_shader_values_preserves_a_readers_existing_snapshot() {
+        use std::io::Read;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let pack = scratch.path().join("pack.hshader");
+        let options = [option("enabled", OptionKind::Bool { default: false })];
+        save_values(&pack, &options, &[1.0]).unwrap();
+        let mut previous = std::fs::File::open(values_path(&pack)).unwrap();
+
+        save_values(&pack, &options, &[0.0]).unwrap();
+        let mut old_text = String::new();
+        previous.read_to_string(&mut old_text).unwrap();
+        assert_eq!(old_text, "enabled=1\n");
+        assert_eq!(std::fs::read_to_string(values_path(&pack)).unwrap(), "");
+        assert_eq!(load_values(&pack, &options), [0.0]);
+    }
+
+    #[test]
+    fn float_steps_keep_the_last_short_interval_in_both_directions() {
+        for max in [2.1_f32, 2.001_f32] {
+            let kind = OptionKind::Float {
+                default: 0.0,
+                min: 0.0,
+                max,
+                step: 1.0,
+            };
+            let max = f64::from(max);
+            assert_eq!(step_value(&kind, 2.0, false), max);
+            assert_eq!(step_value(&kind, max, true), 2.0);
+            assert_eq!(step_value(&kind, max, false), 0.0);
+            assert_eq!(step_value(&kind, 0.0, true), max);
+        }
+    }
+
+    #[test]
+    fn float_slider_reaches_the_exact_declared_maximum() {
+        let max = 1.0_f32.next_up();
+        let kind = OptionKind::Float {
+            default: 0.0,
+            min: 0.0,
+            max,
+            step: 0.5,
+        };
+        assert_eq!(float_steps(0.0, max, 0.5), 2.0);
+        assert_eq!(slider_value(&kind, 0.0), Some(0.0));
+        assert_eq!(slider_value(&kind, 0.5), Some(0.5));
+        assert_eq!(slider_value(&kind, 1.0), Some(f64::from(max)));
+        assert_eq!(step_value(&kind, 0.5, false), f64::from(max));
+        assert_eq!(step_value(&kind, f64::from(max), true), 0.5);
+    }
+
+    #[test]
+    fn sliders_refuse_non_finite_positions() {
+        let kind = OptionKind::Int {
+            default: 1,
+            min: 0,
+            max: 3,
+        };
+        for position in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(slider_value(&kind, position), None);
+        }
+        assert_eq!(slider_value(&kind, 0.5), Some(2.0));
     }
 
     #[test]

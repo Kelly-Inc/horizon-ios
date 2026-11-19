@@ -10,15 +10,14 @@ class VirtualCursorTests(unittest.TestCase):
  def test_menu_drag_buttons_screen_change_and_cancel(self):
   if not shutil.which('rustc'): self.skipTest('requires Rust')
   code=(ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
-  methods='\n'.join(method(code,n) for n in ['touch_menu_cursor_mode','visible_touch_layout','touch_render_point','touch_click_context','touch_record_click_context','touch_cursor_flush','touch_cursor_reset','touch_cursor_motion','touch_cursor_event','touch_cursor_frame','touch_menu_mouse_held','touch_queue_cursor_button'])
+  methods='\n'.join(method(code,n) for n in ['touch_menu_cursor_mode','visible_touch_layout','touch_render_point','touch_click_context','touch_record_click_context','touch_cursor_flush','touch_cursor_reset','touch_cursor_motion','touch_cursor_event','touch_cursor_button_event','touch_cursor_frame','touch_menu_mouse_held','touch_queue_cursor_button'])
   window=(ROOT/'crates/horizon-client/src/game/runtime/window_handler.rs').read_text()
-  a=window.index('        if let WindowEvent::MouseInput { state, button, .. } = &event {')
+  a=window.index('        if let WindowEvent::MouseInput { state, button, .. } = &event')
   b=window.index('        let mouse =',a)
   ledger=window[a:b]
   methods += method((ROOT/'crates/horizon-client/src/game/interface/hud_editor.rs').read_text(),'hud_editor_release')
   hud = method((ROOT/'crates/horizon-client/src/game.rs').read_text(), 'hud')
-  # Execute the production final composition wrapper, with unrelated renderers stubbed.
-  # Its touch overlay acknowledgement drives the real deferred click dispatcher below.
+  # The render acknowledgement drives deferred clicks.
   methods += hud
   acknowledgement = code[code.index('            self.touch.cursor_drawn = Some('):].split('\n', 1)[0]
   acknowledgement = acknowledgement.replace('self.cursor', 'self.point')
@@ -42,6 +41,7 @@ mod horizon_ios_launcher{
  pub fn set_touch_context(id:u64){SET.store(id,Ordering::Relaxed)}
 }
 use actual::Control;
+use std::collections::HashSet;
 #[derive(Clone,Copy,Debug,PartialEq,Eq,Hash)]enum MouseButton{Left,Right,Middle}
 #[derive(Clone,Copy,PartialEq)]enum TouchPhase{Started,Moved,Ended,Cancelled}
 #[derive(Clone,Copy,Debug,PartialEq)] enum KeyCode{KeyW,KeyS,KeyA,KeyD,Space,ShiftLeft,F5,KeyT,Escape,KeyE,ControlLeft,F3,Tab}
@@ -68,14 +68,15 @@ impl Graph{fn draw(&self,_:(),_:&mut Batch,_:&()){}}
 
 TYPES
 #[derive(Default)]struct Input{more:bool,hidden:bool,cursor:actual::desktop::Cursor,cursor_screen:Option<u64>,cursor_pending:Vec<CursorEdge>,fingers:actual::Touches,
- cursor_down:[bool;3],native_mouse:[bool;3],custom_mouse:[bool;3],cursor_cancelled:[bool;3],cursor_delivery:Option<ClickContext>,cursor_drawn:Option<(u64,(f32,f32))>,
+ window_buttons:HashSet<MouseButton>,cursor_down:[bool;3],native_mouse:[bool;3],custom_mouse:[bool;3],cursor_cancelled:[Option<u64>;3],cursor_delivery:Option<ClickContext>,cursor_drawn:Option<(u64,(f32,f32))>,
  click_contexts:Vec<(u64,ClickContext)>,native_surface:Option<(u64,(f32,f32))>,cursor_keys:Vec<Control>}
-/// `clicks` records (right, down, pointer, modifiers) as the screen receives each mouse edge.
+/// Edges record button, direction, position and modifiers.
 #[derive(Default)]struct Game{render_scale:f32,title:Option<()>,ui:Ui,server_packs:Packs,code_of_conduct:Option<()>,command_prompt:Option<()>,player:Option<()>,gui:Gui,frame_graph:Graph,rendered:usize,pvp:Pvp,settings:Settings,touch:Input,frames:u64,key:u64,point:(f32,f32),clicks:Vec<(bool,bool,(f32,f32),u8)>,switch_on_down:bool,
- keys:Vec<(KeyCode,bool)>,modifiers:winit::keyboard::ModifiersState,physical_buttons:std::collections::HashSet<MouseButton>,size:(f32,f32)}
+ keys:Vec<(KeyCode,bool)>,modifiers:winit::keyboard::ModifiersState,size:(f32,f32)}
 impl Game{
  fn advance_skin_frame(&mut self){}
  fn dialog_open(&self)->bool{false}
+ fn menu_input_blocked(&self)->bool{false}
  fn hud_layers(&mut self,size:[u32;2])->Batch{Batch::new(size,())}
  fn draw_dialog(&mut self,_:&mut Batch){}
  fn draw_pack_prompt(&mut self,_:&mut Batch){}
@@ -88,6 +89,7 @@ impl Game{
  fn draw_touch_close(&mut self,_:&mut Batch){ACKNOWLEDGEMENT self.rendered+=1;}
  fn options_path()->&'static str{"unused-test-path"}
  fn new()->Self{Game{player:Some(()),size:(512.,300.),..Default::default()}}
+ fn touch_cancel_key(&mut self,key:KeyCode)->Result<(),()>{self.touch_raw_key(key,false)}
  fn touch_raw_key(&mut self,key:KeyCode,down:bool)->Result<(),()>{self.keys.push((key,down));Ok(())}
  fn touch_now(&mut self)->f64{self.frames as f64/60.0}
  fn key_screen(&self)->u64{self.key}
@@ -97,6 +99,7 @@ impl Game{
  fn screen_point(&self,at:(f32,f32))->(f32,f32){at}
  fn hardware_hides_touch(&self)->bool{false}
  fn touch_pointer(&mut self,_:&dyn EventLoopCtl,at:(f32,f32)){let s=self.render_scale.max(1.);self.point=((at.0*s)/s,(at.1*s)/s);}
+ fn pointer_buttons_mut(&mut self)->Option<&mut HashSet<MouseButton>>{Some(&mut self.touch.window_buttons)}
  fn touch_mouse_button(&mut self,_:&dyn EventLoopCtl,b:MouseButton,down:bool){
   let event=WindowEvent::MouseInput{state:if down{ElementState::Pressed}else{ElementState::Released},button:b};
 LEDGER
@@ -118,11 +121,11 @@ fn main(){
   for custom_first in [false,true] {
    let mut g=Game::new();g.touch.cursor_screen=Some(g.key);
    if custom_first {g.touch.custom_mouse[index]=true;g.touch_queue_cursor_button(button,true);}else{g.input(1,TouchPhase::Started,point);}
-   for _ in 0..3{g.frame();}assert!(g.physical_buttons.contains(&button));
+   for _ in 0..3{g.frame();}assert!(g.touch.window_buttons.contains(&button));
    if custom_first {g.input(1,TouchPhase::Started,point);g.touch.custom_mouse[index]=false;g.touch_queue_cursor_button(button,false);}else{g.touch.custom_mouse[index]=true;g.touch_queue_cursor_button(button,true);g.input(1,TouchPhase::Ended,point);}
-   for _ in 0..3{g.frame();}assert!(g.physical_buttons.contains(&button));assert_eq!(g.clicks.len(),1);
+   for _ in 0..3{g.frame();}assert!(g.touch.window_buttons.contains(&button));assert_eq!(g.clicks.len(),1);
    if custom_first {g.input(1,TouchPhase::Ended,point);}else{g.touch.custom_mouse[index]=false;g.touch_queue_cursor_button(button,false);}for _ in 0..3{g.frame();}
-   assert!(!g.physical_buttons.contains(&button));assert_eq!(g.clicks.len(),2);
+   assert!(!g.touch.window_buttons.contains(&button));assert_eq!(g.clicks.len(),2);
   }
  }
 
@@ -168,24 +171,64 @@ fn main(){
  g.input(2,TouchPhase::Started,centre(Control::LeftClick));g.input(2,TouchPhase::Ended,centre(Control::LeftClick));assert!(g.clicks.is_empty());
  g.frame();assert_eq!(g.clicks,[(false,true,(276.,160.),0)]);
  g.frame();assert_eq!(g.edges(),[(false,true),(false,false)]);assert_eq!(g.clicks[1].2,(276.,160.));
+ // UIKit can reuse a finger ID after the cursor misses its release. A new
+ // start releases a captured key or click and takes fresh ownership.
+ for control in [Control::Sneak,Control::LeftClick] {
+  let mut reused=Game::new();
+  reused.input(14,TouchPhase::Started,centre(control));
+  reused.frame();reused.frame();
+  reused.input(14,TouchPhase::Started,(200.,100.));
+  reused.input(14,TouchPhase::Moved,(220.,110.));
+  reused.frame();reused.frame();
+  assert_eq!(reused.touch.cursor.primary_finger(),Some(14),"{control:?}");
+  assert_eq!(reused.point,(276.,160.),"{control:?}");
+  assert!(reused.touch.window_buttons.is_empty());
+  if control==Control::Sneak {
+   assert_eq!(reused.keys,[(KeyCode::ShiftLeft,true),(KeyCode::ShiftLeft,false)]);
+  }
+ }
+ let mut reused=Game::new();
+ reused.input(14,TouchPhase::Started,(200.,100.));
+ reused.input(14,TouchPhase::Started,centre(Control::Sneak));
+ assert_eq!(reused.touch.cursor.primary_finger(),None);
+ reused.input(14,TouchPhase::Ended,centre(Control::Sneak));
+ assert_eq!(reused.keys,[(KeyCode::ShiftLeft,true),(KeyCode::ShiftLeft,false)]);
+ let mut reused=Game::new();
+ reused.input(10,TouchPhase::Started,centre(Control::LeftClick));
+ reused.input(14,TouchPhase::Started,centre(Control::LeftClick));
+ reused.input(14,TouchPhase::Started,(200.,100.));
+ reused.input(14,TouchPhase::Moved,(220.,110.));
+ assert_eq!(reused.touch.cursor.primary_finger(),Some(14));
+ reused.input(10,TouchPhase::Ended,centre(Control::LeftClick));
+ for _ in 0..4 {reused.frame();}
+ assert_eq!(reused.edges(),[(false,true),(false,false)]);
+ // A joystick contact can also be superseded by a surface touch.
+ let mut cursor=actual::desktop::Cursor::default();
+ let size=(100.,100.);let layout=[(Control::Joystick,[0.,0.,40.,40.])];
+ assert!(cursor.event_controls(14,0,(30.,10.),size,&layout).is_empty());
+ assert!(cursor.tick(1.).is_none());
+ assert!(cursor.tick(1.+1./60.).is_some());
+ assert!(!cursor.event_controls(14,0,(60.,60.),size,&layout).is_empty());
+ assert_eq!(cursor.primary_finger(),Some(14));
+ assert!(cursor.tick(2.).is_none());
  // The middle button owns its own ledger entry and cancellation sends its paired up.
  let mut middle=Game::new();middle.input(88,TouchPhase::Started,centre(Control::MiddleClick));middle.frame();middle.frame();
- assert!(middle.physical_buttons.contains(&MouseButton::Middle));assert!(middle.touch.cursor_down[2]);
- middle.touch_cursor_reset();middle.touch_cursor_flush(&Loop);assert!(middle.physical_buttons.is_empty());assert!(!middle.touch.cursor_down[2]);
+ assert!(middle.touch.window_buttons.contains(&MouseButton::Middle));assert!(middle.touch.cursor_down[2]);
+ middle.touch_cursor_reset();middle.touch_cursor_flush(&Loop);assert!(middle.touch.window_buttons.is_empty());assert!(!middle.touch.cursor_down[2]);
  // A held button stays down while the surface finger drags.
  g.input(3,TouchPhase::Started,centre(Control::RightClick));g.frame();assert_eq!(g.edges().last(),Some(&(true,true)));
  g.input(1,TouchPhase::Moved,(240.,110.));assert_eq!(g.point,(296.,160.));assert!(g.touch.cursor_down[1]);
- // A new screen releases it exactly once, and nothing is left queued or held.
- g.key+=1;g.frame();assert_eq!(g.edges().last(),Some(&(true,false)));assert_eq!(g.clicks.len(),4);
- assert!(g.touch.cursor_pending.is_empty());assert_eq!(g.touch.cursor_down,[false,false,false]);assert!(g.physical_buttons.is_empty());
- g.frame();g.frame();assert_eq!(g.clicks.len(),4);
+ // A new screen clears the held button without a synthetic release there.
+ g.key+=1;g.frame();assert_eq!(g.edges().last(),Some(&(true,true)));assert_eq!(g.clicks.len(),3);
+ assert!(g.touch.cursor_pending.is_empty());assert_eq!(g.touch.cursor_down,[false,false,false]);assert!(g.touch.window_buttons.is_empty(), "old buttons");
+ g.frame();g.frame();assert_eq!(g.clicks.len(),3);
 
  // Reload can reset without an event loop: it clears the ledger immediately but must
  // subsequently deliver a real window up to end the actual HUD drag and save once.
  let mut drag=Game::new();drag.input(99,TouchPhase::Started,centre(Control::LeftClick));drag.frame();drag.frame();
- assert!(drag.physical_buttons.contains(&MouseButton::Left));
+ assert!(drag.touch.window_buttons.contains(&MouseButton::Left));
  drag.pvp.editor=Some(Editor{drag:Some(()),guides:(Some(1.),Some(2.))});
- drag.touch_cursor_reset();assert!(drag.physical_buttons.is_empty());assert!(drag.pvp.editor.as_ref().unwrap().drag.is_some());
+ drag.touch_cursor_reset();assert!(drag.touch.window_buttons.is_empty());assert!(drag.pvp.editor.as_ref().unwrap().drag.is_some());
  drag.touch_cursor_flush(&Loop);assert!(drag.pvp.editor.as_ref().unwrap().drag.is_none());assert_eq!(drag.settings.saved.get(),1);
  drag.touch_cursor_flush(&Loop);assert_eq!(drag.settings.saved.get(),1);
  // The press is not delivered until a frame has been drawn with the pointer at its place.
@@ -223,11 +266,19 @@ fn main(){
  k.input(10,TouchPhase::Cancelled,(200.,100.));assert_eq!(k.keys,[(KeyCode::ShiftLeft,true)]);
  k.input(11,TouchPhase::Ended,centre(Control::Sneak));assert_eq!(k.keys,[(KeyCode::ShiftLeft,true),(KeyCode::ShiftLeft,false)]);
  // Cancelling a tap before its deferred press never creates a click.
- let mut g=Game::new();g.input(1,TouchPhase::Started,centre(Control::LeftClick));g.input(1,TouchPhase::Cancelled,(0.,0.));for _ in 0..10{g.frame();}assert!(g.clicks.is_empty());
- // A pressed button that changes screens aborts the remaining old-screen edges, and is itself released once.
+ let mut g=Game::new();
+ g.input(10,TouchPhase::Started,(200.,100.));
+ g.input(1,TouchPhase::Started,centre(Control::LeftClick));
+ g.input(1,TouchPhase::Cancelled,(0.,0.));
+ g.input(10,TouchPhase::Moved,(220.,110.));
+ for _ in 0..10{g.frame();}
+ assert!(g.clicks.is_empty());
+ assert_eq!(g.touch.cursor.primary_finger(),Some(10));
+ assert_eq!(g.point,(276.,160.));
+ // A press that changes screens drops the remaining edges from the old screen before they can reach the new one.
  let mut g=Game::new();g.switch_on_down=true;g.input(1,TouchPhase::Started,centre(Control::LeftClick));g.input(2,TouchPhase::Started,centre(Control::RightClick));
- g.frame();assert!(g.clicks.is_empty());g.frame();assert_eq!(g.edges(),[(false,true),(false,false)]);assert!(g.touch.cursor_pending.is_empty());
- g.switch_on_down=false;for _ in 0..3{g.frame();}assert_eq!(g.clicks.len(),2);assert!(g.physical_buttons.is_empty());
+ g.frame();assert!(g.clicks.is_empty());g.frame();assert_eq!(g.edges(),[(false,true)]);assert!(g.touch.cursor_pending.is_empty());
+ g.switch_on_down=false;for _ in 0..3{g.frame();}assert_eq!(g.clicks.len(),1);assert!(g.touch.window_buttons.is_empty());
 }
 '''.replace('SOURCE',str(ROOT/'crates/horizon-client/src/touch.rs')).replace('METHODS',methods).replace('KEY_OF',method(code,'key_of')).replace('TYPES',types).replace('LEDGER',ledger).replace('ACKNOWLEDGEMENT',acknowledgement)
   with tempfile.TemporaryDirectory(prefix='horizon-virtual-cursor-') as d:

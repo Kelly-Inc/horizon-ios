@@ -85,6 +85,18 @@ impl RandomSequences {
         self.settle();
         std::mem::take(&mut self.dirty).then(|| self.to_nbt())
     }
+    /// Write changed sequences without clearing a pending save when the write fails.
+    pub fn save_dirty<E>(
+        &mut self,
+        write: impl FnOnce(horizon_core::nbt::Tag) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.settle();
+        if self.dirty {
+            write(self.to_nbt())?;
+            self.dirty = false;
+        }
+        Ok(())
+    }
     /// Lends sequence `id` out (created if missing); `give_back` returns it. Lending
     /// is no draw; what was drawn from it marks the data when it comes back.
     pub fn lend(&mut self, id: &str, world_seed: i64) -> XoroshiroRandom {

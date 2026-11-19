@@ -123,7 +123,7 @@ pub fn with_home_access<T>(home: &Path, operation: impl FnOnce() -> Result<T>) -
 pub enum Kind {
     /// The prepared tree: `horizon-resources.json` and everything `horizon-prepare` writes beside it.
     Resources,
-    /// One world folder: `level.dat` and its chunks.
+    /// One world folder: `level.dat` or its recovery copy, and the saved chunks.
     World,
     /// One resource pack, which stays an archive rather than being unpacked.
     ResourcePack,
@@ -139,6 +139,10 @@ impl Kind {
             Kind::World => "level.dat",
             Kind::ResourcePack => "pack.mcmeta",
         }
+    }
+
+    fn markers(self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.marker()).chain((self == Kind::World).then_some("level.dat_old"))
     }
 
     pub fn label(self) -> &'static str {
@@ -170,8 +174,9 @@ pub struct Installed {
 
 /// Where the prepared files are, of the two places they can be: the folder beside the executable,
 /// and the folder an import unpacked into the sandbox's home (`Documents/resources`, the one the
-/// Files app can reach). `None` when neither holds `horizon-resources.json` -- on a desktop the
-/// ordinary answer, which leaves the caller's `.local/horizon-client/26.3` in charge.
+/// Files app can reach). Prefer the bundled files unless their prepared tables fail the startup
+/// check and the imported copy passes. `None` when neither holds `horizon-resources.json`, which
+/// leaves the caller's `.local/horizon-client/26.3` in charge.
 ///
 /// A phone needs the second stop because it has no other door: the bundle is read while the game
 /// runs, so the game cannot put its own assets where the first stop looks, and `.local/...` is a
@@ -179,11 +184,20 @@ pub struct Installed {
 /// because a `resources` folder under its working directory means something else there.
 pub fn resources_root(sibling: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let has = |dir: &Path| dir.join(Kind::Resources.marker()).is_file();
-    if has(sibling) {
-        return Some(sibling.to_owned());
+    let imported = home
+        .map(|home| home.join(Kind::Resources.folder()))
+        .filter(|dir| has(dir));
+    match (has(sibling), imported) {
+        (true, Some(imported))
+            if imported != sibling
+                && damaged_prepared(sibling).is_some()
+                && damaged_prepared(&imported).is_none() =>
+        {
+            Some(imported)
+        }
+        (true, _) => Some(sibling.to_owned()),
+        (false, imported) => imported,
     }
-    home.map(|home| home.join(Kind::Resources.folder()))
-        .filter(|dir| has(dir))
 }
 
 // These files are read unconditionally by Assets, item defaults and gameplay tables.
@@ -274,17 +288,18 @@ pub fn home() -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
-/// Names that are not part of what a person meant to send: the droppings a desktop leaves in a zip,
-/// and a running world's `session.lock`, which says "someone is inside" rather than anything worth
-/// importing. Left in, the droppings would also hide the one folder everything shares at the top,
-/// which is what lets [`Pack`] see through archives made by a desktop's Compress.
+/// Names a desktop adds to ZIPs that could hide the common wrapper folder.
 fn is_junk(name: &str) -> bool {
     let last = name.rsplit('/').next().unwrap_or(name);
-    name.starts_with("__MACOSX/")
-        || matches!(
-            last,
-            ".DS_Store" | "Thumbs.db" | "desktop.ini" | "session.lock"
-        )
+    name.starts_with("__MACOSX/") || matches!(last, ".DS_Store" | "Thumbs.db" | "desktop.ini")
+}
+
+/// Drop the session lock at the root of a save (including when an archive
+/// carries it beside a wrapping directory). A nested file can be mod data.
+fn archive_session_lock(name: &str, prefix: &str) -> bool {
+    name.strip_suffix("session.lock").is_some_and(|parent| {
+        parent.is_empty() || (parent.ends_with('/') && prefix.starts_with(parent))
+    })
 }
 
 /// The name an archive carries for itself, with anything that would turn it into a path or a
@@ -298,8 +313,35 @@ fn sanitize(name: &str) -> String {
     if trimmed.is_empty() {
         "imported".to_owned()
     } else {
-        trimmed.chars().take(64).collect()
+        // Leave space under 255 bytes for a collision suffix and .zip.
+        let end = trimmed
+            .char_indices()
+            .nth(64)
+            .map_or(trimmed.len(), |(i, _)| i);
+        trimmed[..trimmed.floor_char_boundary(end.min(238))].to_owned()
     }
+}
+
+/// Discard current-directory components before looking for an archive's root.
+fn normalized_zip_name(name: &str) -> String {
+    let name = name.replace('\\', "/");
+    let mut normalized = String::new();
+    if name.starts_with('/') {
+        normalized.push('/');
+    }
+    for part in name
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if !normalized.is_empty() && !normalized.ends_with('/') {
+            normalized.push('/');
+        }
+        normalized.push_str(part);
+    }
+    if name.ends_with('/') && !normalized.is_empty() && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
 }
 
 /// Where an entry belongs inside the destination, or `None` when it belongs nowhere: no `..`, no
@@ -307,7 +349,10 @@ fn sanitize(name: &str) -> String {
 /// the entry, so a player hears that the archive is strange rather than playing a half-imported
 /// world.
 fn inside(name: &str, prefix: &str) -> Option<PathBuf> {
-    if name.starts_with('/') || name.contains([':', '\0']) {
+    if name.starts_with('/')
+        || name.contains([':', '\0'])
+        || name.split('/').any(|part| part == "..")
+    {
         return None;
     }
     let rest = if prefix.is_empty() {
@@ -329,16 +374,20 @@ fn inside(name: &str, prefix: &str) -> Option<PathBuf> {
 /// The one folder every entry shares one level below `prefix`, if there is one: what compressing a
 /// folder produces, as opposed to compressing its contents.
 fn common_folder(names: &[String], prefix: &str) -> Option<String> {
-    let names: Vec<&str> = names
+    let mut entries = names
         .iter()
-        .filter_map(|name| name.strip_prefix(prefix))
-        .filter(|rest| rest.contains('/'))
-        .collect();
-    let first = names.first()?.split('/').next()?;
-    names
-        .iter()
-        .all(|name| name.starts_with(first) && name[first.len()..].starts_with('/'))
-        .then(|| first.to_owned())
+        .filter(|name| name.strip_prefix(prefix) != Some("session.lock"));
+    let (folder, _) = entries.next()?.strip_prefix(prefix)?.split_once('/')?;
+    if folder.is_empty() || folder == ".." {
+        return None;
+    }
+    entries
+        .all(|name| {
+            name.strip_prefix(prefix)
+                .and_then(|name| name.split_once('/'))
+                .is_some_and(|(candidate, _)| candidate == folder)
+        })
+        .then(|| folder.to_owned())
 }
 
 /// Does one of the kinds' markers sit directly under `prefix`?
@@ -346,7 +395,7 @@ fn has_marker(names: &[String], prefix: &str) -> Option<Kind> {
     Kind::ALL.iter().copied().find(|kind| {
         names.iter().any(|name| {
             name.strip_prefix(prefix)
-                .is_some_and(|rest| rest == kind.marker())
+                .is_some_and(|rest| kind.markers().any(|marker| marker == rest))
         })
     })
 }
@@ -361,6 +410,8 @@ pub struct Pack {
     /// Every entry above the root the game reads, including the trailing `/`: `""`, `"Horizon/"`, or
     /// `"horizon-client/26.3/"` for somebody who compressed one folder too many.
     prefix: String,
+    /// Even a pack with no wrapper needs rewriting if its entry names changed.
+    normalized_names: bool,
     pub kind: Kind,
 }
 
@@ -373,7 +424,7 @@ impl Pack {
                 io::ErrorKind::InvalidData,
                 crate::lang::get_or(
                     "horizon.import.game_files_only",
-                    "The automatic download did not contain game files.",
+                    "This archive does not contain prepared game files.",
                 ),
             )
             .into());
@@ -384,22 +435,27 @@ impl Pack {
     /// Look inside an archive and say what it is, writing nothing. Only the central directory is
     /// read, so this is cheap even for a prepared tree.
     pub fn open(path: &Path) -> Result<Self> {
-        if fs::metadata(path)?.len() > MAX_PACKED {
-            return Err("the archive is larger than this will unpack".into());
+        let input = File::open(path)?;
+        if input.metadata()?.len() > MAX_PACKED {
+            return Err("the ZIP exceeds Horizon's 2 GiB import limit".into());
         }
-        let archive = ZipArchive::new(File::open(path)?)?;
-        // `name_for_index` borrows the archive, so the list is finished before anything is read out.
+        let archive = ZipArchive::new(input)?;
         let mut names = Vec::new();
+        let mut declared_bytes = 0u128;
+        let mut normalized_names = false;
         for index in 0..archive.len() {
-            if let Some(name) = archive.name_for_index(index) {
-                let name = name?.replace('\\', "/");
-                if !name.ends_with('/') && !is_junk(&name) {
-                    names.push(name);
-                }
+            let entry = archive.by_index_data(index)?;
+            let original = entry.name()?;
+            let name = normalized_zip_name(&original);
+            if name.is_empty() || name.ends_with('/') || is_junk(&name) {
+                continue;
             }
-        }
-        if names.len() > MAX_ENTRIES {
-            return Err("the archive holds more files than this will unpack".into());
+            normalized_names |= name != original.as_ref();
+            if names.len() == MAX_ENTRIES {
+                return Err("the archive holds more files than this will unpack".into());
+            }
+            declared_bytes += u128::from(entry.size());
+            names.push(name);
         }
         if names.is_empty() {
             return Err("the archive holds nothing".into());
@@ -426,11 +482,16 @@ impl Pack {
                 path.display(),
                 Kind::ALL
                     .iter()
-                    .map(|k| k.marker())
+                    .flat_map(|kind| kind.markers())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         })?;
+        // Packs stay compressed. For files we do extract, reject an oversized
+        // tree before staging it and still enforce the actual byte limit while reading.
+        if kind != Kind::ResourcePack && declared_bytes > u128::from(MAX_UNPACKED) {
+            return Err("the ZIP exceeds Horizon's 4 GiB unpacked import limit".into());
+        }
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -448,16 +509,17 @@ impl Pack {
             path: path.to_owned(),
             item,
             prefix,
+            normalized_names,
             kind,
         })
     }
 
     /// Read every entry out into `into`, which is created here. Anything that goes wrong removes
     /// `into` again: the game must never see a half tree.
-    fn unpack(&mut self, into: &Path) -> Result<(usize, u64)> {
+    fn unpack(&mut self, into: &Path, wanted: &impl Fn() -> bool) -> Result<(usize, u64)> {
         // If removing interrupted staging failed, never merge the incoming archive with it.
         fs::create_dir(into)?;
-        let result = self.unpack_entries(into);
+        let result = self.unpack_entries(into, wanted);
         if result.is_err() {
             // CRC, decompression and filesystem failures also leave partial
             // output. A world marker may already be visible in that output.
@@ -466,19 +528,26 @@ impl Pack {
         result
     }
 
-    fn unpack_entries(&mut self, into: &Path) -> Result<(usize, u64)> {
+    fn unpack_entries(&mut self, into: &Path, wanted: &impl Fn() -> bool) -> Result<(usize, u64)> {
         let mut files = 0;
         let mut written = 0u64;
         for index in 0..self.archive.len() {
-            let file = self.archive.by_index(index)?;
-            let name = file.name()?.replace('\\', "/");
+            if !wanted() {
+                return Err("the import was cancelled".into());
+            }
+            let file = self.archive.by_index(index).map_err(io::Error::from)?;
+            let name = normalized_zip_name(&file.name()?);
             let failure = |message: String| Err::<(usize, u64), _>(message.into());
             // Not `ZipArchive::extract`, which would create these: an archive from a stranger must
             // not be able to point a later write somewhere else in the container.
             if file.is_symlink() {
                 return failure(format!("the archive holds a symbolic link: {name}"));
             }
-            if name.ends_with('/') || is_junk(&name) {
+            if name.is_empty()
+                || name.ends_with('/')
+                || is_junk(&name)
+                || archive_session_lock(&name, &self.prefix)
+            {
                 continue;
             }
             let Some(relative) = inside(&name, &self.prefix) else {
@@ -492,11 +561,21 @@ impl Pack {
             // The limit is on bytes actually written, not on what the archive claims: a header can
             // say anything at all. The extra byte is what tells "exactly the limit" from "past it"
             // without a second pass.
-            let copied = io::copy(&mut file.take(MAX_UNPACKED - written + 1), &mut out)?;
-            if written + copied > MAX_UNPACKED {
-                return failure("the archive unpacks to more than this will hold".to_owned());
+            let mut input = file.take(MAX_UNPACKED - written + 1);
+            const COPY_CHUNK: u64 = 1 << 20;
+            loop {
+                if !wanted() {
+                    return Err("the import was cancelled".into());
+                }
+                let copied = io::copy(&mut input.by_ref().take(COPY_CHUNK), &mut out)?;
+                written += copied;
+                if written > MAX_UNPACKED {
+                    return failure("the archive unpacks to more than this will hold".to_owned());
+                }
+                if copied < COPY_CHUNK {
+                    break;
+                }
             }
-            written += copied;
             files += 1;
         }
         Ok((files, written))
@@ -505,16 +584,19 @@ impl Pack {
     /// A folder-wrapped resource pack must have its resource root promoted to
     /// the ZIP root before the normal pack repository can see it. Copy compressed
     /// entries directly: rewriting names does not require inflating HD assets.
-    fn normalize_resource_pack(&mut self, dest: &Path) -> Result<()> {
-        fs::metadata(&self.path)?;
+    fn normalize_resource_pack(&mut self, preferred: &Path) -> Result<(PathBuf, u64)> {
         let mut entries = BTreeMap::new();
         for index in 0..self.archive.len() {
             let file = self.archive.by_index(index)?;
-            let name = file.name()?.replace('\\', "/");
+            let name = normalized_zip_name(&file.name()?);
             if file.is_symlink() {
                 return Err(format!("the archive holds a symbolic link: {name}").into());
             }
-            if name.ends_with('/') || is_junk(&name) {
+            if name.is_empty()
+                || name.ends_with('/')
+                || is_junk(&name)
+                || archive_session_lock(&name, &self.prefix)
+            {
                 continue;
             }
             let relative = inside(&name, &self.prefix)
@@ -527,15 +609,15 @@ impl Pack {
         if !entries.contains_key(Kind::ResourcePack.marker()) {
             return Err("the archive has no resource pack metadata at its resource root".into());
         }
-        publish_pack(dest, |file| {
+        let published = publish_pack(preferred, |file| {
             let mut output = ZipWriter::new(file);
             for (name, index) in entries {
                 output.raw_copy_file_rename(self.archive.by_index(index)?, name)?;
             }
             Ok(output.finish()?)
         })?;
-        fs::remove_file(&self.path)?;
-        Ok(())
+        consume_installed_archive(&self.path);
+        Ok(published)
     }
 
     /// Put the archive where the game reads it, under `home` (`Documents` on a phone), and consume
@@ -545,54 +627,72 @@ impl Pack {
         self.install_guarded(home, || true)
     }
 
-    fn install_guarded(mut self, home: &Path, wanted: impl Fn() -> bool) -> Result<Installed> {
+    fn install_guarded(self, home: &Path, wanted: impl Fn() -> bool) -> Result<Installed> {
         fs::create_dir_all(home)?;
-        with_home_access(home, || {
-            if !wanted() {
-                return Err("the import was cancelled".into());
+        let access = acquire_home_access(home)?;
+        self.install_with_access(home, &access, wanted)
+    }
+
+    /// Keep publication in the caller's existing home transaction.
+    fn install_with_access(
+        mut self,
+        home: &Path,
+        _access: &HomeAccess,
+        wanted: impl Fn() -> bool,
+    ) -> Result<Installed> {
+        if !wanted() {
+            return Err("the import was cancelled".into());
+        }
+        let archive = self.path.clone();
+        // A previous import may have consumed this path while we waited for the home.
+        let archive_bytes = fs::metadata(&archive)?.len();
+        let folder = Path::new(self.kind.folder());
+        let (path, files, bytes) = match self.kind {
+            // A pack stays an archive: the game reads zips straight out of `resourcepacks`
+            // (`packs::discover`), so unpacking one would only lose what vanilla players expect.
+            Kind::ResourcePack => {
+                let preferred = home.join(folder).join(format!("{}.zip", self.item));
+                let (path, bytes) = if self.prefix.is_empty() && !self.normalized_names {
+                    move_pack(&archive, &preferred, archive_bytes)?
+                } else {
+                    self.normalize_resource_pack(&preferred)?
+                };
+                (path, 1, bytes)
             }
-            let archive = self.path.clone();
-            let folder = Path::new(self.kind.folder());
-            let (path, files, bytes) = match self.kind {
-                // A pack stays an archive: the game reads zips straight out of `resourcepacks`
-                // (`packs::discover`), so unpacking one would only lose what vanilla players expect.
-                Kind::ResourcePack => {
-                    let dest = unique(&home.join(folder).join(format!("{}.zip", self.item)));
-                    if self.prefix.is_empty() {
-                        move_file(&archive, &dest)?;
-                    } else {
-                        self.normalize_resource_pack(&dest)?;
+            // A world is never written over: what would be overwritten is the player's own.
+            Kind::World => {
+                let saves = home.join(folder);
+                fs::create_dir_all(&saves)?;
+                clear_world_staging(&saves)?;
+                let staging = saves.join(WORLD_IMPORT_STAGING);
+                fs::create_dir(&staging)?;
+                // The world list only checks the immediate children of saves. Put
+                // the partial tree one level deeper, on the destination volume.
+                let scratch = staging.join("world");
+                let published = (|| -> Result<_> {
+                    let (files, bytes) = self.unpack(&scratch, &wanted)?;
+                    if !wanted() {
+                        return Err("the import was cancelled".into());
                     }
-                    let bytes = fs::metadata(&dest)?.len();
-                    (dest, 1, bytes)
-                }
-                // A world is never written over: what would be overwritten is the player's own.
-                Kind::World => {
-                    let saves = home.join(folder);
-                    fs::create_dir_all(&saves)?;
-                    clear_world_staging(&saves)?;
-                    let staging = saves.join(WORLD_IMPORT_STAGING);
-                    fs::create_dir(&staging)?;
-                    // The world list only checks the immediate children of saves. Put
-                    // the partial tree one level deeper, on the destination volume.
-                    let scratch = staging.join("world");
-                    let published = (|| -> Result<_> {
-                        let (files, bytes) = self.unpack(&scratch)?;
-                        let dest = unique(&saves.join(&self.item));
-                        fs::rename(&scratch, &dest)?;
-                        Ok((dest, files, bytes))
-                    })();
-                    let _ = clear_world_staging(&saves);
-                    let installed = published?;
-                    fs::remove_file(&archive)?;
-                    installed
-                }
-                Kind::Resources => {
-                    let scratch = home.join("resources.unpacking");
-                    let _ = fs::remove_dir_all(&scratch);
-                    let (files, bytes) = self.unpack(&scratch)?;
+                    let dest = publish_without_replacing(
+                        &scratch,
+                        &saves.join(&self.item),
+                        rename_world_without_replacing,
+                    )?;
+                    Ok((dest, files, bytes))
+                })();
+                let _ = clear_world_staging(&saves);
+                let installed = published?;
+                consume_installed_archive(&archive);
+                installed
+            }
+            Kind::Resources => {
+                let scratch = home.join("resources.unpacking");
+                clear_resource_slot(&scratch)?;
+                let (files, bytes) = self.unpack(&scratch, &wanted)?;
+                let staged = home.join("resources.staged");
+                let staging = (|| -> Result<()> {
                     if let Some(problem) = damaged_prepared(&scratch) {
-                        let _ = fs::remove_dir_all(&scratch);
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("Horizon's prepared game files are damaged: {problem}"),
@@ -600,28 +700,28 @@ impl Pack {
                         .into());
                     }
                     if !wanted() {
-                        let _ = fs::remove_dir_all(&scratch);
                         return Err("the import was cancelled".into());
                     }
-                    // Only this rename proves extraction finished. A marker inside
-                    // `resources.unpacking` may have been the very first ZIP entry.
-                    let staged = home.join("resources.staged");
-                    if staged.exists() {
-                        fs::remove_dir_all(&staged)?;
-                    }
+                    clear_resource_slot(&staged)?;
+                    // The marker may be the first ZIP entry; only the rename proves completion.
                     fs::rename(&scratch, &staged)?;
-                    let dest = home.join(folder);
-                    publish(&staged, &dest, |from, to| fs::rename(from, to))?;
-                    fs::remove_file(&archive)?;
-                    (dest, files, bytes)
+                    Ok(())
+                })();
+                if staging.is_err() {
+                    let _ = fs::remove_dir_all(&scratch);
                 }
-            };
-            Ok(Installed {
-                kind: self.kind,
-                path,
-                files,
-                bytes,
-            })
+                staging?;
+                let dest = home.join(folder);
+                publish(&staged, &dest, |from, to| fs::rename(from, to))?;
+                consume_installed_archive(&archive);
+                (dest, files, bytes)
+            }
+        };
+        Ok(Installed {
+            kind: self.kind,
+            path,
+            files,
+            bytes,
         })
     }
 
@@ -649,10 +749,17 @@ fn clear_world_staging(saves: &Path) -> io::Result<()> {
     fs::remove_dir(staging)
 }
 
-/// Move a finished tree into place, with the old one put aside rather than deleted: the battery can
-/// die between the two renames, and `resources.previous` is something [`recover`] can put back,
-/// while a half-deleted folder is not. The copy is what costs the disk, and it goes as soon as the
-/// new tree is in place.
+// Preserve an unexpected file placed in a resource directory slot instead of deleting it.
+fn clear_resource_slot(slot: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(slot) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(slot),
+        Ok(_) => fs::rename(slot, unique(&slot.with_extension("obstructed"))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Park the current tree before publishing so recovery can restore it after an interrupted installation.
 fn publish(
     scratch: &Path,
     dest: &Path,
@@ -663,30 +770,90 @@ fn publish(
         dest.file_name().unwrap_or_default().to_string_lossy()
     ));
     if dest.exists() {
-        match fs::remove_dir_all(&previous) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if previous.is_dir()
+            && fs::symlink_metadata(dest)?.is_dir()
+            && damaged_prepared(dest).is_some()
+            && damaged_prepared(&previous).is_none()
+        {
+            // A retry must keep the usable backup until the new tree is in place.
+            fs::remove_dir_all(dest)?;
+        } else {
+            clear_resource_slot(&previous)?;
+            rename(dest, &previous)?;
         }
-        rename(dest, &previous)?;
     }
     if let Err(error) = rename(scratch, dest) {
         // A prior interrupted attempt may already have moved the old tree
         // aside. Keep it until the new tree has actually taken its place.
-        if previous.is_dir()
-            && !dest.exists()
-            && let Err(rollback) = rename(&previous, dest)
-        {
-            return Err(format!(
-                "could not install game files: {error}; could not restore the previous game files: {rollback}"
-            )
-            .into());
+        if previous.is_dir() && !dest.exists() {
+            if let Err(rollback) = rename(&previous, dest) {
+                return Err(format!(
+                    "could not install game files: {error}; could not restore the previous game files: {rollback}"
+                )
+                .into());
+            }
+            horizon_core::prepared_files::invalidate(dest);
         }
         return Err(error.into());
     }
     horizon_core::prepared_files::invalidate(dest);
-    let _ = fs::remove_dir_all(&previous);
+    let _ = clear_resource_slot(&previous);
     Ok(())
+}
+
+/// The installed marker fingerprint, using the same fields as the iOS launcher.
+fn resource_marker(home: &Path) -> io::Result<String> {
+    let metadata = match fs::metadata(
+        home.join(Kind::Resources.folder())
+            .join(Kind::Resources.marker()),
+    ) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok("missing".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok("missing".into()),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!("{:?}:{}", metadata.modified()?, metadata.len()))
+    }
+}
+
+/// Check for a newer install after acquiring the same home lock used to publish it.
+fn game_files_are_current(home: &Path, expected_marker: &str) -> io::Result<bool> {
+    let current = resource_marker(home)?;
+    Ok(current == "missing" || current == expected_marker)
+}
+
+/// Install a launcher download only if another setup did not finish meanwhile.
+pub fn install_game_files_if_current(
+    archive: &Path,
+    home: &Path,
+    expected_marker: &str,
+) -> Result<Option<Installed>> {
+    fs::create_dir_all(home)?;
+    let access = acquire_home_access(home)?;
+    if !game_files_are_current(home, expected_marker)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        Pack::open(archive)?
+            .require_game_files()?
+            .install_with_access(home, &access, || true)?,
+    ))
 }
 
 /// Finish an install that a crash or a flat battery left half done, and report what it put back.
@@ -707,27 +874,90 @@ pub fn recover(home: &Path) -> Result<Option<PathBuf>> {
         let staged = home.join("resources.staged");
         let dest = home.join(Kind::Resources.folder());
         let previous = home.join("resources.previous");
-        let restored = if !dest.exists() && staged.is_dir() {
-            fs::rename(&staged, &dest)?;
-            true
-        } else if !dest.exists() && previous.is_dir() {
-            // Older builds used the same scratch name before and after
-            // extraction. Prefer the known previous tree over ambiguous scratch.
-            fs::rename(&previous, &dest)?;
-            true
+        let usable = |root: &Path| root.is_dir() && damaged_prepared(root).is_none();
+        let installed_ok = (staged.is_dir() || previous.is_dir()) && usable(&dest);
+        let replacement = if installed_ok {
+            None
         } else {
-            false
+            [&staged, &previous].into_iter().find(|root| usable(root))
         };
-        if restored {
+        if let Some(replacement) = replacement {
+            clear_resource_slot(&dest)?;
+            fs::rename(replacement, &dest)?;
             horizon_core::prepared_files::invalidate(&dest);
         }
-        // An unfinished first install has no recoverable tree. Keep its ZIP for
-        // retry, but never let the launcher see partial resources as ready.
-        let _ = fs::remove_dir_all(&scratch);
-        let _ = fs::remove_dir_all(&staged);
-        let _ = fs::remove_dir_all(&previous);
-        Ok(restored.then_some(dest))
+        // Never promote a partial extraction. Keep an older backup if there is
+        // no usable installation for this build, so it is available for recovery.
+        let _ = clear_resource_slot(&scratch);
+        let _ = clear_resource_slot(&staged);
+        if installed_ok || replacement.is_some() {
+            let _ = fs::remove_dir_all(&previous);
+        }
+        Ok(replacement.is_some().then_some(dest))
     })
+}
+
+/// A competing creator can take a name after `unique` checked it. Retry the
+/// name selection without changing the occupied path or the staged import.
+fn publish_without_replacing(
+    staged: &Path,
+    preferred: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    loop {
+        let dest = unique(preferred);
+        match rename(staged, &dest) {
+            Ok(()) => return Ok(dest),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn rename_world_without_replacing(staged: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    {
+        use rustix::{
+            fs::{CWD, RenameFlags, renameat_with},
+            io::Errno,
+        };
+        match renameat_with(CWD, staged, CWD, dest, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(()),
+            Err(Errno::NOTSUP | Errno::NOSYS | Errno::INVAL) => {}
+            Err(Errno::EXIST | Errno::NOTEMPTY) => return Err(io::ErrorKind::AlreadyExists.into()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        // On Windows a directory rename cannot replace an existing directory.
+        fs::rename(staged, dest).map_err(|error| {
+            if fs::symlink_metadata(dest).is_ok() {
+                io::ErrorKind::AlreadyExists.into()
+            } else {
+                error
+            }
+        })
+    }
+    #[cfg(not(windows))]
+    rename_into_reserved_world_folder(staged, dest)
+}
+
+#[cfg(not(windows))]
+fn rename_into_reserved_world_folder(staged: &Path, dest: &Path) -> io::Result<()> {
+    // Filesystems without exclusive rename can still reserve the name with
+    // an exclusive mkdir. The empty reservation is not a listable world.
+    fs::create_dir(dest)?;
+    if let Err(error) = fs::rename(staged, dest) {
+        let _ = fs::remove_dir(dest);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// `path`, or `path (2)` if it is taken, then `path (3)` and so on.
@@ -755,34 +985,86 @@ fn unique(path: &Path) -> PathBuf {
     }
 }
 
-fn park_failed_archive(home: &Path, archive: &Path) -> Result<PathBuf> {
-    with_home_access(home, || {
-        let parked = unique(&archive.with_extension("zip.failed"));
-        fs::rename(archive, &parked)?;
-        Ok(parked)
-    })
+fn park_archive_with_access(archive: &Path, _access: &HomeAccess) -> Result<PathBuf> {
+    let parked = unique(&archive.with_extension("zip.failed"));
+    fs::rename(archive, &parked)?;
+    Ok(parked)
 }
 
-/// Rename, with a copy when the two ends are on different volumes: a pack pulled off a USB stick is
-/// still a pack the player meant to install.
-fn move_file(from: &Path, to: &Path) -> Result<()> {
-    if let Some(parent) = to.parent() {
+fn rename_pack_without_replacing(from: &Path, to: &Path) -> io::Result<()> {
+    // A failed attempt must leave the source available for another name or a copy.
+    let mut source = tempfile::TempPath::try_from_path(from)?;
+    source.disable_cleanup(true);
+    match source.persist_noclobber(to) {
+        Ok(()) => return Ok(()),
+        Err(error)
+            if error.error.kind() == io::ErrorKind::Unsupported
+                || (cfg!(target_vendor = "apple") && error.error.raw_os_error() == Some(45)) => {}
+        Err(error) => return Err(error.error),
+    }
+    // Some removable filesystems lack exclusive rename and hard links.
+    // Reserve the name without exposing partially copied archive bytes.
+    let reservation = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    drop(reservation);
+    if let Err(error) = fs::rename(from, to) {
+        let _ = fs::remove_file(to);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Move the pack when possible and stage a copy when it comes from another volume.
+fn move_pack(from: &Path, preferred: &Path, archive_bytes: u64) -> Result<(PathBuf, u64)> {
+    if let Some(parent) = preferred.parent() {
         fs::create_dir_all(parent)?;
     }
-    match fs::rename(from, to) {
-        Ok(()) => return Ok(()),
+    match publish_without_replacing(from, preferred, rename_pack_without_replacing) {
+        Ok(path) => return Ok((path, archive_bytes)),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
         Err(error) => return Err(error.into()),
     }
     let mut source = File::open(from)?;
-    publish_pack(to, |mut output| {
+    let published = publish_pack(preferred, |mut output| {
         output.set_permissions(source.metadata()?.permissions())?;
         io::copy(&mut source, &mut output)?;
         Ok(output)
     })?;
     drop(source);
-    fs::remove_file(from)?;
-    Ok(())
+    consume_installed_archive(from);
+    Ok(published)
+}
+
+/// The installation has already been published. A leftover source must
+/// not turn success into an error or invite the startup scanner to re-import it.
+fn consume_installed_archive(archive: &Path) {
+    let error = match fs::remove_file(archive) {
+        Ok(()) => return,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => error,
+    };
+    if fs::symlink_metadata(archive).is_ok_and(|meta| meta.is_dir()) {
+        log::warn!(
+            "Horizon: installed {} but the source path now names a directory",
+            archive.display()
+        );
+        return;
+    }
+    let leftover = unique(&archive.with_extension("zip.imported"));
+    match fs::rename(archive, &leftover) {
+        Ok(()) => log::warn!(
+            "Horizon: installed {} but could not delete the source: {error}; left it as {}",
+            archive.display(),
+            leftover.display()
+        ),
+        Err(rename_error) if rename_error.kind() == io::ErrorKind::NotFound => {}
+        Err(rename_error) => log::warn!(
+            "Horizon: installed {} but could not clean up the source: {error}; could not rename it: {rename_error}",
+            archive.display()
+        ),
+    }
 }
 
 fn clear_pack_staging(folder: &Path) -> io::Result<()> {
@@ -794,8 +1076,13 @@ fn clear_pack_staging(folder: &Path) -> io::Result<()> {
 
 /// The home lock serializes these writes. The staging file lives on the pack's
 /// volume but has no ZIP extension, so a partial archive is never discoverable.
-fn publish_pack(dest: &Path, write: impl FnOnce(File) -> Result<File>) -> Result<()> {
-    let folder = dest.parent().ok_or("the resource pack needs a folder")?;
+fn publish_pack(
+    preferred: &Path,
+    write: impl FnOnce(File) -> Result<File>,
+) -> Result<(PathBuf, u64)> {
+    let folder = preferred
+        .parent()
+        .ok_or("the resource pack needs a folder")?;
     fs::create_dir_all(folder)?;
     clear_pack_staging(folder)?;
     let temporary = folder.join(PACK_IMPORT_STAGING);
@@ -803,12 +1090,13 @@ fn publish_pack(dest: &Path, write: impl FnOnce(File) -> Result<File>) -> Result
         .write(true)
         .create_new(true)
         .open(&temporary)?;
-    let published = (|| -> Result<()> {
+    let published = (|| -> Result<_> {
         let file = write(file)?;
         file.sync_all()?;
+        let bytes = file.metadata()?.len();
         drop(file);
-        fs::rename(&temporary, dest)?;
-        Ok(())
+        let path = publish_without_replacing(&temporary, preferred, rename_pack_without_replacing)?;
+        Ok((path, bytes))
     })();
     if published.is_err() {
         let _ = clear_pack_staging(folder);
@@ -829,22 +1117,22 @@ pub fn pack(folder: &Path, out: &Path, mut progress: impl FnMut(usize, u64)) -> 
     let kind = Kind::ALL
         .iter()
         .copied()
-        .find(|kind| folder.join(kind.marker()).is_file())
+        .find(|kind| kind.markers().any(|marker| folder.join(marker).is_file()))
         .ok_or_else(|| {
             format!(
                 "{} holds none of the three kinds: no {} at its root",
                 folder.display(),
                 Kind::ALL
                     .iter()
-                    .map(|k| k.marker())
+                    .flat_map(|kind| kind.markers())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         })?;
     let top = folder
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
         .ok_or("the folder has no name to give the archive")?;
+    let top = zip_path(Path::new(top))?;
     let root = fs::canonicalize(folder)?;
     let parent = out
         .parent()
@@ -860,7 +1148,10 @@ pub fn pack(folder: &Path, out: &Path, mut progress: impl FnMut(usize, u64)) -> 
     } else {
         destination
     };
-    if destination == root.join(kind.marker()) {
+    if kind
+        .markers()
+        .any(|marker| destination == root.join(marker))
+    {
         return Err("the archive cannot replace the source folder's metadata".into());
     }
     // A nested output may replace an earlier export of this kind, but never
@@ -910,6 +1201,50 @@ pub fn pack(folder: &Path, out: &Path, mut progress: impl FnMut(usize, u64)) -> 
     }
 }
 
+/// Encode filesystem path components as a ZIP name without changing their spelling.
+pub(crate) fn zip_path(path: &Path) -> io::Result<String> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Cannot preserve this path in a Horizon ZIP: {}", path.display()),
+        )
+    };
+    let mut name = String::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(invalid());
+        };
+        let component = component.to_str().ok_or_else(&invalid)?;
+        if component.contains(['\\', ':', '\0']) {
+            return Err(invalid());
+        }
+        if !name.is_empty() {
+            name.push('/');
+        }
+        name.push_str(component);
+    }
+    if name.is_empty() {
+        return Err(invalid());
+    }
+    Ok(name)
+}
+
+/// Add a file of known length, with room for deflate expansion at the ZIP32 limit.
+pub(crate) fn write_zip_entry<W: io::Write + io::Seek>(
+    zip: &mut ZipWriter<W>,
+    name: &str,
+    source: impl Read,
+    size: u64,
+    options: SimpleFileOptions,
+) -> Result<u64> {
+    zip.start_file(name, options.large_file(size >= 1 << 31))?;
+    let copied = io::copy(&mut source.take(size.saturating_add(1)), zip)?;
+    if copied != size {
+        return Err(format!("File changed size during archive creation: {name}").into());
+    }
+    Ok(copied)
+}
+
 /// Walk `dir` into `zip` under `top`. Symlinks are refused on the way out for the same reason
 /// [`Pack::unpack`] refuses them on the way in, and a running world's `session.lock` is left out
 /// because it means "someone is in here", not anything worth importing.
@@ -945,22 +1280,49 @@ fn write_tree(
         if !kind.is_file() {
             continue;
         }
-        let relative = path
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if is_junk(&relative) {
+        let relative = zip_path(path.strip_prefix(root)?)?;
+        if relative == "session.lock" || is_junk(&relative) {
             continue;
         }
-        zip.start_file(format!("{top}/{relative}"), options)?;
-        let mut source = File::open(&path)?;
-        bytes += io::copy(&mut source, zip)?;
+        let source = File::open(&path)?;
+        let size = source.metadata()?.len();
+        bytes += write_zip_entry(zip, &format!("{top}/{relative}"), source, size, options)?;
         files += 1;
         if files % 256 == 0 {
             progress(files, bytes);
         }
     }
     Ok((files, bytes))
+}
+
+fn is_manual_zip(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        && path.is_file()
+        && !download::reserved_archive(path)
+}
+
+fn manual_zips_in_import_order(home: &Path) -> Vec<PathBuf> {
+    let mut archives: Vec<_> = fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_manual_zip(&path) {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    // A later resource install replaces an earlier one. Process the newest
+    // ZIP last, using the path as a stable tie-breaker on coarse filesystems.
+    archives.sort_unstable();
+    archives.into_iter().map(|(_, path)| path).collect()
 }
 
 /// The phone's other door: archives that arrive with no network involved, dropped into `Documents`
@@ -972,15 +1334,17 @@ fn write_tree(
 /// the next launch does not fail in the same place all over again.
 pub fn scan(home: &Path) -> Vec<Installed> {
     let mut installed = Vec::new();
-    let Ok(entries) = fs::read_dir(home) else {
-        return installed;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file()
-            || path.extension().and_then(|e| e.to_str()) != Some("zip")
-            || download::reserved_archive(&path)
-        {
+    for path in manual_zips_in_import_order(home) {
+        let access = match acquire_home_access(home) {
+            Ok(access) => access,
+            Err(error) => {
+                log::warn!("Horizon: could not access the import folder: {error}");
+                break;
+            }
+        };
+        // A Wi-Fi upload can have finished installing this archive while we
+        // waited for the transaction. Open only the file still at this path.
+        if !is_manual_zip(&path) {
             continue;
         }
         let pack = match Pack::open(&path) {
@@ -991,7 +1355,7 @@ pub fn scan(home: &Path) -> Vec<Installed> {
                 continue;
             }
         };
-        match pack.install(home) {
+        match pack.install_with_access(home, &access, || true) {
             Ok(placed) => {
                 log::info!(
                     "Horizon: imported {} {} to {} ({} files, {} bytes)",
@@ -1007,7 +1371,7 @@ pub fn scan(home: &Path) -> Vec<Installed> {
                 );
                 installed.push(placed);
             }
-            Err(error) => match park_failed_archive(home, &path) {
+            Err(error) => match park_archive_with_access(&path, &access) {
                 Ok(parked) => log::error!(
                     "Horizon: {} would not import: {error}; leaving it as {}",
                     path.display(),
@@ -1060,10 +1424,39 @@ mod tests {
         .collect()
     }
 
+    fn write_prepared_tree(root: &Path, payload: &str) -> io::Result<()> {
+        fs::create_dir_all(root)?;
+        for (name, body) in prepared_entries() {
+            fs::write(root.join(name), body)?;
+        }
+        fs::write(root.join("payload.txt"), payload)
+    }
+
     fn prepared() -> Vec<(&'static str, String)> {
         let mut entries = prepared_entries();
         entries.push(("assets/minecraft/textures/block/grass.png", "png".into()));
         entries
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn oversized_world_is_rejected_before_unpacking() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("large-world.zip");
+        let mut zip = ZipWriter::new(File::create(&path).unwrap());
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zip.start_file("World/level.dat", options).unwrap();
+        zip.write_all(b"world metadata").unwrap();
+        zip.start_file("World/large.bin", options.large_file(true))
+            .unwrap();
+        io::copy(&mut io::repeat(0).take(MAX_UNPACKED), &mut zip).unwrap();
+        zip.finish().unwrap();
+
+        let error = Pack::open(&path)
+            .err()
+            .expect("ZIP should be refused before unpacking");
+        assert!(error.to_string().contains("4 GiB unpacked import limit"));
+        assert_eq!(fs::read_dir(home.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -1082,6 +1475,58 @@ mod tests {
         // The archive is a copy of what the computer still has, so it does not stay.
         assert!(!archive.exists());
         assert!(!home.join("resources.unpacking").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn automatic_import_keeps_game_files_installed_after_the_source_lookup() {
+        let home = temp_home("automatic-late-install");
+        let download = home.join("automatic.zip");
+        let manual = home.join("manual.zip");
+        let expected = resource_marker(&home).unwrap();
+
+        write_archive(&download, &prepared());
+        let mut entries = prepared_entries();
+        entries.push(("manual-install.txt", "keep me".into()));
+        write_archive(&manual, &entries);
+        std::thread::scope(|scope| {
+            let access = acquire_home_access(&home).unwrap();
+            let (answer, result) = std::sync::mpsc::channel();
+            let (archive, game_home, marker) = (&download, &home, &expected);
+            scope.spawn(move || {
+                let outcome = install_game_files_if_current(archive, game_home, marker);
+                answer
+                    .send(
+                        outcome
+                            .map(|installed| installed.is_none())
+                            .map_err(|error| error.to_string()),
+                    )
+                    .unwrap();
+            });
+            assert!(matches!(
+                result.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            Pack::open(&manual)
+                .unwrap()
+                .install_with_access(&home, &access, || true)
+                .unwrap();
+            drop(access);
+            assert!(result.recv().unwrap().unwrap());
+        });
+        let installed = home.join("resources/manual-install.txt");
+        assert_eq!(fs::read(&installed).unwrap(), b"keep me");
+        assert!(download.is_file());
+
+        // A repair of exactly the files that were present when setup started is allowed.
+        let expected = resource_marker(&home).unwrap();
+        assert!(
+            install_game_files_if_current(&download, &home, &expected)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!installed.exists());
+        assert!(!download.exists());
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -1231,6 +1676,36 @@ mod tests {
     }
 
     #[test]
+    fn startup_scan_leaves_an_upload_to_the_transaction_that_landed_it() {
+        let home = temp_home("scan-during-upload");
+        let archive = home.join("uploaded.zip");
+        write_archive(&archive, &[("level.dat", "uploaded world")]);
+
+        let access = acquire_home_access(&home).unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let scanner_home = home.clone();
+        let scanner = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            scan(&scanner_home)
+        });
+        waiting.recv().unwrap();
+
+        let installed = Pack::open(&archive)
+            .unwrap()
+            .install_with_access(&home, &access, || true)
+            .unwrap();
+        drop(access);
+        assert!(scanner.join().unwrap().is_empty());
+        assert_eq!(
+            fs::read(installed.path.join("level.dat")).unwrap(),
+            b"uploaded world"
+        );
+        assert_eq!(fs::read_dir(home.join("saves")).unwrap().count(), 1);
+        assert!(!archive.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn recovery_waits_for_an_active_home_transaction_even_through_an_alias() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -1251,8 +1726,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             with_home_access(&writer_home, || {
                 let scratch = writer_home.join("resources.unpacking");
-                fs::create_dir_all(&scratch)?;
-                fs::write(scratch.join("horizon-resources.json"), "staged")?;
+                write_prepared_tree(&scratch, "staged")?;
                 entered.send(()).unwrap();
                 release_rx.recv().unwrap();
                 fs::write(scratch.join("complete.txt"), "complete")?;
@@ -1634,14 +2108,20 @@ mod tests {
             &[
                 ("MyWorld/level.dat", "nbt"),
                 ("MyWorld/session.lock", "locked"),
+                ("MyWorld/data/session.lock", "nested data"),
+                ("session.lock", "lock beside wrapper"),
                 ("__MACOSX/MyWorld/._level.dat", "junk"),
                 (".DS_Store", "junk"),
             ],
         );
         let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
         assert_eq!(installed.kind, Kind::World);
-        assert_eq!(installed.files, 1);
+        assert_eq!(installed.files, 2);
         assert_eq!(installed.path, home.join("saves/MyWorld"));
+        assert_eq!(
+            fs::read(installed.path.join("data/session.lock")).unwrap(),
+            b"nested data"
+        );
         assert!(home.join("saves/MyWorld/level.dat").is_file());
         assert!(!home.join("saves/MyWorld/session.lock").exists());
         fs::remove_dir_all(home).unwrap();
@@ -1835,6 +2315,55 @@ mod tests {
     }
 
     #[test]
+    fn pack_publication_keeps_a_pack_that_arrived_while_staging() {
+        let home = temp_home("pack-publication-collision");
+        let preferred = home.join("resourcepacks/Shared.zip");
+        let (installed, bytes) = publish_pack(&preferred, |mut output| {
+            output.write_all(b"imported pack")?;
+            assert!(!preferred.exists());
+            fs::write(&preferred, b"arriving pack")?;
+            Ok(output)
+        })
+        .unwrap();
+
+        assert_eq!(installed, home.join("resourcepacks/Shared (2).zip"));
+        assert_eq!(fs::read(preferred).unwrap(), b"arriving pack");
+        assert_eq!(fs::read(installed).unwrap(), b"imported pack");
+        assert_eq!(bytes, 13);
+        assert!(
+            !home
+                .join("resourcepacks")
+                .join(PACK_IMPORT_STAGING)
+                .exists()
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn pack_rename_retries_after_a_competing_file_claims_the_name() {
+        let home = temp_home("pack-rename-collision");
+        let staged = home.join("staged");
+        let preferred = home.join("Shared.zip");
+        fs::write(&staged, b"imported pack").unwrap();
+        let mut claimed = false;
+        let installed = publish_without_replacing(&staged, &preferred, |from, to| {
+            if !claimed {
+                assert_eq!(to, preferred);
+                fs::write(to, b"arriving pack")?;
+                claimed = true;
+            }
+            rename_pack_without_replacing(from, to)
+        })
+        .unwrap();
+
+        assert_eq!(installed, home.join("Shared (2).zip"));
+        assert_eq!(fs::read(preferred).unwrap(), b"arriving pack");
+        assert_eq!(fs::read(installed).unwrap(), b"imported pack");
+        assert!(!staged.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_flat_resource_pack_keeps_its_original_archive_bytes() {
         let home = temp_home("resource-pack-flat-bytes");
         let archive = home.join("flat.zip");
@@ -1959,6 +2488,41 @@ mod tests {
     }
 
     #[test]
+    fn world_import_uses_another_name_if_the_first_is_claimed_during_publication() {
+        let movers = [
+            rename_world_without_replacing as fn(&Path, &Path) -> io::Result<()>,
+            #[cfg(not(windows))]
+            rename_into_reserved_world_folder,
+        ];
+        for rename in movers {
+            let home = temp_home("world-publication-collision");
+            let staged = home.join("staged");
+            let preferred = home.join("My World");
+            fs::create_dir(&staged).unwrap();
+            fs::write(staged.join("level.dat"), b"imported world").unwrap();
+            let mut claimed = false;
+            let installed = publish_without_replacing(&staged, &preferred, |from, to| {
+                if !claimed {
+                    assert_eq!(to, preferred);
+                    fs::create_dir(to)?;
+                    claimed = true;
+                }
+                rename(from, to)
+            })
+            .unwrap();
+
+            assert_eq!(installed, home.join("My World (2)"));
+            assert_eq!(fs::read_dir(&preferred).unwrap().count(), 0);
+            assert_eq!(
+                fs::read(installed.join("level.dat")).unwrap(),
+                b"imported world"
+            );
+            assert!(!staged.exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
     fn interrupted_world_stays_off_the_list_and_can_be_reimported() {
         let home = temp_home("interrupted-world");
         let saves = home.join("saves");
@@ -2014,23 +2578,16 @@ mod tests {
                 "partial",
             )
             .unwrap();
+            fs::write(home.join("resources.unpacking/staged.txt"), "partial").unwrap();
             if previous {
-                fs::create_dir_all(home.join("resources.previous")).unwrap();
-                fs::write(
-                    home.join("resources.previous/facts.json"),
-                    "old complete tree",
-                )
-                .unwrap();
+                write_prepared_tree(&home.join("resources.previous"), "old complete tree").unwrap();
             }
             let recovered = recover(&home).unwrap();
-            assert!(
-                !home.join("resources/horizon-resources.json").exists(),
-                "incomplete extraction was published"
-            );
+            assert!(!home.join("resources/staged.txt").exists());
             if previous {
                 assert_eq!(recovered, Some(home.join("resources")));
                 assert_eq!(
-                    fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+                    fs::read_to_string(home.join("resources/payload.txt")).unwrap(),
                     "old complete tree"
                 );
             } else {
@@ -2051,7 +2608,12 @@ mod tests {
         let archive = home.join("game.zip");
         write_archive(&archive, &prepared());
 
-        assert!(Pack::open(&archive).unwrap().unpack(&scratch).is_err());
+        assert!(
+            Pack::open(&archive)
+                .unwrap()
+                .unpack(&scratch, &|| true)
+                .is_err()
+        );
         assert_eq!(fs::read(scratch.join("existing")).unwrap(), b"keep");
         assert!(!scratch.join("horizon-resources.json").exists());
         assert!(archive.is_file());
@@ -2059,20 +2621,54 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_prepared_import_before_publication_leaves_the_installed_files() {
+    fn a_blocked_staging_rename_cleans_the_unpublished_resources() {
+        let home = temp_home("blocked-resource-staging");
+        let archive = home.join("game.zip");
+        let resources = home.join("resources");
+        let staged = home.join("resources.staged");
+        fs::create_dir(&resources).unwrap();
+        fs::write(resources.join("horizon-resources.json"), "installed").unwrap();
+        fs::write(&staged, "unrelated file at the staging path").unwrap();
+        write_archive(&archive, &prepared());
+
+        assert!(Pack::open(&archive).unwrap().install(&home).is_err());
+        assert!(!home.join("resources.unpacking").exists());
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            b"unrelated file at the staging path"
+        );
+        assert_eq!(
+            fs::read(resources.join("horizon-resources.json")).unwrap(),
+            b"installed"
+        );
+        assert!(archive.is_file());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn cancelling_during_extraction_leaves_the_installed_files_and_archive() {
         let home = temp_home("cancelled-import");
         let resources = home.join("resources");
         fs::create_dir(&resources).unwrap();
         fs::write(resources.join("horizon-resources.json"), b"installed").unwrap();
         let archive = home.join("game.zip");
-        write_archive(&archive, &prepared());
-        let checks = std::cell::Cell::new(0);
+        let large_size = 3 << 20;
+        let mut entries = prepared();
+        entries.push(("large-file", "a".repeat(large_size)));
+        write_archive(&archive, &entries);
+        let staged_file = home.join("resources.unpacking/large-file");
+        let cancelled_at = std::cell::Cell::new(None);
         let result = Pack::open(&archive).unwrap().install_guarded(&home, || {
-            checks.set(checks.get() + 1);
-            checks.get() == 1
+            let copied = fs::metadata(&staged_file).map_or(0, |file| file.len());
+            if copied == 0 {
+                return true;
+            }
+            cancelled_at.set(Some(copied));
+            false
         });
-        assert!(result.is_err());
-        assert_eq!(checks.get(), 2);
+        assert_eq!(result.unwrap_err().to_string(), "the import was cancelled");
+        let copied = cancelled_at.get().expect("cancellation during extraction");
+        assert!(copied < large_size as u64);
         assert_eq!(
             fs::read(resources.join("horizon-resources.json")).unwrap(),
             b"installed"
@@ -2080,6 +2676,42 @@ mod tests {
         assert!(archive.is_file());
         assert!(!home.join("resources.unpacking").exists());
         assert!(!home.join("resources.staged").exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_already_consumed_world_archive_is_not_installed_again() {
+        let home = temp_home("world-source-consumed");
+        let archive = home.join("world.zip");
+        write_archive(&archive, &[("level.dat", "world fixture")]);
+        let first = Pack::open(&archive).unwrap();
+        let second = Pack::open(&archive).unwrap();
+
+        first.install(&home).unwrap();
+        assert!(second.install(&home).is_err());
+        assert_eq!(fs::read_dir(home.join("saves")).unwrap().count(), 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_removed_source_does_not_fail_a_published_import() {
+        let home = temp_home("source-removed");
+        let archive = home.join("game.zip");
+        write_archive(&archive, &prepared());
+        let checks = std::cell::Cell::new(0);
+        let installed = Pack::open(&archive)
+            .unwrap()
+            .install_guarded(&home, || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    fs::remove_file(&archive).unwrap();
+                }
+                true
+            })
+            .unwrap();
+        assert_eq!(installed.kind, Kind::Resources);
+        assert!(installed.path.join("horizon-resources.json").is_file());
+        assert!(!archive.exists());
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2135,10 +2767,37 @@ mod tests {
     }
 
     #[test]
+    fn retry_preserves_a_usable_backup_when_the_live_install_is_damaged() {
+        let home = tempfile::tempdir().unwrap();
+        let dest = home.path().join("resources");
+        let previous = home.path().join("resources.previous");
+        let staged = home.path().join("resources.staged");
+        write_prepared_tree(&dest, "damaged installation").unwrap();
+        fs::remove_file(dest.join("facts.json")).unwrap();
+        write_prepared_tree(&previous, "last usable installation").unwrap();
+        write_prepared_tree(&staged, "new installation").unwrap();
+
+        let error = publish(&staged, &dest, |from, to| {
+            if from == staged {
+                return Err(io::Error::other("simulated retry failure"));
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("simulated retry failure"));
+        assert_eq!(
+            fs::read_to_string(dest.join("payload.txt")).unwrap(),
+            "last usable installation"
+        );
+        assert!(damaged_prepared(&dest).is_none());
+        assert!(staged.is_dir());
+    }
+
+    #[test]
     fn a_swap_left_half_done_is_finished() {
         let home = temp_home("swap");
-        fs::create_dir_all(home.join("resources.staged")).unwrap();
-        fs::write(home.join("resources.staged/horizon-resources.json"), "{}").unwrap();
+        write_prepared_tree(&home.join("resources.staged"), "new files").unwrap();
         assert_eq!(recover(&home).unwrap(), Some(home.join("resources")));
         assert!(home.join("resources/horizon-resources.json").is_file());
         fs::remove_dir_all(home).unwrap();
@@ -2147,23 +2806,78 @@ mod tests {
     #[test]
     fn a_crash_between_the_two_renames_puts_the_old_tree_back() {
         let home = temp_home("previous");
-        fs::create_dir_all(home.join("resources.previous")).unwrap();
-        fs::write(home.join("resources.previous/facts.json"), "{}").unwrap();
+        write_prepared_tree(&home.join("resources.previous"), "previous files").unwrap();
         assert_eq!(recover(&home).unwrap(), Some(home.join("resources")));
         assert!(home.join("resources/facts.json").is_file());
         fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
+    fn recovery_restores_usable_files_when_the_interrupted_copy_is_damaged() {
+        for (broken, obstruction) in [
+            ("resources.staged", false),
+            ("resources", false),
+            ("resources", true),
+        ] {
+            let home = temp_home(broken);
+            let previous = home.join("resources.previous");
+            let dest = home.join("resources");
+            write_prepared_tree(&previous, "last usable installation").unwrap();
+            let broken = home.join(broken);
+            if obstruction {
+                fs::write(&broken, "unrelated data").unwrap();
+            } else {
+                write_prepared_tree(&broken, "interrupted installation").unwrap();
+                fs::write(broken.join("facts.json"), "").unwrap();
+            }
+
+            assert_eq!(recover(&home).unwrap(), Some(dest.clone()));
+            assert_eq!(
+                fs::read_to_string(dest.join("payload.txt")).unwrap(),
+                "last usable installation"
+            );
+            assert!(!previous.exists());
+            if obstruction {
+                assert_eq!(
+                    fs::read(home.join("resources.obstructed")).unwrap(),
+                    b"unrelated data"
+                );
+            }
+            assert!(!home.join("resources.staged").exists());
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_does_not_publish_a_damaged_first_install() {
+        let home = temp_home("damaged-first-install");
+        let staged = home.join("resources.staged");
+        write_prepared_tree(&staged, "interrupted installation").unwrap();
+        fs::remove_file(staged.join("items.json")).unwrap();
+
+        assert_eq!(recover(&home).unwrap(), None);
+        assert!(!home.join("resources").exists());
+        assert!(!staged.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn a_leftover_scratch_does_not_bury_a_good_tree() {
-        // A leftover scratch beside a good tree is dropped, not promoted over it.
         let home = temp_home("stale-scratch");
-        fs::create_dir_all(home.join("resources")).unwrap();
-        fs::write(home.join("resources/facts.json"), "{}").unwrap();
+        let dest = home.join("resources");
+        write_prepared_tree(&dest, "active installation").unwrap();
+        write_prepared_tree(&home.join("resources.staged"), "unpublished installation").unwrap();
+        write_prepared_tree(&home.join("resources.previous"), "older installation").unwrap();
         fs::create_dir_all(home.join("resources.unpacking")).unwrap();
+
         assert!(recover(&home).unwrap().is_none());
         assert!(!home.join("resources.unpacking").exists());
-        assert!(home.join("resources/facts.json").is_file());
+        assert!(!home.join("resources.staged").exists());
+        assert!(!home.join("resources.previous").exists());
+        assert_eq!(
+            fs::read_to_string(dest.join("payload.txt")).unwrap(),
+            "active installation"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -2182,6 +2896,45 @@ mod tests {
     }
 
     #[test]
+    fn drop_folder_installs_archives_oldest_first_with_a_stable_tie_breaker() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let scratch = tempfile::tempdir().unwrap();
+        for (name, seconds, source) in [
+            ("C.ZIP", 300, "newest"),
+            ("A.zip", 300, "same-time"),
+            ("Z.zip", 200, "oldest"),
+        ] {
+            let path = scratch.path().join(name);
+            let mut entries = prepared();
+            entries.push(("source.txt", source.into()));
+            write_archive(&path, &entries);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000 + seconds)),
+                )
+                .unwrap();
+        }
+        let ordered = manual_zips_in_import_order(scratch.path());
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|path| path.file_name().unwrap())
+                .collect::<Vec<_>>(),
+            ["Z.zip", "A.zip", "C.ZIP"]
+        );
+        assert_eq!(scan(scratch.path()).len(), 3);
+        assert_eq!(
+            fs::read(scratch.path().join("resources/source.txt")).unwrap(),
+            b"newest"
+        );
+    }
+
+    #[test]
     fn startup_scan_does_not_consume_automatic_download_cache_archives() {
         let mut failures = Vec::new();
         for (index, (name, marker)) in [
@@ -2190,9 +2943,9 @@ mod tests {
                 "horizon-download-00000000-0000-4000-8000-000000000001.zip",
                 "level.dat",
             ),
-            ("HORIZON-DOWNLOAD.zip", "horizon-resources.json"),
+            ("HORIZON-DOWNLOAD.ZIP", "horizon-resources.json"),
             (
-                "horizon-download-ABCDEFAB-0000-4ABC-8ABC-ABCDEFABCDEF.zip",
+                "horizon-download-ABCDEFAB-0000-4ABC-8ABC-ABCDEFABCDEF.ZiP",
                 "horizon-resources.json",
             ),
         ]
@@ -2346,6 +3099,113 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
+    fn export_writes_a_world_with_a_zip64_entry() {
+        let scratch = tempfile::tempdir().unwrap();
+        let world = scratch.path().join("World");
+        fs::create_dir(&world).unwrap();
+        let metadata = b"world metadata";
+        fs::write(world.join("level.dat"), metadata).unwrap();
+        let size = u64::from(u32::MAX) + 1;
+        File::create(world.join("large.bin"))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let output = scratch.path().join("export.zip");
+
+        let exported = pack(&world, &output, |_, _| {}).unwrap();
+        assert_eq!(exported.kind, Kind::World);
+        assert_eq!(exported.bytes, size + metadata.len() as u64);
+        let mut zip = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let entry = zip.by_name("World/large.bin").unwrap();
+        assert_eq!(entry.size(), size);
+        assert!(entry.compressed_size() < size);
+    }
+
+    #[test]
+    fn dot_components_are_normalized_when_detecting_and_installing_a_world() {
+        let scratch = tempfile::tempdir().unwrap();
+        let archive = scratch.path().join("world.zip");
+        write_archive(
+            &archive,
+            &[
+                ("./Outer/./World/level.dat", "metadata"),
+                ("./Outer/World/region//r.0.0.mca", "chunks"),
+                ("./__MACOSX/junk", "ignored"),
+            ],
+        );
+        let pack = Pack::open(&archive).unwrap();
+        assert_eq!(pack.kind, Kind::World);
+        let world = pack.install(&scratch.path().join("home")).unwrap().path;
+        assert_eq!(fs::read(world.join("level.dat")).unwrap(), b"metadata");
+        assert_eq!(fs::read(world.join("region/r.0.0.mca")).unwrap(), b"chunks");
+    }
+
+    #[test]
+    fn a_pack_with_dot_components_is_rewritten_even_without_a_wrapper() {
+        let scratch = tempfile::tempdir().unwrap();
+        let archive = scratch.path().join("pack.zip");
+        write_archive(
+            &archive,
+            &[
+                ("./pack.mcmeta", "metadata"),
+                ("assets/./test/data.txt", "asset"),
+            ],
+        );
+        let pack = Pack::open(&archive).unwrap();
+        assert_eq!(pack.kind, Kind::ResourcePack);
+        let installed = pack.install(&scratch.path().join("home")).unwrap().path;
+        let mut zip = ZipArchive::new(File::open(installed).unwrap()).unwrap();
+        assert!(zip.by_name("pack.mcmeta").is_ok());
+        assert!(zip.by_name("assets/test/data.txt").is_ok());
+    }
+
+    #[test]
+    fn archive_detection_does_not_ignore_files_outside_a_nested_world() {
+        let scratch = tempfile::tempdir().unwrap();
+        let archive = scratch.path().join("world.zip");
+        for outside in ["notes.txt", "Outer/notes.txt"] {
+            write_archive(
+                &archive,
+                &[("Outer/World/level.dat", "metadata"), (outside, "notes")],
+            );
+            assert!(Pack::open(&archive).is_err(), "{outside} is outside the world");
+        }
+
+        write_archive(
+            &archive,
+            &[
+                ("Outer/World/level.dat", "metadata"),
+                ("Outer/World/region/r.0.0.mca", "chunks"),
+                ("Outer/.DS_Store", "ignored"),
+            ],
+        );
+        let pack = Pack::open(&archive).unwrap();
+        assert_eq!(pack.kind, Kind::World);
+        assert_eq!(pack.prefix, "Outer/World/");
+    }
+
+    #[test]
+    fn world_with_only_recovery_metadata_round_trips_through_zip() {
+        let scratch = tempfile::tempdir().unwrap();
+        let world = scratch.path().join("Recovered World");
+        fs::create_dir(&world).unwrap();
+        fs::write(world.join("level.dat_old"), b"recovery metadata").unwrap();
+        let archive = scratch.path().join("backup.zip");
+        let exported = pack(&world, &archive, |_, _| {}).unwrap();
+        assert_eq!(exported.kind, Kind::World);
+        let opened = Pack::open(&archive).unwrap();
+        assert_eq!(opened.kind, Kind::World);
+        assert_eq!(opened.item, "Recovered World");
+        let installed = opened.install(&scratch.path().join("restored")).unwrap();
+        assert_eq!(
+            fs::read(installed.path.join("level.dat_old")).unwrap(),
+            b"recovery metadata"
+        );
+        assert!(!installed.path.join("level.dat").exists());
+    }
+
+    #[test]
     fn a_real_folder_round_trips_through_the_archive() {
         let home = temp_home("round");
         let source = home.join("Horizon-26.3");
@@ -2433,11 +3293,35 @@ mod tests {
     }
 
     #[test]
+    fn startup_keeps_a_successful_repair_when_the_bundled_root_is_damaged() {
+        let root = tempfile::tempdir().unwrap();
+        let sibling = root.path().join("bundle");
+        let home = root.path().join("Documents");
+        fs::create_dir(&sibling).unwrap();
+        fs::create_dir(&home).unwrap();
+        for (name, contents) in prepared_entries() {
+            fs::write(sibling.join(name), contents).unwrap();
+        }
+        let archive = root.path().join("repair.zip");
+        write_archive(&archive, &prepared());
+        let installed = Pack::open(&archive).unwrap().install(&home).unwrap();
+
+        assert_eq!(resources_root(&sibling, Some(&home)), Some(sibling.clone()));
+        fs::write(sibling.join("facts.json"), "").unwrap();
+        assert_eq!(
+            resources_root(&sibling, Some(&home)),
+            Some(installed.path.clone())
+        );
+        fs::remove_file(installed.path.join("items.json")).unwrap();
+        assert_eq!(resources_root(&sibling, Some(&home)), Some(sibling));
+    }
+
+    #[test]
     fn an_archive_dropped_in_documents_is_where_the_game_then_looks() {
         let dir = temp_home("usb");
         let home = dir.join("Documents");
         fs::create_dir_all(&home).unwrap();
-        write_archive(&home.join("Horizon-26.3.zip"), &prepared());
+        write_archive(&home.join("Horizon-26.3.ZIP"), &prepared());
         assert_eq!(scan(&home).len(), 1);
         assert_eq!(
             resources_root(&dir.join("Horizon.app/resources"), Some(&home)).unwrap(),
@@ -2454,5 +3338,6 @@ mod tests {
         // An escape sequence is dropped with the brackets: what is left cannot paint a terminal.
         assert_eq!(sanitize("o\u{1b}[2J"), "o2J");
         assert_eq!(sanitize(&"a".repeat(100)).len(), 64);
+        assert_eq!(sanitize(&"𐐀".repeat(64)).len(), 236);
     }
 }

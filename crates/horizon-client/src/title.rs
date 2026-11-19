@@ -206,7 +206,7 @@ impl WorldEntry {
     }
     /// `LevelSummary.primaryActionActive`: a corrupted world offers recovery.
     fn can_play(&self) -> bool {
-        self.corrupted || !self.disabled()
+        !self.locked && (self.corrupted || self.compatible())
     }
     /// `LevelSummary.canEdit` and `canRecreate`.
     fn can_edit(&self) -> bool {
@@ -578,6 +578,13 @@ pub fn parse_seed(text: &str) -> Option<i64> {
         )
     }))
 }
+/// World dates must fit both SystemTime and the date formatter used by the list.
+fn saved_last_played(millis: i64) -> Option<std::time::SystemTime> {
+    chrono::DateTime::from_timestamp_millis(millis)?;
+    let millis = u64::try_from(millis).ok()?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(millis))
+}
+
 pub fn list_worlds(saves: &Path) -> Vec<WorldEntry> {
     let mut worlds: Vec<WorldEntry> = std::fs::read_dir(saves)
         .into_iter()
@@ -593,31 +600,36 @@ pub fn list_worlds(saves: &Path) -> Vec<WorldEntry> {
             let folder = e.file_name().to_string_lossy().into_owned();
             // readLevelSummary reads level.dat alone; when it fails the world is
             // still listed, as a CorruptedLevelSummary named after its folder.
-            let level = Level::read_summary(&path);
             let root = crate::save::read_dat(&path.join("level.dat"));
-            let (Some(level), Some(root)) = (level, root) else {
-                return Some(WorldEntry::corrupted(folder, modified));
+            let locked = crate::save::SessionLock::is_locked(&path);
+            let Some(metadata) = root.as_ref().and_then(crate::save::LevelMetadata::from_root) else {
+                return Some(WorldEntry {
+                    locked,
+                    ..WorldEntry::corrupted(folder, modified)
+                });
             };
-            let data = root.get("Data")?;
+            let data = metadata.data;
             let modified = match data.get("LastPlayed") {
-                Some(horizon_core::nbt::Tag::Long(millis)) if *millis >= 0 => std::time::UNIX_EPOCH + std::time::Duration::from_millis(*millis as u64),
+                Some(horizon_core::nbt::Tag::Long(millis)) => {
+                    saved_last_played(*millis).unwrap_or(modified)
+                }
                 _ => modified,
             };
             Some(WorldEntry {
                 folder,
-                name: level.name,
-                game_mode: level.game_mode,
-                hardcore: level.hardcore,
+                name: metadata.name(),
+                game_mode: metadata.game_type() as i32,
+                hardcore: metadata.hardcore(),
                 modified,
                 commands: matches!(data.get("allowCommands"), Some(horizon_core::nbt::Tag::Byte(v)) if *v != 0),
                 version: data.get("Version").and_then(|v| v.get("Name"))
                     .and_then(|v| match v { horizon_core::nbt::Tag::String(s) => Some(s.to_string_lossy()), _ => None })
                     .unwrap_or_else(|| lang::get_or("selectWorld.versionUnknown", "Unknown")),
-                locked: crate::save::SessionLock::is_locked(&path),
+                locked,
                 corrupted: false,
-                incompatible: crate::save::incompatible_version(&path),
-                file_fixing: crate::save::needs_file_fixes(&path),
-                downgrade: crate::save::downgraded_from(&path).is_some(),
+                incompatible: metadata.incompatible_version(),
+                file_fixing: metadata.needs_file_fixes(),
+                downgrade: metadata.downgraded_from().is_some(),
                 experimental: experimental_features(data),
             })
         })
@@ -628,7 +640,7 @@ pub fn list_worlds(saves: &Path) -> Vec<WorldEntry> {
 /// The folder a new world named `name` gets in `saves` (`findResultFolder`).
 pub fn new_world_folder(saves: &Path, name: &str) -> String {
     let new_world = lang::get_or("selectWorld.newWorld", "New World");
-    world_folder::result_folder(name, &new_world, |folder| saves.join(folder).exists())
+    world_folder::result_folder(saves, name, &new_world)
 }
 
 /// `FeatureFlags.isExperimental` of `LevelStorageSource.parseFeatureFlagsFromSummary`:
@@ -1491,9 +1503,9 @@ impl Title {
             });
             return Action::None;
         }
-        if crate::save::SessionLock::acquire_validated(
+        if crate::save::SessionLock::acquire_existing(
             &self.saves.join(&world.folder),
-            &self.saves.join("allowed_symlinks.txt"),
+            Some(&self.saves.join("allowed_symlinks.txt")),
         )
         .is_err()
         {
@@ -1583,18 +1595,17 @@ impl Title {
     /// (`restoreLevelDataFromOld`); anything else is a failure.
     fn attempt_restore(&mut self, world: WorldEntry) {
         let dir = self.saves.join(&world.folder);
-        let Ok(_lock) = crate::save::SessionLock::acquire_validated(
+        let Ok(_lock) = crate::save::SessionLock::acquire_existing(
             &dir,
-            &self.saves.join("allowed_symlinks.txt"),
+            Some(&self.saves.join("allowed_symlinks.txt")),
         ) else {
+            self.return_to_list(Some(&world.folder));
             self.pending_toast = Some(WorldToast::AccessFailure(world.folder));
             return;
         };
-        let issues = recover_issues(&dir);
-        let success = issues[0].is_some()
-            && issues[1].is_none()
-            && crate::save::restore_level_data_from_old(&dir);
+        let success = crate::save::restore_level_data_from_old(&dir);
         if !success {
+            let issues = recover_issues(&dir);
             log::error!(
                 "Failed to recover world, files not as expected. level.dat: {:?}, level.dat_old: {:?}",
                 issues[0],
@@ -1610,10 +1621,13 @@ impl Title {
     /// older DataVersion is what converts it whole.
     fn begin_optimize(&mut self, world: WorldEntry, erase_cache: bool) {
         let dir = self.saves.join(&world.folder);
-        let Ok(lock) = crate::save::SessionLock::acquire_validated(
+        let Ok(lock) = crate::save::SessionLock::acquire_existing(
             &dir,
-            &self.saves.join("allowed_symlinks.txt"),
+            Some(&self.saves.join("allowed_symlinks.txt")),
         ) else {
+            if matches!(self.mode, Mode::Backup { .. }) {
+                self.return_to_list(Some(&world.folder));
+            }
             self.pending_toast = Some(WorldToast::AccessFailure(world.folder));
             return;
         };
@@ -2215,10 +2229,10 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             && (0.0..32.0).contains(&ry)
             && let Some((_, world)) = self.visible_worlds(worlds).nth(row)
         {
-            let lines = if world.corrupted {
-                Vec::new()
-            } else if world.locked {
+            let lines = if world.locked {
                 atlas.font.split(&red("selectWorld.locked"), 175.0)
+            } else if world.corrupted {
+                Vec::new()
             } else if world.incompatible.is_some() {
                 atlas
                     .font

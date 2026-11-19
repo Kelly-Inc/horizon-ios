@@ -9,9 +9,9 @@ use crate::title::confirm_top;
 use horizon_protocol::servers::{self, ServerEntry};
 pub use page::Form;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -84,11 +84,11 @@ fn player_list(players: &serde_json::Value, online: i64) -> Vec<Text> {
     lines
 }
 type Pings = Arc<Mutex<HashMap<String, Ping>>>;
-/// A saved server being dragged: where it is now, and whether it moved.
+/// A saved server being dragged: its original row and current row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held {
+    origin: usize,
     row: usize,
-    moved: bool,
 }
 /// Server icons by address as 64x64 RGBA (FaviconTexture), from servers.dat
 /// and then from each ping's favicon.
@@ -111,7 +111,8 @@ pub enum Screen {
     },
     /// Add (index None) or edit a server entry.
     Edit {
-        index: Option<usize>,
+        index: Option<(usize, ServerEntry)>,
+        save_failed: bool,
         name: String,
         address: String,
         focus: u8,
@@ -261,131 +262,220 @@ fn favicon_bytes(json: &serde_json::Value) -> Option<Vec<u8>> {
         .replace('\n', "");
     crate::skins::base64_decode(&base64)
 }
-fn ping_all(servers: &[ServerEntry], pings: &Pings, icons: &Icons, file: &Path) {
-    for s in servers {
-        let address = s.ip.clone();
-        pings.lock().unwrap().insert(address.clone(), Ping::Pinging);
-        let saved = s.icon.clone();
-        if let Some(pixels) = saved
-            .as_deref()
-            .and_then(crate::skins::base64_decode)
-            .and_then(|png| icon_pixels(&png))
-        {
-            icons.lock().unwrap().insert(address.clone(), pixels);
+const MAX_SERVER_PINGS: usize = 4;
+
+struct PingJob {
+    address: String,
+    saved: Option<String>,
+    pings: Weak<Mutex<HashMap<String, Ping>>>,
+    icons: Weak<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
+    file: Arc<PathBuf>,
+}
+
+#[derive(Default)]
+struct PingQueue {
+    pending: VecDeque<PingJob>,
+    workers: usize,
+}
+
+fn ping_queue() -> &'static Mutex<PingQueue> {
+    static QUEUE: std::sync::OnceLock<Mutex<PingQueue>> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(Mutex::default)
+}
+
+fn run_ping_worker() {
+    loop {
+        let job = {
+            let mut queue = ping_queue().lock().unwrap();
+            match queue.pending.pop_front() {
+                Some(job) => job,
+                None => {
+                    queue.workers -= 1;
+                    return;
+                }
+            }
+        };
+        if job.pings.strong_count() != 0 {
+            let (pings, address) = (job.pings.clone(), job.address.clone());
+            if let Err(error) = crate::crash::contain(|| job.run())
+                && let Some(pings) = pings.upgrade()
+            {
+                pings
+                    .lock()
+                    .unwrap()
+                    .insert(address, Ping::Failed(error.to_string()));
+            }
         }
-        let (pings, icons, file) = (pings.clone(), icons.clone(), file.to_owned());
-        let _ = std::thread::Builder::new()
-            .name("horizon-ping".into())
-            .spawn(move || {
-                let result = match crate::net::ping(&address, Duration::from_secs(5)) {
-                    Ok((json, ms)) => {
-                        let motd = crate::component::to_text(&json["description"], &mut |s| {
-                            Text::literal(s)
-                        });
-                        let players = json["players"].as_object().map(|p| {
-                            (
-                                p.get("online").and_then(|n| n.as_i64()).unwrap_or(0),
-                                p.get("max").and_then(|n| n.as_i64()).unwrap_or(0),
-                            )
-                        });
-                        let player_list = players
-                            .map(|(online, _)| player_list(&json["players"], online))
-                            .unwrap_or_default();
-                        let version = json["version"]["name"].as_str().unwrap_or("?").to_owned();
-                        // ServerStatus.version absent: `multiplayer.status.old`
-                        // and protocol 0.
-                        let protocol = json["version"]["protocol"].as_i64().unwrap_or(0);
-                        let version_text = if json["version"].is_object() {
-                            Text::literal(version.clone())
-                        } else {
-                            Text::translate("multiplayer.status.old", &[])
-                        };
-                        // A new favicon replaces the saved one (an invalid one
-                        // clears it) and servers.dat is saved again.
-                        if let Some(png) = favicon_bytes(&json) {
-                            let encoded = crate::lan::base64(&png);
-                            let pixels = icon_pixels(&png);
-                            match &pixels {
-                                Some(p) => icons.lock().unwrap().insert(address.clone(), p.clone()),
-                                None => icons.lock().unwrap().remove(&address),
-                            };
-                            // ServerData.validateIcon: up to 1024x1024 is kept,
-                            // though only a 64x64 icon is drawn.
-                            let icon = valid_icon(&png).then_some(encoded);
-                            if icon != saved {
-                                save_icon(&file, &address, icon);
-                            }
-                        }
-                        // OnlineServerEntry: SUCCESSFUL only for this game's protocol.
-                        let joinable = protocol == i64::from(horizon_protocol::PROTOCOL_VERSION)
-                            || (crate::net::older_servers_enabled()
-                                && i32::try_from(protocol)
-                                    .ok()
-                                    .and_then(
-                                        horizon_protocol::adapter::ServerVersion::from_protocol,
-                                    )
-                                    .is_some());
-                        if joinable {
-                            Ping::Ok {
-                                motd,
-                                players,
-                                player_list,
-                                ms,
-                                version,
-                            }
-                        } else {
-                            Ping::Incompatible {
-                                motd,
-                                players,
-                                player_list,
-                                version: version_text,
-                            }
-                        }
-                    }
-                    // ClientStatusPacketListener.onDisconnect without a
-                    // status: pingLegacyServer.
-                    Err(e) => match crate::net::ping_legacy(&address, Duration::from_secs(5)) {
-                        Ok(legacy) => Ping::Incompatible {
-                            motd: Text::literal(legacy.motd),
-                            players: Some((
-                                i64::from(legacy.players),
-                                i64::from(legacy.max_players),
-                            )),
-                            player_list: Vec::new(),
-                            version: Text::literal(legacy.version),
-                        },
-                        Err(_) => Ping::Failed(e),
-                    },
-                };
-                pings.lock().unwrap().insert(address, result);
-            });
     }
 }
-/// Save the list after a move or delete, keeping the icons pings stored in
-/// servers.dat since it was loaded, and the Code of Conduct accepted on a server.
-fn save_servers(file: &Path, servers: &mut [ServerEntry]) {
-    let _guard = servers::lock();
-    let saved = servers::load(file);
-    for entry in servers.iter_mut() {
-        if let Some(s) = saved.iter().find(|s| s.ip == entry.ip) {
-            entry.icon = s.icon.clone();
-            entry.accepted_code_of_conduct = s.accepted_code_of_conduct;
+
+fn ping_all(servers: &[ServerEntry], pings: &Pings, icons: &Icons, file: &Path) {
+    let file = Arc::new(file.to_owned());
+    let mut seen = HashSet::new();
+    let jobs = servers
+        .iter()
+        .filter_map(|server| {
+            let address = server.ip.clone();
+            if !seen.insert(address.clone()) {
+                return None;
+            }
+            pings.lock().unwrap().insert(address.clone(), Ping::Pinging);
+            let saved = server.icon.clone();
+            if let Some(pixels) = saved
+                .as_deref()
+                .and_then(crate::skins::base64_decode)
+                .and_then(|png| icon_pixels(&png))
+            {
+                icons.lock().unwrap().insert(address.clone(), pixels);
+            }
+            Some(PingJob {
+                address,
+                saved,
+                pings: Arc::downgrade(pings),
+                icons: Arc::downgrade(icons),
+                file: file.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut queue = ping_queue().lock().unwrap();
+    queue.pending.retain(|job| job.pings.strong_count() != 0);
+    queue.pending.extend(jobs);
+    let to_start = (MAX_SERVER_PINGS - queue.workers).min(queue.pending.len());
+    for _ in 0..to_start {
+        if let Err(error) = std::thread::Builder::new()
+            .name("horizon-ping".into())
+            .spawn(run_ping_worker)
+        {
+            if queue.workers == 0 {
+                for job in queue.pending.drain(..) {
+                    if let Some(pings) = job.pings.upgrade() {
+                        pings
+                            .lock()
+                            .unwrap()
+                            .insert(job.address, Ping::Failed(error.to_string()));
+                    }
+                }
+            }
+            break;
+        }
+        queue.workers += 1;
+    }
+}
+
+impl PingJob {
+    fn run(self) {
+        let Self {
+            address,
+            saved,
+            pings,
+            icons,
+            file,
+        } = self;
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+        let result = match crate::net::ping(&address, timeout) {
+            Ok((json, ms)) => {
+                let motd =
+                    crate::component::to_text(&json["description"], &mut |s| Text::literal(s));
+                let players = json["players"].as_object().map(|p| {
+                    (
+                        p.get("online").and_then(|n| n.as_i64()).unwrap_or(0),
+                        p.get("max").and_then(|n| n.as_i64()).unwrap_or(0),
+                    )
+                });
+                let player_list = players
+                    .map(|(online, _)| player_list(&json["players"], online))
+                    .unwrap_or_default();
+                let version = json["version"]["name"].as_str().unwrap_or("?").to_owned();
+                // ServerStatus.version absent: `multiplayer.status.old`
+                // and protocol 0.
+                let protocol = json["version"]["protocol"].as_i64().unwrap_or(0);
+                let version_text = if json["version"].is_object() {
+                    Text::literal(version.clone())
+                } else {
+                    Text::translate("multiplayer.status.old", &[])
+                };
+                // A new favicon replaces the saved one (an invalid one
+                // clears it) and servers.dat is saved again.
+                if let Some(png) = favicon_bytes(&json)
+                    && let Some(icons) = icons.upgrade()
+                {
+                    let encoded = crate::lan::base64(&png);
+                    let pixels = icon_pixels(&png);
+                    match &pixels {
+                        Some(p) => icons.lock().unwrap().insert(address.clone(), p.clone()),
+                        None => icons.lock().unwrap().remove(&address),
+                    };
+                    // ServerData.validateIcon: up to 1024x1024 is kept,
+                    // though only a 64x64 icon is drawn.
+                    let icon = valid_icon(&png).then_some(encoded);
+                    if icon != saved {
+                        save_icon(&file, &address, icon);
+                    }
+                }
+                // OnlineServerEntry: SUCCESSFUL only for this game's protocol.
+                let joinable = protocol == i64::from(horizon_protocol::PROTOCOL_VERSION)
+                    || (crate::net::older_servers_enabled()
+                        && i32::try_from(protocol)
+                            .ok()
+                            .and_then(horizon_protocol::adapter::ServerVersion::from_protocol)
+                            .is_some());
+                if joinable {
+                    Ping::Ok {
+                        motd,
+                        players,
+                        player_list,
+                        ms,
+                        version,
+                    }
+                } else {
+                    Ping::Incompatible {
+                        motd,
+                        players,
+                        player_list,
+                        version: version_text,
+                    }
+                }
+            }
+            // ClientStatusPacketListener.onDisconnect without a
+            // status: pingLegacyServer.
+            Err(_) if pings.strong_count() == 0 => return,
+            Err(e) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                let legacy = (!remaining.is_zero())
+                    .then(|| crate::net::ping_legacy(&address, remaining).ok())
+                    .flatten();
+                match legacy {
+                    Some(legacy) => Ping::Incompatible {
+                        motd: Text::literal(legacy.motd),
+                        players: Some((i64::from(legacy.players), i64::from(legacy.max_players))),
+                        player_list: Vec::new(),
+                        version: Text::literal(legacy.version),
+                    },
+                    None => Ping::Failed(e),
+                }
+            }
+        };
+        if let Some(pings) = pings.upgrade() {
+            pings.lock().unwrap().insert(address, result);
         }
     }
-    let _ = servers::save(file, servers);
+}
+/// Commit a row move before applying it to the visible list.
+fn move_saved_server(file: &Path, servers: &mut Vec<ServerEntry>, from: usize, to: usize) -> bool {
+    let _guard = servers::lock();
+    if let Err(error) = servers::move_visible(file, servers, from, to) {
+        log::warn!("Horizon: could not save {}: {error}", file.display());
+        return false;
+    }
+    let entry = servers.remove(from);
+    servers.insert(to, entry);
+    true
 }
 /// Store `icon` on the entries for `address` (OnlineServerEntry.updateServerList).
 fn save_icon(file: &Path, address: &str, icon: Option<String>) {
     let _guard = servers::lock();
-    let mut list = servers::load(file);
-    let mut changed = false;
-    for entry in list.iter_mut().filter(|e| e.ip == address) {
-        changed |= entry.icon != icon;
-        entry.icon = icon.clone();
-    }
-    if changed {
-        let _ = servers::save(file, &list);
-    }
+    let _ = servers::update_visible_icon(file, address, icon.as_deref());
 }
 
 /// `ClientPacketListener.handleServerData`: a valid icon the joined server
@@ -1276,6 +1366,7 @@ impl Screen {
                 index,
                 name,
                 address,
+                save_failed,
                 focus,
                 ..
             } => {
@@ -1289,6 +1380,14 @@ impl Screen {
                     17.0,
                     u32::MAX,
                 );
+                if *save_failed {
+                    centered(
+                        batch,
+                        &crate::lang::get_or("horizon.server.saveFailed", "Could not save the server."),
+                        33.0,
+                        0xffff5555,
+                    );
+                }
                 // ManageServerScreen: labels at 53 and 94, boxes at 66 and 106.
                 Self::field(
                     atlas,
@@ -1461,9 +1560,7 @@ impl Screen {
             return false;
         };
         let to = if down { k + 1 } else { k.wrapping_sub(1) };
-        if to < servers.len() {
-            servers.swap(k, to);
-            save_servers(&servers_file(saves), servers);
+        if to < servers.len() && move_saved_server(&servers_file(saves), servers, k, to) {
             *selected = Some(to);
         }
         true
@@ -1506,6 +1603,7 @@ impl Screen {
             (Self::List { .. }, Some(42)) => {
                 return Outcome::Open(Box::new(Self::Edit {
                     index: None,
+                    save_failed: false,
                     name: crate::lang::get_or("selectServer.defaultName", "Minecraft Server"),
                     address: String::new(),
                     focus: 1,
@@ -1518,12 +1616,12 @@ impl Screen {
                 },
                 Some(43),
             ) => {
-                if let Some((i, s)) = selected.and_then(|i| servers.get(i).map(|s| (i, s.clone())))
-                {
+                if let Some((i, s)) = selected.and_then(|i| servers.get(i).map(|s| (i, s))) {
                     return Outcome::Open(Box::new(Self::Edit {
-                        index: Some(i),
-                        name: s.name,
-                        address: s.ip,
+                        index: Some((i, s.clone())),
+                        save_failed: false,
+                        name: s.name.clone(),
+                        address: s.ip.clone(),
                         focus: 0,
                         packs: s.accept_textures,
                     }));
@@ -1556,11 +1654,18 @@ impl Screen {
                     && let Self::List {
                         servers, selected, ..
                     } = &mut list
-                    && let Some(i) = selected.take()
-                    && i < servers.len()
+                    && let Some(i) = *selected
+                    && let Some(entry) = servers.get(i)
                 {
-                    servers.remove(i);
-                    save_servers(&servers_file(saves), servers);
+                    let file = servers_file(saves);
+                    let _guard = servers::lock();
+                    match servers::remove_visible_at(&file, i, entry) {
+                        Ok(()) => {
+                            servers.remove(i);
+                            *selected = None;
+                        }
+                        Err(error) => log::warn!("Horizon: could not save {}: {error}", file.display()),
+                    }
                 }
                 return Outcome::Open(Box::new(list));
             }
@@ -1606,9 +1711,9 @@ impl Screen {
                         None
                     };
                     if let Some(to) = to {
-                        servers.swap(k, to);
-                        save_servers(&servers_file(saves), servers);
-                        *selected = Some(to);
+                        if move_saved_server(&servers_file(saves), servers, k, to) {
+                            *selected = Some(to);
+                        }
                         return Outcome::None;
                     }
                 }
@@ -1633,8 +1738,8 @@ impl Screen {
                     // The press that selects a saved server can drag it.
                     if let Some(Row::Server(k)) = row {
                         *held = Some(Held {
+                            origin: k,
                             row: k,
-                            moved: false,
                         });
                     }
                 }
@@ -1653,36 +1758,23 @@ impl Screen {
                     name,
                     address,
                     packs,
+                    save_failed,
                     ..
                 },
                 Some(50),
             ) => {
-                // Held through the save: a ping storing an icon meanwhile would undo the edit.
+                let file = servers_file(saves);
                 let guard = servers::lock();
-                let (mut list, mut hidden) = servers::load_all(&servers_file(saves));
                 let mut entry = ServerEntry::new(name.trim(), address.trim());
                 entry.accept_textures = *packs;
-                match index.and_then(|i| list.get_mut(i)) {
-                    Some(e) => {
-                        e.name = entry.name;
-                        e.ip = entry.ip;
-                        e.accept_textures = entry.accept_textures;
-                    }
-                    // addServerCallback: ServerList.unhide brings back a hidden entry
-                    // for the address, given the new name and icon
-                    // (copyNameIconFrom); it keeps its other settings.
-                    None => match hidden.iter().position(|h| h.ip == entry.ip) {
-                        Some(h) => {
-                            let mut e = hidden.remove(h);
-                            e.name = entry.name;
-                            e.icon = entry.icon;
-                            list.push(e);
-                        }
-                        None => list.push(entry),
-                    },
-                }
-                let _ = servers::save_all(&servers_file(saves), &list, &hidden);
+                let original = index.as_ref().map(|(row, saved)| (*row, saved));
+                let result = servers::save_editor_entry(&file, original, &entry);
                 drop(guard);
+                if let Err(error) = result {
+                    log::warn!("Horizon: could not save {}: {error}", file.display());
+                    *save_failed = true;
+                    return Outcome::None;
+                }
                 return Outcome::Open(Box::new(Self::list(saves)));
             }
             (
@@ -1762,9 +1854,11 @@ impl Screen {
                 // A LAN game has no place to move to.
                 let to = if up { k.checked_sub(1) } else { Some(k + 1) };
                 if let Some(to) = to.filter(|&to| k < servers.len() && to < servers.len()) {
-                    servers.swap(k, to);
-                    save_servers(&servers_file(saves), servers);
-                    Some(to)
+                    if move_saved_server(&servers_file(saves), servers, k, to) {
+                        Some(to)
+                    } else {
+                        Some(k)
+                    }
                 } else {
                     Some(k)
                 }
@@ -1830,10 +1924,7 @@ impl Screen {
             {
                 let server = servers.remove(held.row);
                 servers.insert(to, server);
-                *held = Held {
-                    row: to,
-                    moved: true,
-                };
+                held.row = to;
                 *selected = Some(to);
             }
         }
@@ -1843,14 +1934,20 @@ impl Screen {
     pub fn release(&mut self, saves: &Path) {
         if let Self::List {
             servers,
+            selected,
             scroll,
             held,
             ..
         } = self
         {
             scroll.release();
-            if held.take().is_some_and(|h| h.moved) {
-                save_servers(&servers_file(saves), servers);
+            if let Some(held) = held.take()
+                && held.row != held.origin
+            {
+                let entry = servers.remove(held.row);
+                servers.insert(held.origin, entry);
+                let moved = move_saved_server(&servers_file(saves), servers, held.origin, held.row);
+                *selected = Some(if moved { held.row } else { held.origin });
             }
         }
     }
@@ -2294,6 +2391,7 @@ mod tests {
         ] {
             let edit = Screen::Edit {
                 index: None,
+                save_failed: false,
                 name: "Server".into(),
                 address: address.into(),
                 focus: 1,

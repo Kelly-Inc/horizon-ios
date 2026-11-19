@@ -433,7 +433,14 @@ pub(crate) fn name_and_value(label: &str) -> (String, Option<String>) {
 
 /// A slider's position one step on: a step of its own, or a pixel of its `width` wide track.
 pub(crate) fn slider_step(pos: f32, steps: Option<u32>, width: f32, forward: bool) -> f32 {
+    if !pos.is_finite() {
+        return pos;
+    }
+    let pos = pos.clamp(0.0, 1.0);
     if let Some(steps) = steps {
+        if steps == 0 {
+            return pos;
+        }
         let steps = steps as f32;
         let current = (pos * steps).round();
         let next = if forward {
@@ -443,6 +450,9 @@ pub(crate) fn slider_step(pos: f32, steps: Option<u32>, width: f32, forward: boo
         };
         (next / steps).clamp(0.0, 1.0)
     } else {
+        if !width.is_finite() {
+            return pos;
+        }
         let delta = 1.0 / (width - 8.0).max(1.0);
         if forward {
             (pos + delta).min(1.0)

@@ -270,6 +270,13 @@ pub fn open_latest(dir: &Path) -> io::Result<Option<Latest>> {
         .open(dir.join("latest.log"))?;
     let modified = file.metadata()?.modified()?;
     let date = DateTime::<Local>::from(modified).date_naive();
+    #[cfg(target_os = "ios")]
+    if let Err(error) = roll(&mut file, dir, date) {
+        // A blocked archive must not stop this session from logging to a
+        // still-writable latest.log. Append keeps enforcing the size limit.
+        eprintln!("Horizon: could not roll over the log: {error}");
+    }
+    #[cfg(not(target_os = "ios"))]
     roll(&mut file, dir, date)?;
     Ok(Some(Latest { file, _lock: lock }))
 }
@@ -283,7 +290,23 @@ enum Out {
         stderr: Option<String>,
     },
     /// Answer once everything before is written.
-    Flush(mpsc::SyncSender<()>),
+    Flush(mpsc::SyncSender<bool>),
+}
+
+#[cfg(target_os = "ios")]
+type OutSender = mpsc::SyncSender<Out>;
+#[cfg(not(target_os = "ios"))]
+type OutSender = mpsc::Sender<Out>;
+
+#[cfg(target_os = "ios")]
+static DROPPED_MOBILE_RECORDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn out_channel() -> (OutSender, mpsc::Receiver<Out>) {
+    #[cfg(target_os = "ios")]
+    return mpsc::sync_channel(128);
+    #[cfg(not(target_os = "ios"))]
+    mpsc::channel()
 }
 
 /// The file side of the log, on its own thread: a line costs the thread that logs it a
@@ -300,7 +323,12 @@ struct Writer {
 impl Writer {
     fn run(mut self, out: mpsc::Receiver<Out>) {
         let stderr = io::stderr();
+        // Remember failed appends until a diagnostic barrier reports them.
+        #[cfg(target_os = "ios")]
+        let mut mobile_write_failed = false;
         for msg in out {
+            #[cfg(target_os = "ios")]
+            let reported_drops = self.report_dropped_mobile_records();
             match msg {
                 Out::Write {
                     date,
@@ -325,24 +353,66 @@ impl Writer {
                         let mut text = lines.join("\n");
                         text.push('\n');
                         #[cfg(target_os = "ios")]
-                        let _ = mobile_log::append(&mut latest.file, &self.dir, &text);
+                        if let Err(error) = mobile_log::append(&mut latest.file, &self.dir, &text) {
+                            DROPPED_MOBILE_RECORDS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if !mobile_write_failed {
+                                let _ = writeln!(
+                                    stderr.lock(),
+                                    "Horizon: could not write the mobile log: {error}"
+                                );
+                            }
+                            mobile_write_failed = true;
+                        }
                         #[cfg(not(target_os = "ios"))]
                         let _ = latest.file.write_all(text.as_bytes());
                     }
                 }
                 Out::Flush(done) => {
-                    if let Some(latest) = &mut self.file {
-                        let _ = latest.file.flush();
+                    let flushed = self
+                        .file
+                        .as_mut()
+                        .is_some_and(|latest| latest.file.flush().is_ok());
+                    #[cfg(target_os = "ios")]
+                    let flushed = flushed && !mobile_write_failed && reported_drops;
+                    let answered = done.send(flushed);
+                    // A later successful write cannot restore an omitted record.
+                    // Retain its failure until a caller receives the barrier result.
+                    #[cfg(target_os = "ios")]
+                    if answered.is_ok() {
+                        mobile_write_failed = false;
                     }
-                    let _ = done.send(());
+                    #[cfg(not(target_os = "ios"))]
+                    let _ = answered;
                 }
             }
         }
     }
+
+    #[cfg(target_os = "ios")]
+    fn report_dropped_mobile_records(&mut self) -> bool {
+        let dropped = DROPPED_MOBILE_RECORDS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped == 0 {
+            return true;
+        }
+        if let Some(latest) = &mut self.file {
+            let summary = format_line(
+                &Local::now(),
+                "Diagnostics",
+                log::Level::Warn,
+                &format!("{dropped} log entries omitted because they could not be saved"),
+            );
+            if mobile_log::append(&mut latest.file, &self.dir, &summary).is_err() {
+                DROPPED_MOBILE_RECORDS.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct Logger {
-    out: mpsc::Sender<Out>,
+    out: OutSender,
     /// The last lines, kept here (not on the writer) so a crash report has them at once.
     recent: Mutex<VecDeque<String>>,
     /// What the main thread is called in the log: "Render thread", or "Server thread" for the
@@ -469,10 +539,28 @@ fn capped(text: &str, max: usize) -> String {
     text[..end].to_owned()
 }
 
+#[cfg(target_os = "ios")]
+fn bounded_mobile_message(message: &str) -> String {
+    let safe = mobile_log::redact(message);
+    if safe.len() <= mobile_log::ENTRY_LIMIT {
+        return safe;
+    }
+    const MARKER: &str = "\n[message truncated]";
+    let mut bounded = capped(&safe, mobile_log::ENTRY_LIMIT - MARKER.len());
+    bounded.push_str(MARKER);
+    bounded
+}
+
 fn tap(thread: &str, level: log::Level, message: &str) {
     if !TAPPING.load(std::sync::atomic::Ordering::Relaxed) || UNTAPPED.get() {
         return;
     }
+    // Native console listeners are another diagnostic sink on mobile.
+    // Redact the full entry before the tap's byte cap can remove a label.
+    #[cfg(target_os = "ios")]
+    let mobile_message = mobile_log::redact(message);
+    #[cfg(target_os = "ios")]
+    let message = mobile_message.as_str();
     let mut lines = TAP.lock().unwrap_or_else(|e| e.into_inner());
     if lines.len() >= TAP_LINES {
         lines.pop_front();
@@ -543,27 +631,73 @@ impl log::Log for Logger {
         }
     }
 
-    /// Waits (a second at most) until every line logged before is in the file.
+    /// Give the writer up to one second to flush when it can accept the request.
     fn flush(&self) {
         let (done, wait) = mpsc::sync_channel(1);
-        if self.out.send(Out::Flush(done)).is_ok() {
+        if self.enqueue(Out::Flush(done)).is_ok() {
             let _ = wait.recv_timeout(std::time::Duration::from_secs(1));
         }
     }
 }
 
 impl Logger {
+    fn flush_before(&self, deadline: Instant) -> bool {
+        let (done, wait) = mpsc::sync_channel(1);
+        let command = Out::Flush(done);
+        #[cfg(target_os = "ios")]
+        let mut command = command;
+        #[cfg(target_os = "ios")]
+        loop {
+            match self.out.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+                Err(mpsc::TrySendError::Full(pending)) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return false;
+                    }
+                    command = pending;
+                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                }
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        if self.out.send(command).is_err() {
+            return false;
+        }
+        matches!(
+            wait.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            Ok(true)
+        )
+    }
+
+    /// A full mobile queue drops the entry rather than blocking the game.
+    fn enqueue(&self, message: Out) -> Result<(), Out> {
+        #[cfg(target_os = "ios")]
+        return match self.out.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(Out::Write { .. })) => {
+                DROPPED_MOBILE_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(message)) => Err(message),
+            Err(mpsc::TrySendError::Disconnected(message)) => Err(message),
+        };
+        #[cfg(not(target_os = "ios"))]
+        self.out.send(message).map_err(|error| error.0)
+    }
+
     fn write(&self, thread: &str, level: log::Level, message: &str) {
         self.send(thread, level, message, None);
     }
 
     fn send(&self, thread: &str, level: log::Level, message: &str, stderr: Option<String>) {
         #[cfg(target_os = "ios")]
-        let safe = mobile_log::redact(message);
+        let safe = bounded_mobile_message(message);
         #[cfg(target_os = "ios")]
         let message = safe.as_str();
         #[cfg(target_os = "ios")]
-        let stderr = stderr.map(|s| mobile_log::redact(&s));
+        let stderr = stderr.map(|s| bounded_mobile_message(&s));
         let now = Local::now();
         // As log4j writes a multi-line message: the pattern once, the rest as it is.
         let lines: Vec<String> = message
@@ -591,10 +725,10 @@ impl Logger {
             lines,
             stderr,
         };
-        if let Err(mpsc::SendError(Out::Write {
+        if let Err(Out::Write {
             stderr: Some(message),
             ..
-        })) = self.out.send(msg)
+        }) = self.enqueue(msg)
         {
             // No writer (it could not start): the terminal still gets Horizon's messages.
             eprintln!("{message}");
@@ -624,7 +758,7 @@ pub fn init(home: &Path, main_thread: &'static str) {
         }
     };
     let logger = LOGGER.get_or_init(|| {
-        let (out, receive) = mpsc::channel();
+        let (out, receive) = out_channel();
         let writer = Writer {
             file,
             dir,
@@ -688,6 +822,19 @@ pub fn flush() {
     if let Some(logger) = LOGGER.get() {
         log::Log::flush(logger);
     }
+}
+
+/// Wait for queued records before a diagnostic snapshot. Call from an export
+/// worker so a busy writer cannot hold up rendering or launcher input.
+///
+/// Mobile append failures carry forward to the next acknowledged barrier.
+/// A write that succeeds later does not recover the omitted message. When
+/// possible, the log also records the number of omitted entries.
+pub fn flush_for_export() -> bool {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    LOGGER
+        .get()
+        .is_some_and(|logger| logger.flush_before(deadline))
 }
 
 /// The last `lines` lines of a text file.
@@ -759,12 +906,21 @@ mod tests {
         let kept = take_tapped();
         let line = kept.last().unwrap();
         assert_eq!(line.thread, "t".repeat(TAP_THREAD_BYTES));
-        assert!(line.message.starts_with("tap probe long \u{20ac}"));
-        assert!(line.message.len() <= TAP_MESSAGE_BYTES);
-        assert!(
-            TAP_MESSAGE_BYTES - line.message.len() < 3,
-            "cut at the last whole character"
-        );
+        if cfg!(target_os = "ios") {
+            assert_eq!(line.message, "tap probe long [redacted]");
+            write_as("Server thread", log::Level::Info, "Token\t=opaque-fixture");
+            assert_eq!(
+                take_tapped().last().unwrap().message,
+                "[redacted sensitive log message]"
+            );
+        } else {
+            assert!(line.message.starts_with("tap probe long \u{20ac}"));
+            assert!(line.message.len() <= TAP_MESSAGE_BYTES);
+            assert!(
+                TAP_MESSAGE_BYTES - line.message.len() < 3,
+                "cut at the last whole character"
+            );
+        }
         set_tap(false);
         write_as("Server thread", log::Level::Info, "tap probe after");
         assert!(probes(take_tapped()).is_empty());
@@ -776,7 +932,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("horizon-native-log-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let (out, receive) = mpsc::channel();
+        let (out, receive) = out_channel();
         let writer = Writer {
             file: Some(open_latest(&dir).unwrap().unwrap()),
             dir: dir.clone(),
@@ -820,9 +976,44 @@ mod tests {
     }
 
     #[test]
+    fn the_export_barrier_waits_for_already_queued_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "ios")]
+        let (out, receive) = mpsc::sync_channel(1);
+        #[cfg(not(target_os = "ios"))]
+        let (out, receive) = out_channel();
+        let writer = Writer {
+            file: Some(open_latest(dir.path()).unwrap().unwrap()),
+            dir: dir.path().to_path_buf(),
+            date: Local::now().date_naive(),
+        };
+        let logger = Logger {
+            out,
+            recent: Mutex::new(VecDeque::new()),
+            main_thread: "Render thread",
+            floods: Mutex::new(Floods::default()),
+        };
+        logger.write("Render thread", log::Level::Error, "latest diagnostic");
+        let latest = dir.path().join("latest.log");
+        assert!(fs::read_to_string(&latest).unwrap().is_empty());
+        #[cfg(target_os = "ios")]
+        assert!(!logger.flush_before(Instant::now() + Duration::from_millis(10)));
+
+        let handle = std::thread::spawn(move || writer.run(receive));
+        assert!(logger.flush_before(Instant::now() + Duration::from_secs(1)));
+        assert!(
+            fs::read_to_string(latest)
+                .unwrap()
+                .contains("latest diagnostic")
+        );
+        drop(logger);
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn horizon_stderr_and_external_file_records_stay_separate() {
         use log::Log;
-        let (out, receive) = mpsc::channel();
+        let (out, receive) = out_channel();
         let logger = Logger {
             out,
             recent: Mutex::new(VecDeque::new()),
@@ -966,6 +1157,8 @@ mod tests {
 
     #[test]
     fn startup_archives_the_last_runs_log() {
+        use std::io::Read;
+
         let dir = std::env::temp_dir().join(format!("horizon-logs-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

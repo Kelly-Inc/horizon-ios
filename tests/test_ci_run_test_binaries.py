@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -49,9 +50,11 @@ class RunTestBinariesTests(unittest.TestCase):
         """A cargo that lists `binaries` (and records its arguments) and a rustc beside it."""
         listing = [artifact(str(binary)).replace("/repo", str(root)) for binary in binaries]
         cargo = root / "cargo"
-        cargo.write_text(f'#!/bin/sh\necho "$@" > {root}/cargo-args\ncat <<\'EOF\'\n' + "\n".join(listing) + "\nEOF\n")
+        args_path = shlex.quote(str(root / "cargo-args"))
+        sysroot = shlex.quote(str(root / "sysroot"))
+        cargo.write_text(f'#!/bin/sh\necho "$@" > {args_path}\ncat <<\'EOF\'\n' + "\n".join(listing) + "\nEOF\n")
         rustc = root / "rustc"
-        rustc.write_text(f'#!/bin/sh\ncase "$1" in --print) echo {root}/sysroot ;; *) echo "host: x86_64-unknown-linux-gnu" ;; esac\n')
+        rustc.write_text(f'#!/bin/sh\ncase "$1" in --print) echo {sysroot} ;; *) echo "host: x86_64-unknown-linux-gnu" ;; esac\n')
         for tool in (cargo, rustc):
             tool.chmod(0o755)
         return cargo
@@ -63,14 +66,14 @@ class RunTestBinariesTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "requires a POSIX shell")
     def test_every_binary_runs_and_each_failure_is_listed_at_the_end(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix="horizon runner ") as directory:
             root = Path(directory).resolve()
             package = root / "crates/horizon-world"
             package.mkdir(parents=True)
             passing, failing, unstartable = root / "passing", root / "failing", root / "unstartable"
             passing.write_text('#!/bin/sh\necho "cwd=$PWD pkg=$CARGO_PKG_NAME args=$*"\n')
             failing.write_text("#!/bin/sh\necho 'test a::b ... ok'\necho 'test a::c ... FAILED'\nexit 101\n")
-            unstartable.write_text("#!/bin/sh\nexit 0\n")  # Not executable: the binary cannot start.
+            # Leave the path absent so launch fails even on filesystems without POSIX modes.
             for binary in (passing, failing):
                 binary.chmod(0o755)
             cargo = self.fake_toolchain(root, [unstartable, passing, failing])

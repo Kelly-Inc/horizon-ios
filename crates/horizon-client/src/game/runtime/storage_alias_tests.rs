@@ -56,7 +56,7 @@ fn snbt(text: &str) -> Tag {
 fn writes(game: &mut Game<'_>, name: &str) -> bool {
     let dir = std::env::temp_dir().join(format!("h246-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    game.score.storage.save(&dir);
+    game.score.storage.save(&dir).unwrap();
     let wrote = dir.join("data").exists();
     let _ = std::fs::remove_dir_all(&dir);
     wrote
@@ -117,7 +117,7 @@ fn saved(
 ) -> Option<horizon_client::command_storage::CommandStorage> {
     let dir = std::env::temp_dir().join(format!("h246-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    game.score.storage.save(&dir);
+    game.score.storage.save(&dir).unwrap();
     let back = dir
         .join("data")
         .exists()

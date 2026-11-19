@@ -1,5 +1,9 @@
 //! Read-back screenshots waiting for the game's client hook, then PNG encoding.
-use super::{Result, hdr_icc, hdr_screenshot_path};
+use super::{
+    Result,
+    capture::{persist_screenshot, publish_player_screenshot, stage_screenshot},
+    hdr_icc, hdr_screenshot_path,
+};
 use std::path::{Path, PathBuf};
 
 /// CPU-side frame returned to the game before any screenshot file is written.
@@ -123,10 +127,18 @@ impl PendingScreenshot {
     /// Save a capture and report the HDR sibling only when its write succeeds.
     pub fn save_with_details(&self) -> Result<SavedScreenshot> {
         let image = self.rgba()?;
+        crate::config_file::write_atomic_with(&self.path, |file| encode_sdr(image, file))?;
+        Ok(SavedScreenshot {
+            size: [image.width, image.height],
+            hdr_path: self.save_hdr(true),
+        })
+    }
+
+    fn save_hdr(&self, replace: bool) -> Option<PathBuf> {
         let mut hdr_path = None;
         if let Some(hdr) = &self.hdr {
             let path = hdr_screenshot_path(&self.path);
-            match hdr.save(&path) {
+            match hdr.save(&path, replace) {
                 Ok(()) => {
                     log::info!("Saved HDR screenshot to {}", path.display());
                     hdr_path = Some(path);
@@ -134,18 +146,7 @@ impl PendingScreenshot {
                 Err(e) => log::warn!("Horizon renderer: HDR screenshot {}: {e}", path.display()),
             }
         }
-        let mut encoder = png::Encoder::new(
-            std::io::BufWriter::new(std::fs::File::create(&self.path)?),
-            image.width,
-            image.height,
-        );
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.write_header()?.write_image_data(&image.rgba)?;
-        Ok(SavedScreenshot {
-            size: [image.width, image.height],
-            hdr_path,
-        })
+        hdr_path
     }
 
     /// Validate a mod's relative file name at the write boundary, then save
@@ -160,11 +161,25 @@ impl PendingScreenshot {
                 .replace(std::path::MAIN_SEPARATOR, "/");
             screenshot_destination(root, &hdr_name)?;
         }
-        self.rgba()?;
+        let image = self.rgba()?;
+        let size = [image.width, image.height];
         std::fs::create_dir_all(path.parent().expect("destination has a parent"))?;
-        self.path = path;
-        self.save()
+        let staged = stage_screenshot(&path, |file| encode_sdr(image, file))?;
+        self.path = publish_player_screenshot(staged, &path)?;
+        let _ = self.save_hdr(false);
+        Ok(size)
     }
+}
+
+fn encode_sdr(image: &mod_api::ScreenshotImage, file: &mut std::fs::File) -> Result<()> {
+    let mut encoder =
+        png::Encoder::new(std::io::BufWriter::new(file), image.width, image.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&image.rgba)?;
+    writer.finish()?;
+    Ok(())
 }
 
 /// A relative, portable path. Refuse Windows separators/prefixes on every OS,
@@ -226,21 +241,29 @@ fn screenshot_destination(root: &Path, file_name: &str) -> Result<PathBuf> {
 
 impl HdrScreenshot {
     /// HDR10 as a 16-bit PNG, retaining BT.2020/PQ, cLLI and the ICC profile.
-    fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, path: &Path, replace: bool) -> Result<()> {
         let mut info = png::Info::with_size(self.size[0], self.size[1]);
         info.color_type = png::ColorType::Rgb;
         info.bit_depth = png::BitDepth::Sixteen;
         info.icc_profile = Some(hdr_icc::profile().into());
-        let encoder =
-            png::Encoder::with_info(std::io::BufWriter::new(std::fs::File::create(path)?), info)?;
-        let mut writer = encoder.write_header()?;
-        writer.write_chunk(png::chunk::cICP, &[9, 16, 0, 1])?;
-        writer.write_chunk(
-            png::chunk::cLLI,
-            &hdr_icc::content_light_levels(&self.pixels),
-        )?;
-        writer.write_image_data(&self.pixels)?;
-        Ok(())
+        let encode = |file: &mut std::fs::File| -> Result<()> {
+            let encoder = png::Encoder::with_info(std::io::BufWriter::new(file), info)?;
+            let mut writer = encoder.write_header()?;
+            writer.write_chunk(png::chunk::cICP, &[9, 16, 0, 1])?;
+            writer.write_chunk(
+                png::chunk::cLLI,
+                &hdr_icc::content_light_levels(&self.pixels),
+            )?;
+            writer.write_image_data(&self.pixels)?;
+            writer.finish()?;
+            Ok(())
+        };
+        if replace {
+            crate::config_file::write_atomic_with(path, encode)
+        } else {
+            let staged = stage_screenshot(path, encode)?;
+            persist_screenshot(staged, path).map_err(|error| error.error.into())
+        }
     }
 }
 
@@ -319,18 +342,32 @@ mod tests {
         );
         assert!(save.try_complete().is_none());
         release.send(()).unwrap();
-        assert_eq!(
-            save.receiver
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap()
-                .1,
-            Ok([1, 1])
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let completed = loop {
+            if let Some(completed) = save.try_complete() {
+                break completed;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "encoder did not settle"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(completed, (save.original.clone(), Ok([1, 1])));
+        // Once a ready result can be consumed, dropping it cannot wait for
+        // a live encoder. The quit supervisor uses this same readiness gate.
+        assert!(
+            save.worker
+                .as_ref()
+                .is_none_or(|worker| worker.is_finished())
         );
     }
 
     #[test]
     fn background_save_keeps_hook_edits_and_renames_both_copies() {
         let root = tempfile::tempdir().unwrap();
+        let orphan = root.path().join("changed-hdr.png");
+        std::fs::write(&orphan, b"old").unwrap();
         let mut pending = frame(root.path().join("unused.png"), true);
         pending.image_mut().rgba = vec![9, 8, 7, 255];
         let save = pending.save_background(Some((root.path().to_owned(), "changed.png".into())));
@@ -339,8 +376,9 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
         assert_eq!(result, Ok([1, 1]));
-        assert_eq!(path, root.path().join("changed.png"));
-        assert!(root.path().join("changed-hdr.png").exists());
+        assert_eq!(path, root.path().join("changed_2.png"));
+        assert_eq!(std::fs::read(orphan).unwrap(), b"old");
+        assert!(root.path().join("changed_2-hdr.png").exists());
         assert!(!root.path().join("unused.png").exists());
         let mut reader =
             png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
@@ -349,6 +387,16 @@ mod tests {
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut pixels).unwrap();
         assert_eq!(&pixels[..info.buffer_size()], &[9, 8, 7, 255]);
+    }
+
+    #[test]
+    fn a_failed_primary_screenshot_does_not_publish_an_hdr_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("shot.png");
+        std::fs::create_dir(&path).unwrap();
+        let pending = frame(path, true);
+        assert!(pending.save().is_err());
+        assert!(!root.path().join("shot-hdr.png").exists());
     }
 
     #[test]

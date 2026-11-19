@@ -258,6 +258,7 @@ fn quads_keep_the_state_of_their_block() {
         shader_pack_lighting: false,
         separate_ao: false,
         shader_pack: false,
+        looks: false,
         translucent_layers: &[],
         hidden_states: &[],
         part_tables: Default::default(),

@@ -741,8 +741,13 @@ mod tests {
         assert!(refused[OsStr::new("directory")].contains("not a regular file"));
         assert!(refused[OsStr::new("dangling")].starts_with("unsafe or unreadable entry:"));
         let invalid_key = OsString::from_vec(vec![0xff]);
-        match fs::write(root.join("reader").join(&invalid_key), "invalid key") {
-            Ok(()) => {
+        let reader = root.join("reader");
+        match fs::write(reader.join(&invalid_key), "invalid key") {
+            Ok(())
+                if fs::read_dir(&reader)
+                    .unwrap()
+                    .any(|entry| entry.unwrap().file_name() == invalid_key) =>
+            {
                 refused.clear();
                 let captured = capture_settings_with_report(&root, ["reader"], |_, key, reason| {
                     refused.insert(key.unwrap().to_owned(), reason.to_string());
@@ -754,6 +759,7 @@ mod tests {
                     refused[OsStr::new("value")].starts_with("package contains a non-UTF-8 key:")
                 );
             }
+            Ok(()) => eprintln!("the filesystem escaped the non-UTF-8 fixture filename"),
             Err(error)
                 if error.kind() == std::io::ErrorKind::InvalidInput
                     || error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) =>

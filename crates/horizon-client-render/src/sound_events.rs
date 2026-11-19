@@ -251,10 +251,16 @@ impl SoundRegistry {
         }
         registry
     }
-    /// No sound event at all: the resources hold no `sounds.json` (sounds not
-    /// imported from the player's launcher when the game was prepared).
+    /// Whether any sound events have been registered.
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+
+    /// Parsed events can still be silent when every referenced sound file is missing.
+    pub(crate) fn has_samples(&self) -> bool {
+        self.events
+            .values()
+            .any(|event| event.sounds.iter().any(|sound| !sound.event))
     }
     /// One `sounds.json` (`Preparations.handleRegistration` for each entry).
     /// `exists(namespace, path)` says whether a sound file is present.
@@ -427,6 +433,20 @@ mod tests {
         let sounds = &registry.get("example:tone").unwrap().sounds;
         assert_eq!(sounds.len(), 1);
         assert_eq!(sounds[0].location, "other:nested/tone");
+    }
+
+    #[test]
+    fn registered_events_without_resolved_files_do_not_count_as_samples() {
+        let mut registry = SoundRegistry::default();
+        registry.add_file(
+            "minecraft",
+            br#"{"tone":{"sounds":["test"]},"linked":{"sounds":[{"name":"tone","type":"event"}]}}"#,
+            &|_, _| false,
+        );
+        assert!(registry.contains("minecraft:tone"));
+        assert!(!registry.has_samples());
+        registry.add_file("minecraft", br#"{"tone":{"sounds":["test"]}}"#, &|_, _| true);
+        assert!(registry.has_samples());
     }
 
     #[test]

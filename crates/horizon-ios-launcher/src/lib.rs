@@ -67,12 +67,32 @@ pub fn covered() -> bool {
     COVERED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Queue a request for the game's next frame.
+/// Queue a request for the game's next frame. Coalesce status polls and
+/// repeated cancellation requests for the same launch.
 pub fn push(request: Request) {
-    QUEUE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push_back(request);
+    let mut words = request.line.split_whitespace();
+    let coalesces = match words.next() {
+        Some("launcher-state" | "download-state" | "game-files-source") => true,
+        Some("launcher-cancel-start") => words.next().is_some(),
+        _ => false,
+    };
+    let replaced = {
+        let mut queue = QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+        let replaced = if coalesces {
+            queue
+                .iter()
+                .position(|pending| pending.line == request.line)
+                .and_then(|index| queue.remove(index))
+        } else {
+            None
+        };
+        queue.push_back(request);
+        replaced
+    };
+    // A callback may re-enter the bridge, so answer after releasing the queue.
+    if let Some(request) = replaced {
+        request.answer(r#"{"error":"A newer launcher request replaced this one."}"#);
+    }
 }
 
 /// The requests the launcher sent since the last call, oldest first. Empty everywhere but a phone.
@@ -82,6 +102,50 @@ pub fn take() -> Vec<Request> {
         .unwrap_or_else(PoisonError::into_inner)
         .drain(..)
         .collect()
+}
+
+/// Read-only requests that can be answered while the game home is busy.
+pub fn take_status_requests() -> Vec<Request> {
+    let mut queue = QUEUE.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut status = Vec::new();
+    for _ in 0..queue.len() {
+        let request = queue.pop_front().expect("queue length is held by the lock");
+        let verb = request.line.split_whitespace().next();
+        if matches!(
+            verb,
+            Some("launcher-state" | "download-state" | "game-files-source" | "diagnostic-log-home")
+        ) {
+            status.push(request);
+        } else {
+            queue.push_back(request);
+        }
+    }
+    status
+}
+
+// Only one launch can be draining. A retry replaces its reply callback
+// without replacing the shutdown operation.
+static CANCEL_REPLY: Mutex<Option<(String, Request)>> = Mutex::new(None);
+
+pub fn wait_for_cancel_reply(owner: String, request: Request) {
+    let replaced = CANCEL_REPLY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .replace((owner, request));
+    if let Some((_, request)) = replaced {
+        request.answer(r#"{"error":"A newer cancellation request replaced this one."}"#);
+    }
+}
+
+/// Called by the supervisor once the old engine has drained.
+pub fn acknowledge_cancelled_start(owner: &str) {
+    let stopped = CANCEL_REPLY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take_if(|(waiting_owner, _)| waiting_owner == owner);
+    if let Some((_, request)) = stopped {
+        request.answer(r#"{"ok":true,"status":"stopped"}"#);
+    }
 }
 
 /// The result of canceling one owned launcher start.
@@ -101,6 +165,7 @@ struct StartState {
     started: Option<bool>,
     owner: Option<String>,
     canceling: Option<String>,
+    stopped_owner: Option<String>,
     committed: bool,
 }
 
@@ -110,6 +175,7 @@ impl StartState {
             started: None,
             owner: None,
             canceling: None,
+            stopped_owner: None,
             committed: false,
         }
     }
@@ -127,6 +193,7 @@ impl StartState {
         // A legacy fallback must not erase an owned start's identity. Likewise,
         // starting an already visible engine does not make it cancelable again.
         self.started = Some(true);
+        self.stopped_owner = None;
         true
     }
 
@@ -160,6 +227,7 @@ impl StartState {
             return false;
         }
         self.reset(default_open);
+        self.stopped_owner = Some(owner.to_owned());
         true
     }
 
@@ -266,6 +334,16 @@ pub fn complete_cancel(owner: &str) -> bool {
         .complete_cancel(owner, !bundled())
 }
 
+/// The owner whose last cancellation drained, for launchers that missed its reply.
+pub fn stopped_owner() -> Option<String> {
+    STARTED
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .stopped_owner
+        .clone()
+}
+
 /// Return to launcher-only state after the engine has shut down normally.
 pub fn reset() {
     STARTED
@@ -313,7 +391,7 @@ pub fn show() -> bool {
     false
 }
 
-/// Show the game files download over the game, in SwiftUI (packaging/ios/Launcher/DownloadView.swift): upright,
+/// Show the game files download over the game, in SwiftUI (packaging/ios/Launcher/DownloadView.swift),
 /// with its progress, speed and time left, asked of the game with `download-state`. Shown whether or not the
 /// launcher is switched on, since it only needs the framework. False when this build or bundle has none, and the
 /// game's own download screen is all there is.
@@ -418,19 +496,27 @@ mod ios {
 
     extern "C" fn submit(line: *const c_char, ctx: *mut c_void, done: Done) {
         let line = if line.is_null() {
-            String::new()
+            None
         } else {
             // SAFETY: the launcher passes a NUL-terminated string it keeps alive for this call
             // (`withCString` in Bridge.swift), and nothing here keeps the pointer past it.
-            unsafe { CStr::from_ptr(line) }
-                .to_string_lossy()
-                .into_owned()
+            unsafe { CStr::from_ptr(line) }.to_str().ok()
+        };
+        let Some(line) = line else {
+            done(
+                ctx,
+                c"{\"error\":\"the launcher's request was not UTF-8\"}".as_ptr(),
+            );
+            return;
         };
         // The context is the launcher's: carried back untouched, as an address so the reply is Send.
         let ctx = ctx as usize;
         super::push(super::Request::new(line, move |json: &str| {
-            let text = CString::new(json.replace('\0', "")).unwrap_or_default();
-            done(ctx as *mut c_void, text.as_ptr());
+            let text = CString::new(json);
+            let answer = text
+                .as_deref()
+                .unwrap_or(c"{\"error\":\"the game's answer was not JSON\"}");
+            done(ctx as *mut c_void, answer.as_ptr());
         }));
     }
 
@@ -640,9 +726,11 @@ mod tests {
         assert_eq!(state.canceling.as_deref(), Some("attempt A"));
         assert!(state.complete_cancel("attempt A", false));
         assert_eq!(state.started, Some(false));
+        assert_eq!(state.stopped_owner.as_deref(), Some("attempt A"));
         assert!(state.owner.is_none() && state.canceling.is_none());
         assert!(!state.complete_cancel("attempt A", false));
         assert!(state.start_owned(Some("attempt B")));
+        assert!(state.stopped_owner.is_none());
         assert_eq!(state.request_cancel("attempt A"), CancelDecision::Stale);
         assert!(!state.complete_cancel("attempt A", false));
         assert_eq!(state.owner.as_deref(), Some("attempt B"));
@@ -741,6 +829,35 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_retry_replaces_the_reply_until_the_matching_engine_drains() {
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        for id in 0..64 {
+            let responses = responses.clone();
+            wait_for_cancel_reply(
+                "owner A".to_owned(),
+                Request::new("launcher-cancel-start owner A", move |reply| {
+                    responses.lock().unwrap().push((id, reply.to_owned()));
+                }),
+            );
+        }
+        acknowledge_cancelled_start("owner B");
+        assert_eq!(responses.lock().unwrap().len(), 63);
+        acknowledge_cancelled_start("owner A");
+        acknowledge_cancelled_start("owner A");
+        let responses = responses.lock().unwrap();
+        assert_eq!(responses.len(), 64);
+        assert!(
+            responses[..63]
+                .iter()
+                .all(|(_, reply)| reply.contains("newer cancellation request"))
+        );
+        assert_eq!(
+            responses[63],
+            (63, r#"{"ok":true,"status":"stopped"}"#.to_owned())
+        );
+    }
+
+    #[test]
     fn requests_come_out_in_order_and_answer_once() {
         let answers = Arc::new(Mutex::new(Vec::new()));
         for line in ["worlds", "servers"] {
@@ -763,5 +880,101 @@ mod tests {
         assert_eq!(answers[0], r#"{"ok":true}"#);
         assert!(answers[1].contains("error"));
         assert_eq!(answers.len(), 2);
+        drop(answers);
+
+        // A stalled engine can have multiple polling attempts queued between
+        // frames. Keep the newest status query in its original order relative
+        // to mutations, and still answer every replaced callback.
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        for (id, line) in [
+            (0, "launcher-state"),
+            (1, "download-state"),
+            (2, "launcher-start A"),
+            (3, "launcher-state"),
+            (4, "download-retry"),
+            (5, "download-state"),
+            (6, "download-retry"),
+        ] {
+            let replies = replies.clone();
+            push(Request::new(line, move |json| {
+                replies.lock().unwrap().push((id, json.to_owned()));
+            }));
+        }
+        let taken = take();
+        assert_eq!(
+            taken.iter().map(|r| r.line.as_str()).collect::<Vec<_>>(),
+            [
+                "launcher-start A",
+                "launcher-state",
+                "download-retry",
+                "download-state",
+                "download-retry"
+            ]
+        );
+        for request in taken {
+            request.answer(r#"{"ok":true}"#);
+        }
+        let replies = replies.lock().unwrap();
+        assert_eq!(
+            replies.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6]
+        );
+        for (_, answer) in &replies[..2] {
+            assert!(answer.contains("newer launcher request"));
+        }
+        assert!(
+            replies[2..]
+                .iter()
+                .all(|(_, answer)| answer == r#"{"ok":true}"#)
+        );
+
+        for line in [
+            "launcher-start A",
+            "launcher-state",
+            "launcher-cancel-start A",
+            "game-files-source",
+            "diagnostic-log-home",
+            "import-game-files fixture.zip",
+            "download-state",
+        ] {
+            push(Request::new(line, |_| {}));
+        }
+        assert_eq!(
+            take_status_requests()
+                .iter()
+                .map(|r| r.line.as_str())
+                .collect::<Vec<_>>(),
+            ["launcher-state", "game-files-source", "diagnostic-log-home", "download-state"]
+        );
+        assert_eq!(
+            take().iter().map(|r| r.line.as_str()).collect::<Vec<_>>(),
+            [
+                "launcher-start A",
+                "launcher-cancel-start A",
+                "import-game-files fixture.zip"
+            ]
+        );
+
+        for _ in 0..3 {
+            push(Request::new("game-files-source", |_| {}));
+        }
+        let source = take();
+        assert_eq!(source.len(), 1);
+        assert_eq!(source[0].line, "game-files-source");
+
+        for line in [
+            "launcher-cancel-start A",
+            "launcher-cancel-start B",
+            "launcher-cancel-start A",
+        ] {
+            push(Request::new(line, |_| {}));
+        }
+        assert_eq!(
+            take()
+                .iter()
+                .map(|request| request.line.as_str())
+                .collect::<Vec<_>>(),
+            ["launcher-cancel-start B", "launcher-cancel-start A"]
+        );
     }
 }

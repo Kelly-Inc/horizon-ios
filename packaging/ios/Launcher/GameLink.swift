@@ -1,3 +1,4 @@
+import Darwin
 import SwiftUI
 import UIKit
 
@@ -9,13 +10,6 @@ enum GameFolder {
     static var screenshots: URL { documents.appendingPathComponent("screenshots") }
     static var resources: URL { documents.appendingPathComponent("resources") }
 
-    struct ResourceMarker: Equatable {
-        let volume: UInt64?
-        let file: UInt64?
-        let modified: Date?
-        let size: UInt64?
-    }
-
     /// Whether imported game files are in place (`import::resources_root`'s second stop).
     static var hasGameFiles: Bool { resourceMarker(at: resources) != nil }
 
@@ -23,18 +17,21 @@ enum GameFolder {
         resourceMarker(at: resources) != nil
     }
 
-    static func resourceMarker(at resources: URL) -> ResourceMarker? {
-        // Match the engine's is_file(): follow a link to a regular manifest,
-        // but reject directories, broken links and other non-file entries.
-        let marker = resources.appendingPathComponent("horizon-resources.json").resolvingSymlinksInPath()
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: marker.path),
-              attributes[.type] as? FileAttributeType == .typeRegular else { return nil }
-        return ResourceMarker(
-            volume: (attributes[.systemNumber] as? NSNumber)?.uint64Value,
-            file: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
-            modified: attributes[.modificationDate] as? Date,
-            size: (attributes[.size] as? NSNumber)?.uint64Value
-        )
+    /// Keep this fingerprint in sync with the engine's import::resource_marker.
+    static func resourceMarker(at resources: URL) -> String? {
+        let path = resources.appendingPathComponent("horizon-resources.json").path
+        var metadata = stat()
+        guard fstatat(AT_FDCWD, path, &metadata, 0) == 0,
+              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { return nil }
+        return [
+            UInt64(truncatingIfNeeded: metadata.st_dev).description,
+            metadata.st_ino.description,
+            metadata.st_size.description,
+            metadata.st_mtimespec.tv_sec.description,
+            metadata.st_mtimespec.tv_nsec.description,
+            metadata.st_ctimespec.tv_sec.description,
+            metadata.st_ctimespec.tv_nsec.description,
+        ].joined(separator: ":")
     }
 }
 
@@ -102,6 +99,12 @@ final class GameLink: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .unknown
+    @Published private(set) var startupStatusError: String?
+    @Published private(set) var cleaningUpCache = false
+    @Published private var canRetryLoader = false
+    private var retryingLoader = false
+    @Published private var engineHasGameFiles = false
+    @Published private var idleGameFilesProblem: String?
     @Published private(set) var worlds: [World] = []
     @Published private(set) var servers: [Server] = []
     @Published private(set) var statuses: [String: ServerStatus] = [:]
@@ -116,6 +119,8 @@ final class GameLink: ObservableObject {
 
     /// Uncover the game (Present.swift dismisses the launcher).
     var uncover: () -> Void = {}
+    /// The launcher can observe published files before their import has replied.
+    var gameFilesSetupBusy: () -> Bool = { false }
     /// Installed by HomeView; every Play/Join/Create waits for an acknowledged session.
     var prepareSession: () async throws -> Void = {
         throw AccountError("Account setup is not ready. Try Play again.")
@@ -125,30 +130,51 @@ final class GameLink: ObservableObject {
     private final class LaunchAttempt {
         let id = UUID()
         var submitted = false
-        var accepted = false
         var cancelled = false
         var presented = false
         var failure: String?
+        var stopProblem: String?
         var preparation: Task<Void, Error>?
         var cleanup: Task<Void, Never>?
     }
     private var currentLaunch: LaunchAttempt?
     private var phaseEpoch = UUID()
     private var appliedRefresh: UUID?
+    private var worldListRevision = UUID()
+    private var serverListRevision = UUID()
     private var queued: (id: UUID, action: () async -> [String: Any])?
+    private let stopAudio: () -> Void
     private let send: (String) async -> [String: Any]
 
-    init(send: @escaping (String) async -> [String: Any] = { await Bridge.send($0) }) {
+    init(stopAudio: @escaping () -> Void = { GameAudio.shared.stop() },
+         send: @escaping (String) async -> [String: Any] = { await Bridge.send($0) }) {
+        self.stopAudio = stopAudio
         self.send = send
+    }
+
+    /// The engine also supports prepared files beside the executable and at an
+    /// explicitly selected root. Check Documents directly for new imports.
+    var hasGameFiles: Bool {
+        if ready || phase == .world { return true }
+        if case .needsFiles = phase { return false }
+        if repairingGameFiles { return false }
+        return engineHasGameFiles || GameFolder.hasGameFiles
     }
 
     /// First-time setup or an engine-reported failure to load the installed files.
     var needsGameFiles: Bool {
         if case .needsFiles = phase { return true }
-        return phase == .waiting && !GameFolder.hasGameFiles
+        return phase == .waiting && !cleaningUpCache && !hasGameFiles
+    }
+
+    var gameFilesProblem: String? {
+        if case let .needsFiles(reason) = phase { return reason }
+        if phase == .waiting { return idleGameFilesProblem }
+        return nil
     }
 
     var repairingGameFiles: Bool {
+        if phase == .waiting { return idleGameFilesProblem != nil }
         if case .needsFiles = phase { return GameFolder.hasGameFiles }
         return false
     }
@@ -161,7 +187,8 @@ final class GameLink: ObservableObject {
     func watch() async {
         while !Task.isCancelled {
             await refresh()
-            let pause: UInt64 = ready || phase == .waiting ? 3_000_000_000 : 400_000_000
+            let settled = ready || phase == .waiting || startupStatusError != nil
+            let pause: UInt64 = settled && !cleaningUpCache ? 3_000_000_000 : 400_000_000
             try? await Task.sleep(nanoseconds: pause)
         }
     }
@@ -175,19 +202,49 @@ final class GameLink: ObservableObject {
         let state = await self.send("launcher-state")
         guard epoch == phaseEpoch, !Task.isCancelled else { return }
         let was = phase
-        switch state["phase"] as? String {
+        let reportedPhase = state.error == nil ? state["phase"] as? String : nil
+        switch reportedPhase {
         case "waiting":
-            if phase != .waiting { GameAudio.shared.stop() }
-            phase = .waiting
+            if let attempt = currentLaunch, attempt.cancelled,
+               state["stopped_owner"] as? String == attempt.id.uuidString {
+                finishCancellation(attempt, stopped: true)
+            } else {
+                if phase != .waiting { stopAudio() }
+                phase = .waiting
+            }
         case "loading": phase = .loading(state["progress"] as? Double ?? 0)
         case "needs_files": phase = .needsFiles(state["reason"] as? String)
         case "title": phase = .title
         case "world": phase = .world
-        default: return
+        default:
+            // Keep the last usable phase, including an open recovery flow. A
+            // failed poll can still happen after startup and must be visible.
+            let message = state.error ?? "Horizon could not read the game's startup status."
+            if startupStatusError != message { startupStatusError = message }
+            return
         }
-        appliedRefresh = epoch
+        let retryLoader = state["phase"] as? String == "needs_files" && state["retry_loader"] as? Bool == true
+        if canRetryLoader != retryLoader { canRetryLoader = retryLoader }
+        if startupStatusError != nil { startupStatusError = nil }
+        if phase == .waiting {
+            if state["cache_cleanup_in_progress"] as? Bool != true {
+                let reportedGameFiles = state["game_files_present"] as? Bool == true
+                if engineHasGameFiles != reportedGameFiles { engineHasGameFiles = reportedGameFiles }
+                let issue = (state["game_files_problem"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                if idleGameFilesProblem != issue { idleGameFilesProblem = issue }
+            }
+        }
+        // During cleanup the engine can answer this poll ahead of a queued start.
+        let collecting = state["cache_cleanup_in_progress"] as? Bool == true
+        if cleaningUpCache != collecting { cleaningUpCache = collecting }
+        if !collecting { appliedRefresh = epoch }
         if let version = state["version"] as? String {
             self.version = version
+        }
+        // Keep setup open until any import has replied and a status poll
+        // confirms the engine has its files. A marker alone can arrive early.
+        if requestingGameFiles, !collecting, !gameFilesSetupBusy(), !needsGameFiles, hasGameFiles {
+            requestingGameFiles = false
         }
         if let action = queued {
             if phase == .title {
@@ -201,7 +258,11 @@ final class GameLink: ObservableObject {
 
     /// Read the worlds and servers again.
     func reload() async {
+        guard !Task.isCancelled else { return }
+        let revision = UUID()
+        worldListRevision = revision
         let listed = await self.send("worlds")
+        guard !Task.isCancelled, revision == worldListRevision else { return }
         if let list = listed["worlds"] as? [[String: Any]] {
             worlds = list.compactMap(World.init)
         }
@@ -209,14 +270,37 @@ final class GameLink: ObservableObject {
     }
 
     func reloadServers() async {
+        guard !Task.isCancelled else { return }
+        let revision = UUID()
+        serverListRevision = revision
         let listed = await self.send("servers")
-        guard let list = listed["servers"] as? [[String: Any]] else { return }
+        guard !Task.isCancelled, revision == serverListRevision, listed.error == nil,
+              let list = listed["servers"] as? [[String: Any]] else { return }
         servers = list.enumerated().compactMap { index, json in
             guard let address = json["address"] as? String else { return nil }
             return Server(index: index, name: json["name"] as? String ?? address, address: address,
                           icon: json["icon"] as? String)
         }
-        serverRound += 1
+        let activeAddresses = Set(servers.map(\.address))
+        statuses = statuses.filter { activeAddresses.contains($0.key) }
+        serverRound &+= 1
+    }
+
+    var retryInstalledFiles: (() async -> Void)? {
+        guard canRetryLoader else { return nil }
+        return { await self.retryGameLoader() }
+    }
+
+    private func retryGameLoader() async {
+        guard canRetryLoader, !retryingLoader, !Task.isCancelled else { return }
+        retryingLoader = true
+        defer { retryingLoader = false }
+        let answer = await send("launcher-retry-loader")
+        guard !Task.isCancelled else { return }
+        if !answer.acknowledged || answer.error != nil {
+            problem = answer.error ?? "Horizon could not retry loading the installed files."
+        }
+        await refresh()
     }
 
     // MARK: - Going somewhere
@@ -246,9 +330,18 @@ final class GameLink: ObservableObject {
     }
 
     func join(_ address: String) async {
+        guard let address = validatedServerAddress(address) else { return }
         Haptics.launch()
-        let address = address.trimmingCharacters(in: .whitespaces)
         await go("Joining \(address)") { await self.send("connect \(address)") }
+    }
+
+    private func validatedServerAddress(_ input: String) -> String? {
+        let address = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty, !address.contains(where: \.isWhitespace), !address.utf8.contains(0) else {
+            problem = "A server address has no spaces: a host name or IP, with :port if it is not 25565."
+            return nil
+        }
+        return address
     }
 
     private func beginLaunch(_ label: String) -> LaunchAttempt? {
@@ -259,6 +352,7 @@ final class GameLink: ObservableObject {
             requestingGameFiles = true
             return nil
         }
+        guard !cleaningUpCache else { return nil }
         let attempt = LaunchAttempt()
         currentLaunch = attempt
         phaseEpoch = UUID()
@@ -301,11 +395,10 @@ final class GameLink: ObservableObject {
         phaseEpoch = UUID()
         let refreshAtSubmission = appliedRefresh
         let answer = await self.send("launcher-start \(attempt.id.uuidString)")
-        guard answer["ok"] as? Bool == true, answer.error == nil else {
+        guard answer.acknowledged, answer.error == nil else {
             try check(attempt)
             throw AccountError(answer.error ?? "The game could not start. Try again.")
         }
-        attempt.accepted = true
         try check(attempt)
         // State requests submitted after the start command describe a newer
         // engine state, even when their replies arrive before this one.
@@ -324,7 +417,7 @@ final class GameLink: ObservableObject {
     private func present(_ attempt: LaunchAttempt) async throws {
         try check(attempt)
         let answer = await self.send("launcher-commit-start \(attempt.id.uuidString)")
-        if answer["ok"] as? Bool == true, answer["status"] as? String == "committed" {
+        if answer.acknowledged, answer.error == nil, answer["status"] as? String == "committed" {
             finishPresentation(attempt)
         } else {
             try check(attempt)
@@ -347,7 +440,9 @@ final class GameLink: ObservableObject {
         if error is CancellationError || Task.isCancelled || attempt.cancelled {
             requestCancellation(attempt)
         } else if currentLaunch === attempt {
-            if attempt.accepted {
+            // The engine may have accepted the command before its reply was
+            // lost. Reconcile ownership before letting another Play start.
+            if attempt.submitted {
                 attempt.failure = error.localizedDescription
                 requestCancellation(attempt)
             } else {
@@ -377,31 +472,43 @@ final class GameLink: ObservableObject {
             guard let self else { return }
             let answer = await self.send("launcher-cancel-start \(attempt.id.uuidString)")
             guard self.currentLaunch === attempt else { return }
-            guard answer["ok"] as? Bool == true,
+            guard answer.acknowledged, answer.error == nil,
                   let status = answer["status"] as? String,
                   ["stopped", "stale", "committed"].contains(status) else {
                 // Do not enable another Play while shutdown is unproven. A
                 // second Cancel retries a failed bridge operation.
                 attempt.cleanup = nil
-                self.problem = answer.error ?? "The game could not stop. Tap Cancel to retry."
+                let message = answer.error ?? "The game could not stop. Tap Cancel to retry."
+                attempt.stopProblem = message
+                self.problem = message
                 Haptics.failed()
                 return
             }
             if status == "committed" {
+                self.clearStopProblem(attempt)
                 self.finishPresentation(attempt)
-                return
+            } else {
+                self.finishCancellation(attempt, stopped: status == "stopped")
             }
-            self.currentLaunch = nil
-            self.phaseEpoch = UUID()
-            self.launching = nil
-            if status == "stopped" {
-                if self.phase != .waiting { GameAudio.shared.stop() }
-                self.phase = .waiting
-            }
-            if let failure = attempt.failure {
-                self.problem = failure
-                Haptics.failed()
-            }
+        }
+    }
+
+    private func clearStopProblem(_ attempt: LaunchAttempt) {
+        if let message = attempt.stopProblem, problem == message { problem = nil }
+    }
+
+    private func finishCancellation(_ attempt: LaunchAttempt, stopped: Bool) {
+        clearStopProblem(attempt)
+        currentLaunch = nil
+        phaseEpoch = UUID()
+        launching = nil
+        if stopped {
+            stopAudio()
+            phase = .waiting
+        }
+        if let failure = attempt.failure {
+            problem = failure
+            Haptics.failed()
         }
     }
 
@@ -430,6 +537,9 @@ final class GameLink: ObservableObject {
                 let answer = await action()
                 try self.check(attempt)
                 if let error = answer.error { throw AccountError(error) }
+                guard answer.acknowledged else {
+                    throw AccountError("Horizon could not confirm that the game accepted the request.")
+                }
                 try await self.present(attempt)
             } catch { await self.failed(attempt, error: error) }
         }
@@ -464,33 +574,41 @@ final class GameLink: ObservableObject {
     // MARK: - Servers
 
     func addServer(name: String, address: String) async {
-        let address = address.trimmingCharacters(in: .whitespaces)
-        guard !address.isEmpty, !address.contains(where: \.isWhitespace) else {
-            problem = "A server address has no spaces: a host name or IP, with :port if it is not 25565."
-            return
-        }
+        guard let address = validatedServerAddress(address) else { return }
         let name = name.trimmingCharacters(in: .whitespaces)
         report(await self.send("server-add \(address) \(name.isEmpty ? "Minecraft Server" : name)"))
         await reloadServers()
     }
 
     func removeServer(_ server: Server) async {
-        report(await self.send("server-remove \(server.index)"))
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "index": server.index, "name": server.name, "address": server.address,
+        ]) else {
+            problem = "Could not prepare the server selection."
+            return
+        }
+        report(await self.send("server-remove \(String(decoding: data, as: UTF8.self))"))
         await reloadServers()
     }
 
     func ping(_ server: Server) async {
+        guard !Task.isCancelled else { return }
+        let round = serverRound
         let answer = await self.send("server-ping \(server.address)")
+        guard !Task.isCancelled, round == serverRound,
+              servers.contains(where: { $0.address == server.address }) else { return }
         var status = ServerStatus()
         if let error = answer.error {
             status.failed = error
-        } else {
+        } else if answer.acknowledged, let ms = answer["ms"] as? Int, ms >= 0 {
             status.motd = answer["motd"] as? String ?? ""
             status.online = answer["online"] as? Int ?? 0
             status.max = answer["max"] as? Int ?? 0
             status.version = answer["version"] as? String ?? ""
-            status.ms = answer["ms"] as? Int ?? 0
+            status.ms = ms
             status.icon = answer["icon"] as? String
+        } else {
+            status.failed = "The game did not return a valid server status."
         }
         statuses[server.address] = status
     }

@@ -5,10 +5,9 @@ use super::*;
 #[derive(Default)]
 pub(super) struct FrameAttempt<K = FrameKey>(Option<K>);
 
-/// The frame the renderer would be made with (`Renderer::requested_frame`), the pick's path,
-/// its outcome.
+/// The requested frame and drawable size, the shader path, and its outcome.
 type FrameKey = (
-    Option<horizon_client::gfx::FrameConfiguration>,
+    Option<(horizon_client::gfx::FrameConfiguration, [u32; 2])>,
     PathBuf,
     Option<bool>,
 );
@@ -76,10 +75,12 @@ impl Game<'_> {
         let pack = pack.filter(|_| outcome != Some(false)).unwrap_or_default();
         // Display capabilities can still change between shader checks.
         let request = pack.frame();
-        let wanted = self
-            .renderer
-            .as_ref()
-            .map(|r| r.requested_frame(&self.settings.horizon, request));
+        let wanted = self.renderer.as_ref().map(|r| {
+            (
+                r.requested_frame(&self.settings.horizon, request),
+                [r.config.width, r.config.height],
+            )
+        });
         if !self.frame_attempted.changed((wanted, path, outcome)) {
             return;
         }
@@ -118,9 +119,11 @@ impl Game<'_> {
         let mut world_kept = false;
         if let Some(old) = &mut self.renderer {
             renderer.resize(old.config.width, old.config.height);
-            renderer.screenshot = old.screenshot.take();
-            renderer.screenshot_result = old.screenshot_result.take();
             world_kept = renderer.take_world(old);
+            renderer.capture_result = old.capture_result.take();
+            if world_kept {
+                renderer.capture = old.capture.take();
+            }
         }
         self.adopt(renderer, world_kept);
         log::info!(
@@ -165,8 +168,10 @@ impl Game<'_> {
             self.all_sections_changed();
         }
         self.audio.master = self.settings.master_volume;
-        if self.settings.sound_device != self.audio.device() {
-            let _ = self.audio.set_device(&self.settings.sound_device);
+        if self.settings.sound_device != self.audio.device()
+            && let Err(error) = self.audio.set_device(&self.settings.sound_device)
+        {
+            log::warn!("Horizon: could not apply the requested audio output ({error}); will retry");
         }
         let gui = self.settings.gui_scale_inputs();
         if self.applied_gui_scale != Some(gui) {
@@ -263,8 +268,16 @@ impl Game<'_> {
         }
         // And has no wall for the world border.
         self.border_renderer.invalidate();
+        if let Some(old) = self.renderer.as_mut() {
+            renderer.restore_screenshot_state(old.take_screenshot_state());
+        }
         self.renderer = Some(renderer);
-        self.airplay = None;
+        self.dynamic_resolution.restart_measurements();
+        self.airplay = Default::default();
+        // Reattach before this renderer can submit its first frame.
+        if !self.options.split_guest {
+            self.sync_airplay();
+        }
         self.forget_atlas_slots();
         let shader_mesh_changed = self.clear_shader_mesh_state();
         if !world_kept {
@@ -298,27 +311,30 @@ mod tests {
     use super::FrameAttempt;
 
     #[test]
-    fn failed_frame_attempt_waits_for_a_policy_or_setting_change() {
+    fn failed_frame_attempt_waits_for_a_policy_setting_or_size_change() {
         let mut attempts = FrameAttempt::default();
         let mut rebuilds = 0;
         // The requested frame stands for itself here: the 8-bit one, then the float one.
         for key in [
-            ("8-bit", "p", None),
-            ("8-bit", "p", None),
+            (("8-bit", [1440, 1080]), "p", None),
+            (("8-bit", [1440, 1080]), "p", None),
             // HDR output offered later, with HDR On: the frame is looked at again.
-            ("float", "p", None),
-            ("float", "p", Some(true)),
-            ("float", "p", Some(true)),
-            ("float", "p", Some(false)),
-            ("float", "p", Some(false)),
-            ("float", "q", None),
-            ("8-bit", "q", None),
+            (("float", [1440, 1080]), "p", None),
+            (("float", [1440, 1080]), "p", Some(true)),
+            (("float", [1440, 1080]), "p", Some(true)),
+            (("float", [1440, 1080]), "p", Some(false)),
+            (("float", [1440, 1080]), "p", Some(false)),
+            (("float", [1440, 1080]), "q", None),
+            (("8-bit", [1440, 1080]), "q", None),
+            // The smaller drawable can fit after allocation at the first size failed.
+            (("8-bit", [640, 480]), "q", None),
+            (("8-bit", [640, 480]), "q", None),
         ] {
             if attempts.changed(key) {
                 // A replacement fails: no success is recorded, just the attempted key.
                 rebuilds += 1;
             }
         }
-        assert_eq!(rebuilds, 6);
+        assert_eq!(rebuilds, 7);
     }
 }

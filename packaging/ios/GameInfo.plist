@@ -34,9 +34,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<!-- Game Mode (iOS 18+): asks the system to favour the game's frame timing and to route pad and mouse input
 	     as a game would receive it. Read by GameController and UIKit, not by the Rust game. -->
 	<!-- Current Game Mode key; retain GC below for iOS 18. -->

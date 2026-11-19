@@ -458,23 +458,20 @@ impl Game<'_> {
             self.grant_rewards(&tree.list[index]);
         }
     }
-    pub(super) fn save_advancements(&self) {
+    /// Persist advancement progress as a whole file. Save and Quit must
+    /// report a failure if serialization or replacement can't finish.
+    pub(super) fn save_advancements(&self) -> horizon_client::Result<()> {
         if !self.adv.loaded || self.remote.is_some() || self.no_player_here() {
-            return;
+            return Ok(());
         }
         let Some(path) = self.adv_path() else {
-            return;
+            return Ok(());
         };
         let json = self
             .adv
             .progress
             .to_json(&self.adv.tree, horizon_world::DATA_VERSION);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
-        }
+        super::stats::write_player_json(&path, &json)
     }
     /// The player as predicates see it.
     /// The predicate view of a command target.

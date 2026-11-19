@@ -18,7 +18,7 @@ use super::app_state::{self, EventWrapper};
 use super::gesture_delta::{GestureDelta, PanDelta};
 use super::window::WinitUIWindow;
 use crate::dpi::PhysicalPosition;
-use crate::event::{ElementState, Event, Force, KeyEvent, Touch, TouchPhase, WindowEvent};
+use crate::event::{ElementState, Event, Force, Ime, KeyEvent, Touch, TouchPhase, WindowEvent};
 use crate::keyboard::{
     Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey,
 };
@@ -630,7 +630,7 @@ impl WinitView {
         );
     }
 
-    fn release_hardware_keys(&self) {
+    pub(super) fn release_hardware_keys(&self) {
         let held = std::mem::take(&mut *self.ivars().held_keys.borrow_mut());
         for (_, mut event) in held {
             event.state = ElementState::Released;
@@ -708,11 +708,22 @@ impl WinitView {
         let Some(window) = self.window() else { return };
         let window_id = RootWindowId(window.id());
         let mtm = MainThreadMarker::from(self);
-        // Both software typing and hardware navigation can arrive via insertText:.
-        // Decode navigation tokens before expanding genuine text into characters.
+        let text = text.to_string();
+        if let Some(committed) = super::hardware_keyboard::multiline_commit(&text) {
+            if self.ivars().ime_allowed.get() {
+                app_state::handle_nonuser_event(
+                    mtm,
+                    EventWrapper::StaticEvent(Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::Ime(Ime::Commit(committed)),
+                    }),
+                );
+            }
+            return;
+        }
         app_state::handle_nonuser_events(
             mtm,
-            super::hardware_keyboard::insert_text_keys(&text.to_string())
+            super::hardware_keyboard::insert_text_keys(&text)
                 .into_iter()
                 .flat_map(|(physical_key, logical_key)| {
                     let text = match &logical_key {

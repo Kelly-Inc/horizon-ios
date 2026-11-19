@@ -17,6 +17,8 @@ use std::{
 pub const MAX_SIZE: u64 = 262_144_000;
 /// `DownloadQueue.MAX_KEPT_PACKS`.
 const MAX_KEPT: usize = 20;
+/// Progress toasts do not need an event for each write.
+const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 /// Longest wait for a connection, and for any one read from the server. The
 /// queue runs batches on one thread, so a server that accepts the connection
 /// and then goes silent would otherwise hold the pack screen forever.
@@ -102,9 +104,17 @@ fn run(
 ) -> Batch {
     let mut batch = Batch::default();
     for request in requests {
-        let id = horizon_protocol::crypto::uuid_string(request.id);
         let _ = progress.send(Progress::RequestStart);
+        if request.is_cancelled() {
+            let _ = progress.send(Progress::RequestFinished(true));
+            continue;
+        }
+        let id = horizon_protocol::crypto::uuid_string(request.id);
         let result = download_file(&dir.join(&id), request, headers, MAX_SIZE, progress);
+        if request.is_cancelled() {
+            let _ = progress.send(Progress::RequestFinished(true));
+            continue;
+        }
         let _ = progress.send(Progress::RequestFinished(result.is_ok()));
         // DownloadQueue.LogEntry, its fields in the codec's order.
         let mut entry = vec![
@@ -211,6 +221,9 @@ fn download_file_within(
     progress: &Sender<Progress>,
     timeout: std::time::Duration,
 ) -> Result<PathBuf, String> {
+    if request.is_cancelled() {
+        return Err("Server pack download cancelled".into());
+    }
     let target = request.sha1.as_ref().map(|sha1| dir.join(sha1));
     if let (Some(target), Some(sha1)) = (&target, &request.sha1) {
         if matches(target, sha1) {
@@ -243,10 +256,20 @@ fn download_file_within(
         call = call.set(name, value);
     }
     let response = call.call().map_err(|e| e.to_string())?;
+    if request.is_cancelled() {
+        return Err("Server pack download cancelled".into());
+    }
+    // This client requests a whole pack, so a successful partial response
+    // cannot supply valid cache contents, even when no hash was advertised.
+    if response.status() != 200 || response.header("Content-Range").is_some() {
+        return Err(format!(
+            "Expected a complete server pack (HTTP {})",
+            response.status()
+        ));
+    }
     let size = response
         .header("Content-Length")
         .and_then(|v| v.trim().parse::<u64>().ok());
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let _ = progress.send(Progress::DownloadStart(size));
     if let Some(size) = size
         && size > max_size
@@ -259,33 +282,95 @@ fn download_file_within(
     let mut report = |written: u64| {
         let _ = progress.send(Progress::Bytes(written));
     };
-    match (&target, &request.sha1) {
-        (Some(target), Some(sha1)) => {
-            let actual = save_hashed(&mut input, target, max_size, &mut report)
-                .map_err(|e| e.to_string())?;
-            if &actual != sha1 {
-                return Err(format!(
-                    "Hash of downloaded file ({actual}) did not match requested ({sha1})"
-                ));
-            }
-            Ok(target.clone())
-        }
-        _ => {
-            let tmp = dir.join(format!("download{:016x}.tmp", rand_suffix()));
-            let result = save_hashed(&mut input, &tmp, max_size, &mut report).and_then(|actual| {
-                let path = dir.join(&actual);
-                if matches(&path, &actual) {
-                    touch(&path);
-                } else {
-                    fs::rename(&tmp, &path)?;
-                }
-                Ok(path)
-            });
-            let _ = fs::remove_file(&tmp);
-            result.map_err(|e| e.to_string())
-        }
+    // Keep the final cache path absent until the transfer completes and the
+    // advertised hash matches. The temporary file also covers read and write failures.
+    let (staged, output) = StagedDownload::open(dir).map_err(|error| error.to_string())?;
+    let actual = save_hashed(&mut input, output, max_size, &mut report, || {
+        request.is_cancelled()
+    })
+    .map_err(|error| error.to_string())?;
+    if request.is_cancelled() {
+        return Err("Server pack download cancelled".into());
+    }
+    if let Some(expected) = &request.sha1
+        && &actual != expected
+    {
+        return Err(format!(
+            "Hash of downloaded file ({actual}) did not match requested ({expected})"
+        ));
+    }
+    let path = target.unwrap_or_else(|| dir.join(&actual));
+    if matches(&path, &actual) {
+        touch(&path);
+    } else {
+        fs::rename(&staged.path, &path).map_err(|e| e.to_string())?;
+    }
+    Ok(path)
+}
+
+#[cfg(any(target_os = "ios", test))]
+static ACTIVE_STAGING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+struct StagedDownload {
+    path: PathBuf,
+}
+
+impl StagedDownload {
+    fn open(dir: &Path) -> io::Result<(Self, fs::File)> {
+        let path = dir.join(format!("download{:016x}.tmp", rand_suffix()));
+        #[cfg(any(target_os = "ios", test))]
+        let mut active = ACTIVE_STAGING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fs::create_dir_all(dir)?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        #[cfg(any(target_os = "ios", test))]
+        active.push(path.clone());
+        Ok((Self { path }, file))
     }
 }
+
+impl Drop for StagedDownload {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "ios", test))]
+        let mut active = ACTIVE_STAGING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = fs::remove_file(&self.path);
+        #[cfg(any(target_os = "ios", test))]
+        active.retain(|path| *path != self.path);
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn is_staged_download(root: &Path, path: &Path) -> bool {
+    let Some(parent) = path.parent().filter(|parent| parent.parent() == Some(root)) else {
+        return false;
+    };
+    let Some(pack) = parent.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if pack.len() != 36
+        || !pack.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("download"))
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 fn rand_suffix() -> u64 {
     use std::hash::{BuildHasher, RandomState};
     RandomState::new().hash_one(std::time::Instant::now())
@@ -293,21 +378,24 @@ fn rand_suffix() -> u64 {
 /// `downloadAndHash`: write what comes, at most `max_size` bytes.
 fn save_hashed(
     input: &mut dyn Read,
-    path: &Path,
+    mut out: fs::File,
     max_size: u64,
     progress: &mut dyn FnMut(u64),
+    cancelled: impl Fn() -> bool,
 ) -> io::Result<String> {
-    let mut out = fs::File::create(path)?;
     let mut hasher = Sha1::new();
     let mut buffer = [0u8; 8196];
     let mut read_so_far = 0u64;
+    let mut last_reported = 0;
     loop {
+        if cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         let n = input.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         read_so_far += n as u64;
-        progress(read_so_far);
         if read_so_far > max_size {
             return Err(io::Error::other(format!(
                 "Filesize was bigger than maximum allowed (got >= {read_so_far}, limit was {max_size})"
@@ -315,6 +403,13 @@ fn save_hashed(
         }
         out.write_all(&buffer[..n])?;
         hasher.update(&buffer[..n]);
+        if last_reported == 0 || read_so_far - last_reported >= PROGRESS_STEP_BYTES {
+            progress(read_so_far);
+            last_reported = read_so_far;
+        }
+    }
+    if read_so_far != last_reported && !cancelled() {
+        progress(read_so_far);
     }
     Ok(hex(&hasher.finalize()))
 }
@@ -335,6 +430,19 @@ pub fn vacuum(dir: &Path, max_files: usize) {
             if meta.is_dir() {
                 stack.push(path);
             } else if meta.is_file() && path.parent() != Some(dir) {
+                #[cfg(any(target_os = "ios", test))]
+                if is_staged_download(dir, &path) {
+                    let active = ACTIVE_STAGING
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !active.contains(&path) {
+                        let _ = fs::remove_file(&path);
+                        if let Some(parent) = path.parent() {
+                            let _ = fs::remove_dir(parent);
+                        }
+                    }
+                    continue;
+                }
                 let time = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 files.push((path, time));
             }
@@ -375,6 +483,10 @@ pub fn vacuum(dir: &Path, max_files: usize) {
     }
     emptied.remove(dir);
     for d in emptied {
+        #[cfg(any(target_os = "ios", test))]
+        let _active = ACTIVE_STAGING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = fs::remove_dir(d);
     }
 }
@@ -386,6 +498,15 @@ mod tests {
 
     /// A one-shot HTTP server answering `status` with `body`; the request it got.
     fn serve(status: &str, body: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        let length = body.len();
+        serve_with_length(status, body, length)
+    }
+
+    fn serve_with_length(
+        status: &str,
+        body: Vec<u8>,
+        length: usize,
+    ) -> (String, std::thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/pack.zip", listener.local_addr().unwrap());
         let status = status.to_owned();
@@ -398,8 +519,7 @@ mod tests {
                 request.extend_from_slice(&buf[..n]);
             }
             let head = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(head.as_bytes()).unwrap();
             stream.write_all(&body).unwrap();
@@ -423,6 +543,7 @@ mod tests {
         let body = b"PK pack".to_vec();
         let (url, server) = serve("200 OK", body.clone());
         let request = Request {
+            cancelled: Default::default(),
             key: 101,
             id: 7,
             url,
@@ -443,6 +564,7 @@ mod tests {
         assert!(sent.contains("X-Minecraft-Pack-Format: 97.1"), "{sent}");
         // Cached: no server this time.
         let cached = Request {
+            cancelled: Default::default(),
             url: "http://127.0.0.1:9/gone.zip".into(),
             ..request
         };
@@ -459,6 +581,7 @@ mod tests {
         let dir = scratch();
         let (url, server) = serve("200 OK", b"other bytes".to_vec());
         let wrong = Request {
+            cancelled: Default::default(),
             key: 101,
             id: 1,
             url,
@@ -467,7 +590,37 @@ mod tests {
         let err = download_file(&dir, &wrong, &[], MAX_SIZE, &channel().0).unwrap_err();
         assert!(err.contains("did not match requested"), "{err}");
         server.join().unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        let (url, server) = serve("206 Partial Content", b"partial bytes".to_vec());
+        let partial = Request {
+            cancelled: Default::default(),
+            key: 101,
+            id: 1,
+            url,
+            sha1: None,
+        };
+        let err = download_file(&dir, &partial, &[], MAX_SIZE, &channel().0).unwrap_err();
+        assert!(err.contains("Expected a complete server pack"), "{err}");
+        server.join().unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        for hash in [None, Some(sha1(b"the whole pack"))] {
+            let (url, server) = serve_with_length("200 OK", b"the whole".to_vec(), 14);
+            let interrupted = Request {
+                cancelled: Default::default(),
+                key: 101,
+                id: 1,
+                url,
+                sha1: hash,
+            };
+            assert!(download_file(&dir, &interrupted, &[], MAX_SIZE, &channel().0).is_err());
+            server.join().unwrap();
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        }
+
         let dead = Request {
+            cancelled: Default::default(),
             key: 101,
             id: 2,
             url: "http://127.0.0.1:9/pack.zip".into(),
@@ -477,6 +630,7 @@ mod tests {
         assert!(!dir.join("dead").exists());
         let (url, server) = serve("200 OK", vec![0; 100]);
         let large = Request {
+            cancelled: Default::default(),
             key: 101,
             id: 3,
             url,
@@ -487,6 +641,7 @@ mod tests {
         let _ = server.join();
         let (url, server) = serve("404 Not Found", Vec::new());
         let missing = Request {
+            cancelled: Default::default(),
             key: 101,
             id: 4,
             url,
@@ -510,6 +665,7 @@ mod tests {
             let _ = hold.recv();
         });
         let request = Request {
+            cancelled: Default::default(),
             key: 101,
             id: 9,
             url,
@@ -532,10 +688,104 @@ mod tests {
     }
 
     #[test]
+    fn vacuum_removes_only_abandoned_pack_staging_files() {
+        let dir = scratch();
+        let pack = dir.join("5b2c7a4e-1f3d-4c8b-9a6e-2d4f8b1c3e5a");
+        fs::create_dir(&pack).unwrap();
+        let abandoned = pack.join("download0123456789abcdef.tmp");
+        let complete = pack.join("4b8f6e1be8570abf42b74bf9f6206583c48da1f3");
+        let other = pack.join("downloads-readme.tmp");
+        fs::write(&abandoned, b"partial").unwrap();
+        fs::write(&complete, b"completed archive").unwrap();
+        fs::write(&other, b"unrelated").unwrap();
+        let (active, file) = StagedDownload::open(&pack).unwrap();
+        let active_path = active.path.clone();
+
+        vacuum(&dir, 2);
+
+        assert!(!abandoned.exists());
+        assert!(complete.is_file());
+        assert!(other.is_file());
+        assert!(active_path.is_file());
+        drop(file);
+        drop(active);
+        assert!(!active_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn popped_and_replaced_downloads_are_skipped() {
+        let dir = scratch();
+        let mut packs = super::super::ServerPacks::default();
+        packs.connect(super::super::Prompt::Allowed);
+        packs.push(1, "http://unused.invalid/old", None);
+        let old = packs.tick().download.remove(0);
+        packs.push(1, "http://unused.invalid/replacement", None);
+        let replacement = packs.tick().download.remove(0);
+        assert!(old.is_cancelled());
+        assert!(!replacement.is_cancelled());
+        packs.pop(1);
+        assert!(replacement.is_cancelled());
+
+        let (progress, events) = channel();
+        let batch = run(&dir, &[old, replacement], &[], &progress);
+        assert!(batch.downloaded.is_empty() && batch.failed.is_empty());
+        assert!(!dir.join("log.json").exists());
+        assert_eq!(events.try_iter().count(), 4);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn large_transfers_report_their_final_size_without_reporting_every_chunk() {
+        let dir = scratch();
+        let path = dir.join("download");
+        let output = fs::File::create(&path).unwrap();
+        let size = (2 * PROGRESS_STEP_BYTES + 9) as usize;
+        let mut input = io::Cursor::new(vec![7u8; size]);
+        let mut updates = Vec::new();
+
+        save_hashed(
+            &mut input,
+            output,
+            MAX_SIZE,
+            &mut |n| updates.push(n),
+            || false,
+        )
+        .unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().len(), size as u64);
+        assert_eq!(updates.first(), Some(&8196));
+        assert_eq!(updates.last(), Some(&(size as u64)));
+        assert!(updates.len() <= 4);
+        assert!(updates.windows(2).all(|pair| pair[0] < pair[1]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_active_transfer_can_stop_between_chunks() {
+        let dir = scratch();
+        let output = fs::File::create(dir.join("partial.tmp")).unwrap();
+        let stopped = std::cell::Cell::new(false);
+        let mut input = io::Cursor::new(vec![0u8; 16_392]);
+        let error = save_hashed(
+            &mut input,
+            output,
+            MAX_SIZE,
+            &mut |_| stopped.set(true),
+            || stopped.get(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(input.position(), 8196);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn failed_batch_retains_the_request_generation_and_protocol_uuid() {
         let dir = scratch();
         let (url, server) = serve("404 Not Found", Vec::new());
         let request = Request {
+            cancelled: Default::default(),
             id: 77,
             key: 101,
             url,
@@ -558,6 +808,7 @@ mod tests {
         let id = 0x5b2c_7a4e_1f3d_4c8b_9a6e_2d4f_8b1c_3e5a;
         queue.download(
             vec![Request {
+                cancelled: Default::default(),
                 key: 101,
                 id,
                 url,

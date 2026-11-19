@@ -1,4 +1,4 @@
-"""Actual supervisor readiness gate must include both far-terrain producers."""
+"""Far-terrain stop."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -51,15 +51,16 @@ struct Session{cancels:AtomicUsize,recording:Option<WorkHandle>}impl Session{fn 
 struct Remote{session:Session}struct Renderer;impl Renderer{fn shutdown_pack_compiler(&mut self)->bool{true}fn clear_lods(&mut self){}}
 struct Rest{handle:JoinHandle<()>}
 impl Rest{fn ready(&self)->std::result::Result<bool,()>{Ok(self.handle.is_finished())}}
-struct Game{audio:Audio,remote:Option<Remote>,lod:Option<Worker>,lod_blue_map:Option<Arc<Worker>>,renderer:Option<Renderer>,rest_loader:Option<Rest>,retired_far_terrain:Vec<FarTerrainWorkers>,lod_source_attempted:bool,lod_held:Vec<()>,lod_observe:Vec<()>,far_beacons:Vec<()>,lod_covered_at:Option<()>,splitscreen_guest:Option<Box<Game>>,skin_profiles:RefCell<SkinManager>,skin_downloads:RefCell<SkinManager>,retired_skin_workers:Vec<WorkHandle>,retired_recording_workers:Vec<WorkHandle>,studio_recording_notice_pending:bool}
-impl Game{fn retire_guest_culling_workers(&mut self,_:&mut Game){}fn shutdown_server_pack_worker(&mut self)->bool{true}fn shutdown_culling_workers(&mut self)->bool{true}fn shutdown_integrated_workers(&mut self)->bool{true}fn end_splitscreen(&mut self){}}
+#[derive(Default)]struct Split{request:Option<()>,active:bool}
+struct Game{splitscreen:Split,audio:Audio,remote:Option<Remote>,lod:Option<Worker>,lod_blue_map:Option<Arc<Worker>>,renderer:Option<Renderer>,rest_loader:Option<Rest>,retired_far_terrain:Vec<FarTerrainWorkers>,lod_source_attempted:bool,lod_held:Vec<()>,lod_observe:Vec<()>,far_beacons:Vec<()>,lod_covered_at:Option<()>,splitscreen_guest:Option<Box<Game>>,skin_profiles:RefCell<SkinManager>,skin_downloads:RefCell<SkinManager>,retired_skin_workers:Vec<WorkHandle>,retired_recording_workers:Vec<WorkHandle>,studio_recording_notice_pending:bool}
+impl Game{fn poll_screenshot_writes(&mut self)->bool{true}fn retire_guest_culling_workers(&mut self,_:&mut Self){}fn shutdown_server_pack_worker(&mut self)->bool{true}fn shutdown_culling_workers(&mut self)->bool{true}fn shutdown_integrated_workers(&mut self)->bool{true}fn end_splitscreen(&mut self){}}
 mod shader_packs{pub fn shutdown_parser()->bool{true}}
 mod world_loading{pub fn shutdown_preload()->bool{true}pub fn shutdown_prepared_files()->bool{true}}
 enum ControlFlow{WaitUntil(Instant)}struct EventLoop;impl EventLoop{fn set_control_flow(&self,_:ControlFlow){}}
 '''
 
 CASES = r'''
-fn game_with_workers()->Game{let audio=Audio(Worker::new());audio.0.ready.store(true,Ordering::SeqCst);Game{audio,remote:Some(Remote{session:Session{cancels:AtomicUsize::new(0),recording:None}}),lod:Some(Worker::new()),lod_blue_map:Some(Arc::new(Worker::new())),renderer:None,rest_loader:None,retired_far_terrain:Vec::new(),lod_source_attempted:true,lod_held:vec![],lod_observe:vec![],far_beacons:vec![],lod_covered_at:None,splitscreen_guest:None,skin_profiles:RefCell::new(SkinManager::new(true)),skin_downloads:RefCell::new(SkinManager::new(true)),retired_skin_workers:vec![],retired_recording_workers:vec![],studio_recording_notice_pending:false}}
+fn game_with_workers()->Game{let audio=Audio(Worker::new());audio.0.ready.store(true,Ordering::SeqCst);Game{splitscreen:Split::default(),audio,remote:Some(Remote{session:Session{cancels:AtomicUsize::new(0),recording:None}}),lod:Some(Worker::new()),lod_blue_map:Some(Arc::new(Worker::new())),renderer:None,rest_loader:None,retired_far_terrain:Vec::new(),lod_source_attempted:true,lod_held:vec![],lod_observe:vec![],far_beacons:vec![],lod_covered_at:None,splitscreen_guest:None,skin_profiles:RefCell::new(SkinManager::new(true)),skin_downloads:RefCell::new(SkinManager::new(true)),retired_skin_workers:vec![],retired_recording_workers:vec![],studio_recording_notice_pending:false}}
 fn main(){
  let mut g=game_with_workers();
  poll(&mut g,&EventLoop);assert!(!READY.load(Ordering::SeqCst));

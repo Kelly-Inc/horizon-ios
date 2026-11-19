@@ -779,6 +779,7 @@ pub(super) fn load_resources_with_access(
             threads,
         },
         rest: std::sync::OnceLock::new(),
+        block_entity_reach: std::sync::OnceLock::new(),
     };
     let resources = Arc::new(resources);
     if menu {

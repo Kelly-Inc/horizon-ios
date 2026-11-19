@@ -76,7 +76,7 @@ type Result<T> = std::result::Result<T,String>;
 #[derive(Clone,PartialEq)]enum NativeKey{Unidentified}
 #[derive(Clone,PartialEq)]enum Key{Character(String),Named(NamedKey),Unidentified(NativeKey)}
 mod smol_str { pub type SmolStr=String; }
-mod preedit { pub fn set_preedit(_:Option<()>){} pub fn mark_committed() {} }
+mod preedit { pub fn composing() -> bool { false } pub fn set_preedit(_:Option<()>){} pub fn mark_committed() {} }
 #[derive(Clone,Copy,PartialEq)]enum ElementState{Pressed,Released}
 struct KeyEvent{physical_key:PhysicalKey,state:ElementState,text:Option<String>,repeat:bool}
 enum WindowEvent{KeyboardInput{event:KeyEvent},Other}
@@ -109,12 +109,18 @@ struct Renderer{current:bool}impl Renderer{fn presentation_current(&self)->bool{
 #[derive(Default)]struct Pad{reload_pending:bool}
 enum Transaction{Preparing,Committing}
 #[derive(Default)]struct Mods{transaction:Option<Transaction>}
-struct Game{renderer:Option<Renderer>,creative_ignore_text:bool,pad:Pad,pack_reload:Option<()>,mods:Mods,mod_transaction:Option<Transaction>,screen:Screen,title:Option<Title>,modifiers:u32,book:Option<()>,sign_edit:Option<()>,ui:UI,gui:GUI,creative_screen:Creative,text_selection:Selection,audio:Audio,cancel:bool,cancel_key:bool,blocked:bool,dialog:bool,dialog_value:String,command:String,hooked:RefCell<String>}
+mod books {pub enum BookScreen {Edit{signing:bool}}}
+use books::BookScreen;
+struct Game{renderer:Option<Renderer>,creative_ignore_text:bool,pad:Pad,pack_reload:Option<()>,mods:Mods,mod_transaction:Option<Transaction>,screen:Screen,title:Option<Title>,modifiers:u32,book:Option<BookScreen>,sign_edit:Option<()>,ui:UI,gui:GUI,creative_screen:Creative,text_selection:Selection,audio:Audio,cancel:bool,cancel_key:bool,blocked:bool,dialog:bool,dialog_value:String,command:String,hooked:RefCell<String>}
 fn glfw_modifiers(m:u32)->u32{m}
 impl Game {
  fn with_focused_text_edit(&mut self,read:impl FnOnce(&mut Self,Option<()>)->bool)->bool{read(self,None)}
  fn screen_chars_post(&self,_:&str){panic!("focused fixture field must consume its characters");}
  fn dialog_open(&self)->bool{self.dialog}
+ fn dialog_text_focused(&self)->bool{self.dialog}
+ fn dialog_typing_lines(&self)->bool{false}
+ fn dialog_text(&mut self,t:&str){self.dialog_type(t);}
+ fn key_screen(&self)->(std::mem::Discriminant<Screen>,bool){(std::mem::discriminant(&self.screen),self.dialog)}
  fn prompt_open(&self)->bool{self.dialog_open()}
  // No native mod text-field extension is installed in this fixture.
  fn type_text_field_input(&mut self,_:&str)->Option<Result<()>>{None}

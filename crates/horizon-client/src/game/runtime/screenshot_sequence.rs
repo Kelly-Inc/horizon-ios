@@ -137,8 +137,9 @@ impl Game<'_> {
         if self.screenshot_sequence.is_some() {
             return Err("a screenshot sequence is already running".into());
         }
+        self.fail_abandoned_screenshot();
         let renderer = self.renderer.as_ref().ok_or("no renderer yet")?;
-        if self.pending_screenshot.is_some() || renderer.screenshot.is_some() {
+        if self.pending_screenshot.is_some() || renderer.screenshot_busy() {
             return Err("a screenshot is already pending".into());
         }
         if let Some(refusal) = self.sequence_refusal() {
@@ -226,7 +227,7 @@ impl Game<'_> {
             }
         }
         if last && let Some(renderer) = &mut self.renderer {
-            renderer.screenshot = Some(ScreenshotRequest {
+            renderer.request_screenshot(ScreenshotRequest {
                 path,
                 size: None,
                 scaled: false,
@@ -235,7 +236,12 @@ impl Game<'_> {
             renderer.screenshot_result = None;
         }
         let drawn = self.render_frame();
-        let renderer = self.renderer.as_mut().ok_or("no renderer")?;
+        let Some(renderer) = self.renderer.as_mut() else {
+            self.end_screenshot_sequence(
+                Err("the renderer disappeared during the sequence".into()),
+            );
+            return Err("no renderer".into());
+        };
         // Still queued when the frame wasn't drawn, or when the PNG is to be taken
         // again smaller (out of memory): not this sequence's frame.
         let queued = last && renderer.screenshot.take().is_some();
@@ -258,29 +264,31 @@ impl Game<'_> {
             return Ok(true);
         }
         let outcome = match (queued, renderer.screenshot_result.take()) {
-            (false, Some(Ok(pending))) => {
-                let saved = pending.save_with_details().map_err(|e| e.to_string())?;
-                let [w, h] = saved.size;
-                let timing = sequence.timing();
-                let mut value = json!({
-                    "ok": true,
-                    "path": sequence.path,
-                    "frames": sequence.frames,
-                    "step_ms": sequence.step_ms,
-                    "frame": {
-                        "counter": timing.counter,
-                        "elapsed": timing.elapsed,
-                        "delta": timing.delta,
-                    },
-                    "size": [w, h],
-                    "pack": sequence.pack.clone(),
-                });
+            (false, Some(Ok(pending))) => pending
+                .save_with_details()
+                .map(|saved| {
+                    let [w, h] = saved.size;
+                    let timing = sequence.timing();
+                    let mut value = json!({
+                        "ok": true,
+                        "path": sequence.path,
+                        "frames": sequence.frames,
+                        "step_ms": sequence.step_ms,
+                        "frame": {
+                            "counter": timing.counter,
+                            "elapsed": timing.elapsed,
+                            "delta": timing.delta,
+                        },
+                        "size": [w, h],
+                        "pack": sequence.pack.clone(),
+                    });
 
-                if let Some(hdr) = saved.hdr_path {
-                    value["hdr_path"] = json!(hdr);
-                }
-                Ok(value)
-            }
+                    if let Some(hdr) = saved.hdr_path {
+                        value["hdr_path"] = json!(hdr);
+                    }
+                    value
+                })
+                .map_err(|error| error.to_string().into()),
             (_, Some(Err(e))) => Err(e.into()),
             _ => Err("the last frame's PNG wasn't written".into()),
         };

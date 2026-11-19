@@ -27,7 +27,8 @@ class TouchBindingTests(unittest.TestCase):
         bindings = bindings[:start] + bindings[end:]
         bindings = bindings.replace("use winit::{", "use crate::winit::{")
         touch = (ROOT / "crates/horizon-client/src/game/interface/touch.rs").read_text()
-        methods = "\n".join(method(touch, name) for name in ["touch_raw_key", "touch_key_held", "touch_raw_button", "touch_raw_holds_mouse_mapping"])
+        methods = "\n".join(method(touch, name) for name in ["touch_raw_key", "touch_cancel_key", "touch_cancel_debug_modifier", "touch_map_raw_key", "touch_key_held", "touch_raw_button", "touch_raw_holds_mouse_mapping"])
+        methods += "\n" + method(touch, "cancel_touch_for_reload").replace('#[cfg(target_os = "ios")]', "")
         program = r'''
 #![allow(dead_code)]
 mod winit {
@@ -39,17 +40,26 @@ mod horizon_client {pub mod debug_keys {#[derive(Clone,Copy,Debug,PartialEq)]pub
 fn replace_action_bindings<'a>(_:impl Iterator<Item=(&'a str,&'a str)>){panic!("display label publication is not an input event");}
 }}
 #[path="TOUCH_SOURCE"]mod actual_touch;
-use actual_touch::Control;
+use actual_touch::{Control,Out};
+mod horizon_ios_launcher {pub fn touch_gestures(_:u64,_:u32,_:(f64,f64),_:f64){}}
 use winit::{keyboard::KeyCode,event::MouseButton};
 KEY_OF
-#[derive(Default)]struct Touch{fingers:actual_touch::Touches,cursor:actual_touch::desktop::Cursor,cursor_down:[bool;3],cursor_keys:Vec<Control>,native_mouse:[bool;3],native_keys:Vec<KeyCode>,custom_keys:Vec<KeyCode>,custom_mouse:[bool;3]}
+#[derive(Default)]struct Touch{window_buttons:Vec<()>,menu:Option<()>,late:Vec<()>,holding:Option<()>,toggle_keys:Vec<()>,fingers:actual_touch::Touches,cursor:actual_touch::desktop::Cursor,cursor_down:[bool;3],cursor_keys:Vec<Control>,native_mouse:[bool;3],native_keys:Vec<KeyCode>,custom_keys:Vec<KeyCode>,custom_mouse:[bool;3]}
 use horizon_client::keybinds::KeyBinds;
 type Result<T>=std::result::Result<T,()>;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]enum Source{Touch}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]enum Event{Key(KeyCode,bool,KeyCode,Source),Mouse(MouseButton,bool,Source)}
 #[derive(Default)]struct Settings{keys:KeyBinds}
-#[derive(Default)]struct Game{touch:Touch,settings:Settings,events:Vec<Event>,another_touch_hold:bool,debug_edges:Vec<horizon_client::debug_keys::KeyAction>}
+#[derive(Default)]struct DebugState{resets:usize}
+impl DebugState{fn reset(&mut self){self.resets+=1}}
+#[derive(PartialEq,Default)]enum Screen{#[default] Playing,GameModeSwitcher}
+#[derive(Default)]struct Keys;
+impl Keys{fn release_source(&mut self,_:Source){}}
+#[derive(Default)]struct Game{touch_drag_button:Option<()>,keys:Keys,debug_keys:DebugState,screen:Screen,physical_keys:Vec<KeyCode>, applied_mode:Option<bool>,touch:Touch,settings:Settings,events:Vec<Event>,another_touch_hold:bool,debug_edges:Vec<horizon_client::debug_keys::KeyAction>}
 impl Game{
+ fn touch_cursor_reset(&mut self){}
+ fn touch_native_reset(&mut self){}
+ fn close_gamemode_switcher(&mut self,apply:bool){self.applied_mode=Some(apply);self.screen=Screen::Playing;}
  fn debug_key(&mut self,key:KeyCode,action:horizon_client::debug_keys::KeyAction)->bool{if key==KeyCode::F3{self.debug_edges.push(action);true}else{false}}
  fn mapped_key(&mut self,key:KeyCode,pressed:bool,_:bool,raw:KeyCode,source:Source)->Result<()>{self.events.push(Event::Key(key,pressed,raw,source));Ok(())}
  fn mouse_mapping(&mut self,button:MouseButton,pressed:bool,source:Source)->Result<()>{self.events.push(Event::Mouse(button,pressed,source));Ok(())}
@@ -69,6 +79,25 @@ fn main(){
  }
  let mut debug=Game::default();debug.touch_raw_key(F3,true).unwrap();debug.touch_raw_key(F3,false).unwrap();
  assert_eq!(debug.debug_edges,[horizon_client::debug_keys::KeyAction::Press,horizon_client::debug_keys::KeyAction::Release]);assert!(debug.events.is_empty());
+ let mut debug=Game::default();
+ debug.touch_raw_key(F3,true).unwrap();
+ debug.screen=Screen::GameModeSwitcher;
+ debug.touch_cancel_key(F3).unwrap();
+ assert_eq!(debug.debug_edges,[horizon_client::debug_keys::KeyAction::Press]);
+ assert_eq!(debug.debug_keys.resets,1);assert_eq!(debug.applied_mode,Some(false));
+ debug.physical_keys.push(F3);debug.touch_cancel_key(F3).unwrap();
+ assert_eq!(debug.debug_keys.resets,1,"hardware owner keeps debug held");
+ let mut reload=Game::default();
+ reload.touch.fingers.start(1,(10.,10.),0.,&[(Control::Debug,[0.,0.,20.,20.])]);
+ reload.touch_raw_key(F3,true).unwrap();
+ reload.cancel_touch_for_reload();
+ assert_eq!(reload.debug_keys.resets,1);
+ assert_eq!(reload.debug_edges,[horizon_client::debug_keys::KeyAction::Press]);
+ assert!(reload.events.is_empty(),"bulk reset must not dispatch a synthetic key-up");
+ assert!(!reload.touch.fingers.held(Control::Debug));
+ let mut ordinary=Game::default();
+ ordinary.touch_raw_key(KeyW,true).unwrap();ordinary.touch_cancel_key(KeyW).unwrap();
+ assert_eq!(ordinary.events,[key(KeyW,true,KeyW),key(KeyW,false,KeyW)]);
  let mut g=Game::default();g.touch_raw_key(KeyW,true).unwrap();g.touch_raw_key(KeyW,false).unwrap();
  assert_eq!(g.events,[key(KeyW,true,KeyW),key(KeyW,false,KeyW)]);
  g.events.clear();g.settings.keys.set("key.forward","key.keyboard.r");g.settings.keys.set("key.back","key.keyboard.w");

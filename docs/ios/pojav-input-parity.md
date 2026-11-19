@@ -39,6 +39,8 @@ python3 tools/pojav_parity/run.py \
 
 The cache must contain the pinned Pojav `LICENSE`, joystick and surface files at their repository paths, plus `Natives/input/ControllerInput.m`. Under `amethyst/`, provide the corresponding pinned Amethyst files, with its ControllerInput saved as `Natives/ControllerInput.m`. The harness refuses changed hashes. It neither downloads nor vendors the sources. Generated GPL oracle source/binaries stay in the explicitly supplied cache. Rust probe builds use a fresh temporary directory. This opt-in tool deliberately lives outside `tools/test_*_parity.py` automatic discovery: regular CI must not fetch or read GPL reference files.
 
+Pojav and Amethyst are compared directly. For Horizon's direct-touch menu traces, the expected output bounds reference cursor coordinates to the render surface. The JSON report counts these traces in `bounded_menu_traces`. Virtual mouse traces and all other groups use the reference coordinates as emitted.
+
 The verified run compared **1,262 traces / 15,796 samples**, with **zero mismatches** between Pojav, Amethyst and Horizon:
 
 | Group | Traces | Coverage |

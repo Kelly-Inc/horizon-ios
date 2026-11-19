@@ -16,6 +16,7 @@ horizon-game-discovery = { path = "../horizon-game-discovery" }
 path = "../horizon-client/src/client_lib.rs"
 
 [dependencies]
+tempfile = "3"
 horizon-cosmetics = { path = "../horizon-cosmetics" }
 horizon-friends = { path = "../horizon-friends" }
 horizon-guest-stack = { path = "../horizon-guest-stack" }
@@ -159,7 +160,6 @@ workspace = true
 [dev-dependencies]
 horizon-threads = { path = "../horizon-threads", features = ["test-allocation-probe"] }
 horizon-mod-wasm = { path = "../horizon-mod-wasm", features = ["listener-fixture", "test-copy-probe"] }
-tempfile = "3"
 mod_platform = { package = "horizon-mod-api", path = "../horizon-mod-api", features = ["testing"] }
 mod_api = { package = "horizon-mod-vocab", path = "../horizon-mod-vocab", features = ["testing"] }
 # ui_theme's unit tests draw text in the design system's fonts.

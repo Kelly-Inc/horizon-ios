@@ -86,28 +86,22 @@ mod ios {
         button.is_some_and(|b| unsafe { b.isPressed() })
     }
 
-    pub fn active() -> Option<Snapshot> {
-        active_controller().map(|controller| controller.state)
-    }
-
-    pub fn active_controller() -> Option<ConnectedController> {
-        // Refresh identities even when the last controller disconnected, so
-        // reconnecting cannot inherit its old armed menu action.
+    pub fn snapshots_with_active() -> (Vec<ConnectedController>, Option<u64>) {
         let available = snapshots();
-        // SAFETY: retained GameController objects are read on the game's main thread.
-        unsafe {
-            let gamepad = |c: &GCController| c.extendedGamepad().is_some();
-            let controller = GCController::current()
-                .filter(|c| gamepad(c))
-                .or_else(|| GCController::controllers().iter().find(|c| gamepad(c)))?;
-            let id = IDS.with_borrow(|ids| {
+        // SAFETY: both retained objects and their identity map are read on the main thread.
+        let current = unsafe { GCController::current() };
+        let selected = current.and_then(|controller| {
+            IDS.with_borrow(|ids| {
                 ids.live
                     .iter()
                     .find(|(_, previous)| std::ptr::eq(&**previous, &*controller))
                     .map(|(id, _)| *id)
-            })?;
-            available.into_iter().find(|controller| controller.id == id)
-        }
+            })
+        });
+        // iOS can change the current controller during the poll. Only select
+        // from this poll's captured devices, falling back to its first pad.
+        let selected = selected.or_else(|| available.first().map(|pad| pad.id));
+        (available, selected)
     }
 
     fn snapshot(controller: &GCController) -> Option<Snapshot> {
@@ -195,21 +189,25 @@ pub fn snapshots() -> Vec<ConnectedController> {
     Vec::new()
 }
 
+/// The connected pads and the active pad's ID from the same main-thread poll.
+pub fn snapshots_with_active() -> (Vec<ConnectedController>, Option<u64>) {
+    #[cfg(target_os = "ios")]
+    return ios::snapshots_with_active();
+    #[cfg(not(target_os = "ios"))]
+    (Vec::new(), None)
+}
+
 /// The currently selected controller and its stable connection identity.
 pub fn active_controller() -> Option<ConnectedController> {
-    #[cfg(target_os = "ios")]
-    return ios::active_controller();
-    #[cfg(not(target_os = "ios"))]
-    None
+    let (available, selected) = snapshots_with_active();
+    let id = selected?;
+    available.into_iter().find(|pad| pad.id == id)
 }
 
 /// The pad that drives the game, read now: the one iOS last saw used, else the first with a full gamepad
 /// profile. `None` when no such pad is connected.
 pub fn active() -> Option<Snapshot> {
-    #[cfg(target_os = "ios")]
-    return ios::active();
-    #[cfg(not(target_os = "ios"))]
-    None
+    active_controller().map(|pad| pad.state)
 }
 
 /// Whether an external keyboard is currently attached (main-thread UIKit input use only).

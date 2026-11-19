@@ -94,7 +94,7 @@ fn empty_advancement_tree_does_not_skip_normal_or_durable_statistics() {
         std::fs::create_dir_all(advancements.parent().unwrap()).unwrap();
         let existing = b"{\"existing-advancements\":true}";
         std::fs::write(&advancements, existing).unwrap();
-        game.save_guest_records(&host, &guest);
+        game.save_guest_records(&host, &guest).unwrap();
         assert_eq!(
             super::super::stats::Stats::read(&stats).get("custom", "minecraft:jump"),
             13

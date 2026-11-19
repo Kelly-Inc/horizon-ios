@@ -1,6 +1,6 @@
 //! Commands from the control socket (`horizon-ctl`), run on the game thread.
 use super::event_loop::EventLoopCtl;
-use super::{Game, Screen};
+use super::{Game, Screen, WorldFolder};
 use horizon_client::gfx::pack_timing;
 use horizon_client::held::Source;
 use horizon_client::{Result, items::ItemStack};
@@ -132,8 +132,51 @@ impl Game<'_> {
             let _ = flight.reply.send(summary.to_string());
         }
     }
-    /// The game's settings a render capture records beside the renderer's own state.
-    fn render_capture_settings(&self) -> horizon_client::gfx::capture::Settings {
+    /// Report requests that have no queued frame or outstanding readback.
+    pub(in crate::game) fn fail_abandoned_screenshot(&mut self) {
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.screenshot_busy())
+        {
+            return;
+        }
+        let error = "The renderer changed before taking the screenshot. Retry the screenshot.";
+        if let Some(reply) = self.pending_screenshot.take() {
+            let _ = reply.send(json!({ "error": error }).to_string());
+        }
+        self.fail_unwritten_screenshots(error);
+    }
+
+    pub(in crate::game) fn poll_render_capture(&mut self) {
+        let result = self
+            .renderer
+            .as_mut()
+            .and_then(|renderer| renderer.capture_result.take());
+        if result.is_none()
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.capture.is_some())
+        {
+            // The renderer still owns the request, for example while shader targets resize.
+            return;
+        }
+        if let Some(reply) = self.pending_render_capture.take() {
+            let result = result.unwrap_or_else(|| {
+                Err(
+                    "The renderer changed before the scene could be captured. Retry the capture."
+                        .into(),
+                )
+            });
+            let value = result.unwrap_or_else(|error| json!({ "error": error }));
+            let _ = reply.send(value.to_string());
+        }
+    }
+
+    pub(in crate::game) fn render_capture_settings(
+        &self,
+    ) -> horizon_client::gfx::capture::Settings {
         let s = &self.settings;
         horizon_client::gfx::capture::Settings {
             graphics_api: format!("{:?}", s.horizon.api),
@@ -171,7 +214,7 @@ impl Game<'_> {
     }
 
     fn add_async_occlusion_stats(&self, summary: &mut Value) {
-        if let Some(culler) = &self.async_occlusion_culler {
+        if let Some(culler) = self.occlusion.asynchronous() {
             summary["async_occlusion_culling"] = culler.stats_value();
         }
     }
@@ -195,7 +238,7 @@ impl Game<'_> {
     }
     fn reset_frame_stats(&mut self) {
         self.frame_stats.reset();
-        if let Some(culler) = &self.async_occlusion_culler {
+        if let Some(culler) = self.occlusion.asynchronous() {
             culler.reset_stats();
         }
     }
@@ -532,6 +575,7 @@ impl Game<'_> {
                     Ok(Some(json!({ "ok": true, "keeping": false })))
                 }
                 Some(_) => {
+                    self.poll_render_capture();
                     if self.pending_render_capture.is_some() {
                         return Err("a render capture is already pending".into());
                     }
@@ -1114,14 +1158,15 @@ impl Game<'_> {
                 ok()
             }
             "screenshot" => {
+                self.fail_abandoned_screenshot();
                 let renderer = self.renderer.as_mut().ok_or("no renderer yet")?;
-                if self.pending_screenshot.is_some() {
+                if self.pending_screenshot.is_some() || renderer.screenshot_busy() {
                     return Err("a screenshot is already pending".into());
                 }
                 arg(1)?;
                 // The rest of the line: a path may hold spaces.
                 let path = line.trim_start().strip_prefix("screenshot").unwrap_or("");
-                renderer.screenshot = Some(horizon_client::gfx::ScreenshotRequest {
+                renderer.request_screenshot(horizon_client::gfx::ScreenshotRequest {
                     path: path.trim().into(),
                     size: None,
                     scaled: false,
@@ -1291,7 +1336,14 @@ impl Game<'_> {
                 let folder = arg(1)?;
                 let seed = words.get(2).map(|s| s.parse::<i64>()).transpose()?;
                 let creative = words.get(3) == Some(&"creative");
-                self.open_world(folder, Some(folder), seed, creative, None)?;
+                self.open_world_request(
+                    folder,
+                    Some(folder),
+                    seed,
+                    creative,
+                    None,
+                    WorldFolder::OpenOrCreate,
+                )?;
                 ok()
             }
             "connect" => {
@@ -1390,9 +1442,10 @@ impl Game<'_> {
 
     /// `horizon-ctl save` and `save-all`.
     fn control_save(&mut self, all: bool) -> Result<()> {
-        if all {
-            let keys: Vec<_> = self.world.chunks.keys().copied().collect();
-            self.world.modified.extend(keys);
+        if all && self.remote.is_none() {
+            // The synchronous save visits the active level and every parked
+            // dimension, so include clean resident chunks in all of them.
+            self.mark_all_resident_chunks_for_save();
         }
         self.save_game()
     }

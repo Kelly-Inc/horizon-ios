@@ -108,7 +108,7 @@ mod connected_advancement_save_tests {
         );
         // Seed a real prior record with the existing record writer. This is not
         // the connected save under test; its result must not substitute for it.
-        game.save_guest_records(host, &host.hub.guests[0]);
+        game.save_guest_records(host, &host.hub.guests[0]).unwrap();
         let prior: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(prior["minecraft:story/root"]["done"], true);
@@ -365,7 +365,7 @@ mod connected_advancement_preservation_tests {
             .stats
             .add("used", "minecraft:stick", 2);
         // The old disconnect wrapper still writes advancement THEN statistics.
-        game.save_guest_records(&host, &host.hub.guests[0]);
+        game.save_guest_records(&host, &host.hub.guests[0]).unwrap();
         assert_eq!(read()["minecraft:story/root"]["done"], true);
         let stat: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&stats_path).unwrap()).unwrap();

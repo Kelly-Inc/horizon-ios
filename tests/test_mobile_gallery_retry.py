@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from test_mobile_game_files_keychain import swift_block
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -15,40 +16,37 @@ ROOT = Path(__file__).resolve().parents[1]
 def program(source=None):
     source = source or (ROOT / "packaging/ios/Launcher/Gallery.swift").read_text()
     start = source.index("@MainActor\nfinal class Thumbnails")
-    end = source.index("\nstruct GalleryPage", start)
-    return PREAMBLE + source[start:end] + CASES
+    cache = swift_block(source, start)
+    decoder = swift_block(cache, cache.index("    nonisolated private static func decode("))
+    cache = cache.replace(decoder, '''
+    nonisolated private static func decode(_ shot: Shot, longestSide: Int) -> UIImage? {
+        ImageFixture.open() ? UIImage() : nil
+    }
+    ''')
+    return PREAMBLE + cache + '''
+extension Thumbnails {
+    func pending(_ shot: Shot) -> Bool { asked.contains(shot) }
+}
+''' + CASES
 
 
 PREAMBLE = r'''
 import Foundation
 protocol ObservableObject {}
-enum PublishedFixture {
- static let lock=NSLock()
- static var count=0
- static func changed(){lock.lock();defer{lock.unlock()};count+=1}
- static func total()->Int{lock.lock();defer{lock.unlock()};return count}
-}
-@propertyWrapper struct Published<T>{var wrappedValue:T{didSet{PublishedFixture.changed()}}}
+@propertyWrapper struct Published<T>{var wrappedValue:T}
+struct Shot:Hashable{let url:URL}
 enum ImageFixture {
- static let lock=NSLock()
+ static let condition=NSCondition()
  static var available=false
  static var reads=0
- static func set(_ value:Bool){lock.lock();defer{lock.unlock()};available=value;reads=0}
- static func open()->Bool{lock.lock();defer{lock.unlock()};reads+=1;return available}
- static func total()->Int{lock.lock();defer{lock.unlock()};return reads}
+ static var blocked=false
+ static func set(_ value:Bool){condition.lock();defer{condition.unlock()};available=value;reads=0}
+ static func open()->Bool{condition.lock();defer{condition.unlock()};reads+=1;while blocked{condition.wait()};return available}
+ static func total()->Int{condition.lock();defer{condition.unlock()};return reads}
+ static func block(){condition.lock();blocked=true;condition.unlock()}
+ static func release(){condition.lock();blocked=false;condition.broadcast();condition.unlock()}
 }
-actor ThumbnailGate {
- static let shared=ThumbnailGate()
- var blocked=false
- var waiters:[CheckedContinuation<Void,Never>]=[]
- func block(){blocked=true}
- func release(){blocked=false;let pending=waiters;waiters=[];pending.forEach{$0.resume()}}
- func wait() async {if blocked{await withCheckedContinuation{waiters.append($0)}}}
-}
-final class UIImage:@unchecked Sendable {
- init?(contentsOfFile:String){if !ImageFixture.open(){return nil}}
- func byPreparingThumbnail(ofSize:CGSize) async -> UIImage? {await ThumbnailGate.shared.wait();return self}
-}
+final class UIImage:@unchecked Sendable {}
 '''
 CASES = r'''
 @main struct Probe {
@@ -60,31 +58,31 @@ CASES = r'''
   return predicate()
  }
  @MainActor static func main() async {
-  let url=URL(fileURLWithPath:"/fixture/thumbnail.png")
+  let shot=Shot(url:URL(fileURLWithPath:"/fixture/thumbnail.png"))
   do {
-   let model=Thumbnails();ImageFixture.set(false);let previous=PublishedFixture.total()
-   model.load(url,side:110)
-   let completed=await until{PublishedFixture.total()>previous}
+   let model=Thumbnails();model.retain([shot]);ImageFixture.set(false)
+   model.load(shot,side:110)
+   let completed=await until{!model.pending(shot)}
    expect(completed,"first unavailable image decode completed")
-   expect(model.images[url] == nil,"unavailable image stays blank")
-   ImageFixture.set(true);model.load(url,side:110)
-   let loaded=await until{model.images[url] != nil}
+   expect(model.images[shot] == nil,"unavailable image stays blank")
+   ImageFixture.set(true);model.load(shot,side:110)
+   let loaded=await until{model.images[shot] != nil}
    expect(loaded,"retry must load a now-available image")
    expect(ImageFixture.total()==1,"retry actually reads the now-valid file")
   }
   do {
-   let model=Thumbnails();ImageFixture.set(true);await ThumbnailGate.shared.block()
-   model.load(url,side:110);model.load(url,side:110)
+   let model=Thumbnails();model.retain([shot]);ImageFixture.set(true);ImageFixture.block()
+   model.load(shot,side:110);model.load(shot,side:110)
    let started=await until{ImageFixture.total()>0};expect(started,"first image IO starts")
    expect(ImageFixture.total()==1,"simultaneous loads share one in-flight decode")
-   expect(model.images[url] == nil,"blocked decoder has not published")
-   await ThumbnailGate.shared.release()
-   let loaded=await until{model.images[url] != nil};expect(loaded,"coalesced decode publishes")
+   expect(model.images[shot] == nil,"blocked decoder has not published")
+   ImageFixture.release()
+   let loaded=await until{model.images[shot] != nil};expect(loaded,"coalesced decode publishes")
   }
   do {
-   let model=Thumbnails();ImageFixture.set(true);model.load(url,side:110)
-   let loaded=await until{model.images[url] != nil};expect(loaded,"successful initial decode publishes")
-   model.load(url,side:110);model.load(url,side:110)
+   let model=Thumbnails();model.retain([shot]);ImageFixture.set(true);model.load(shot,side:110)
+   let loaded=await until{model.images[shot] != nil};expect(loaded,"successful initial decode publishes")
+   model.load(shot,side:110);model.load(shot,side:110)
    expect(ImageFixture.total()==1,"successful cache avoids further file reads")
   }
   if failures>0{exit(1)}

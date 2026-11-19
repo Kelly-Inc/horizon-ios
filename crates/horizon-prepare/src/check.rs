@@ -144,11 +144,12 @@ fn lacks_languages(resources: &Path) -> bool {
 /// The registry and its actual samples must both have arrived. Copying the
 /// manifest first (or interrupting the asset copy) must not mark silent resources
 /// complete. Event references name other events, not files of their own.
-fn lacks_sounds(resources: &Path) -> bool {
+pub fn lacks_sounds(resources: &Path) -> bool {
     let assets = resources.join("assets");
     let Ok(Value::Object(events)) = read_json(&assets.join("minecraft/sounds.json")) else {
         return true;
     };
+    let mut found_sample = false;
     for (_, event) in events {
         if event.as_object().is_none() {
             return true;
@@ -182,9 +183,10 @@ fn lacks_sounds(resources: &Path) -> bool {
             if !std::fs::metadata(assets.join(relative)).is_ok_and(|m| m.is_file() && m.len() > 0) {
                 return true;
             }
+            found_sample = true;
         }
     }
-    false
+    !found_sample
 }
 
 #[cfg(test)]
@@ -254,6 +256,13 @@ mod tests {
     fn sound_manifest_alone_does_not_prove_samples_were_copied() {
         let root = folder("sound-samples");
         let ns = root.join("assets/minecraft");
+        for manifest in [
+            b"{}".as_slice(),
+            br#"{"silent":{},"linked":{"sounds":[{"name":"silent","type":"event"}]}}"#,
+        ] {
+            file(&ns.join("sounds.json"), manifest);
+            assert!(lacks_sounds(&root), "sound registry has no samples: {manifest:?}");
+        }
         file(
             &ns.join("sounds.json"),
             br#"{
@@ -303,7 +312,11 @@ mod tests {
         file(&background.join("panorama_overlay.png"), b"overlay");
         file(&assets.join("minecraft/font/unifont.zip"), b"zip");
         file(&assets.join("pack.mcmeta"), b"{}");
-        file(&assets.join("minecraft/sounds.json"), b"{}");
+        file(
+            &assets.join("minecraft/sounds.json"),
+            br#"{"test":{"sounds":["test/tone"]}}"#,
+        );
+        file(&assets.join("minecraft/sounds/test/tone.ogg"), b"audio");
         assert_eq!(check(&root, &out).unwrap(), Vec::<String>::new());
 
         fs::remove_file(assets.join("minecraft/font/unifont.zip")).unwrap();

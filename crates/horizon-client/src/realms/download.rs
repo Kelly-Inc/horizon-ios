@@ -155,31 +155,15 @@ pub fn download_world(
     let archive = temp_path("backup", ".tar.gz");
     let result = (|| {
         fetch_to(&download.download_link, &archive, progress)?;
-        // `finishWorldDownload`: a short body is not an error, it just does not unpack.
-        let mut world = None;
-        if progress.written() >= progress.total() && !progress.is_cancelled() {
-            progress.set_extracting();
-            world = Some(extract_archive(
-                &archive,
-                world_name.trim(),
-                saves,
-                progress,
-            )?);
-        }
+        progress.set_extracting();
+        let world = extract_archive(&archive, world_name.trim(), saves, progress)?;
         if progress.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
         if !download.resource_pack_url.is_empty() && !download.resource_pack_hash.is_empty() {
-            let world = world.ok_or_else(|| DownloadError::failed("no world was unpacked"))?;
             let pack = temp_path("resources", ".tar.gz");
-            let result = fetch_to(&download.resource_pack_url, &pack, progress).and_then(|()| {
-                // `finishResourcePackDownload`: a short body is checked nowhere.
-                if progress.written() >= progress.total() {
-                    copy_resource_pack(&pack, &world, &download.resource_pack_hash)
-                } else {
-                    Ok(())
-                }
-            });
+            let result = fetch_to(&download.resource_pack_url, &pack, progress)
+                .and_then(|()| copy_resource_pack(&pack, &world, &download.resource_pack_hash));
             let _ = fs::remove_file(&pack);
             result?;
         }
@@ -273,19 +257,38 @@ fn request(
 /// `FileDownload.download(DownloadStatus, HttpClient, url, target)`: a 200 body to `target`,
 /// counted as it is written.
 fn fetch_to(link: &str, target: &Path, progress: &DownloadProgress) -> Result<(), DownloadError> {
-    let response =
-        request("GET", link, progress.session.as_ref()).map_err(DownloadError::failed)?;
+    if progress.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
+    let response = request("GET", link, progress.session.as_ref());
+    if progress.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
+    write_download(response.map_err(DownloadError::failed)?, target, progress)
+}
+
+fn write_download(
+    response: super::transport::Response,
+    target: &Path,
+    progress: &DownloadProgress,
+) -> Result<(), DownloadError> {
     if response.status != 200 {
         return Err(DownloadError::failed(format!(
             "the link answered {}",
             response.status
         )));
     }
-    let total = response
+    if response.header("Content-Range").is_some() {
+        return Err(DownloadError::failed(
+            "the link returned only part of the file",
+        ));
+    }
+    let expected: Option<u64> = response
         .header("Content-Length")
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0);
-    progress.begin_file(total);
+        .map(|value| value.trim().parse())
+        .transpose()
+        .map_err(DownloadError::failed)?;
+    progress.begin_file(expected.unwrap_or(0));
     let mut reader = response.body;
     let mut file = create_private(target).map_err(DownloadError::failed)?;
     let mut buffer = [0u8; 64 * 1024];
@@ -293,13 +296,30 @@ fn fetch_to(link: &str, target: &Path, progress: &DownloadProgress) -> Result<()
         if progress.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
-        let read = reader.read(&mut buffer).map_err(DownloadError::failed)?;
+        let read = reader.read(&mut buffer);
+        // A managed cancellation shuts down its socket, which can surface as
+        // either an I/O error or EOF from the read already in progress.
+        if progress.is_cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
+        let read = read.map_err(DownloadError::failed)?;
         if read == 0 {
             break;
         }
         file.write_all(&buffer[..read])
             .map_err(DownloadError::failed)?;
         progress.add_written(read as u64);
+    }
+    let written = progress.written();
+    if let Some(expected) = expected
+        && written != expected
+    {
+        return Err(DownloadError::failed(format!(
+            "the transfer ended at {written} bytes (expected {expected})"
+        )));
+    }
+    if written == 0 {
+        return Err(DownloadError::failed("the download was empty"));
     }
     file.flush().map_err(DownloadError::failed)?;
     Ok(())
@@ -383,7 +403,29 @@ fn extract_archive_inner(
     fs::create_dir_all(saves).map_err(DownloadError::failed)?;
     let folder = world_folder(saves, name);
     let world = saves.join(&folder);
-    fs::create_dir_all(&world).map_err(DownloadError::failed)?;
+    // Claim the name exclusively. Another process can create it after
+    // world_folder checks availability, and its data must stay untouched.
+    fs::create_dir(&world).map_err(DownloadError::failed)?;
+    if let Err(error) = unpack_archive(archive, &world, on_extracting) {
+        if let Err(cleanup) = fs::remove_dir_all(&world) {
+            log::warn!("Realms: could not remove the incomplete world: {cleanup}");
+        }
+        return Err(error);
+    }
+    // Match vanilla: rename and remove the singleplayer owner after extraction.
+    match crate::title::world_management::symlinks(saves, &folder) {
+        Ok(links) if links.is_empty() => rename_and_drop_player(&world, &folder),
+        Ok(_) => log::warn!("Realms: the downloaded world holds a symbolic link"),
+        Err(e) => log::warn!("Realms: could not check the downloaded world: {e}"),
+    }
+    Ok(world)
+}
+
+fn unpack_archive(
+    archive: &Path,
+    world: &Path,
+    on_extracting: impl FnOnce(),
+) -> Result<(), DownloadError> {
     let file = File::open(archive).map_err(DownloadError::failed)?;
     let mut tar = TarReader::new(flate2::read::GzDecoder::new(BufReader::new(file)));
     let mut on_extracting = Some(on_extracting);
@@ -391,42 +433,36 @@ fn extract_archive_inner(
         if let Some(on_extracting) = on_extracting.take() {
             on_extracting();
         }
-        let Some(relative) = under_world(&header.name) else {
-            log::warn!(
-                "Realms: an archive entry outside world/ was skipped: {}",
-                header.name
-            );
-            continue;
-        };
-        let destination = world.join(&relative);
-        if !destination.starts_with(&world) {
-            log::warn!(
-                "Realms: an archive entry climbing out of the world was skipped: {}",
-                header.name
-            );
-            continue;
-        }
-        if header.directory {
-            fs::create_dir_all(&destination).map_err(DownloadError::failed)?;
-        } else {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).map_err(DownloadError::failed)?;
+        let destination = under_world(&header.name)
+            .map(|relative| world.join(relative))
+            .filter(|destination| destination.starts_with(world));
+        match destination {
+            Some(destination) if !header.directory => {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).map_err(DownloadError::failed)?;
+                }
+                let mut out = File::create(&destination).map_err(DownloadError::failed)?;
+                tar.copy_contents(header.size, &mut out)
+                    .map_err(DownloadError::failed)?;
             }
-            let mut out = File::create(&destination).map_err(DownloadError::failed)?;
-            tar.copy_contents(header.size, &mut out)
-                .map_err(DownloadError::failed)?;
+            directory => {
+                if let Some(destination) = directory {
+                    fs::create_dir_all(&destination).map_err(DownloadError::failed)?;
+                } else {
+                    log::warn!(
+                        "Realms: an archive entry outside world/ was skipped: {}",
+                        header.name
+                    );
+                }
+                // TAR entries still occupy space when we don't extract them.
+                tar.copy_contents(header.size, &mut io::sink())
+                    .map_err(DownloadError::failed)?;
+            }
         }
         tar.skip_padding(header.size)
             .map_err(DownloadError::failed)?;
     }
-    // `validateAndCreateAccess`: a world holding a symbolic link is not renamed (vanilla
-    // logs `Failed to download file`); the folder stays as extracted either way.
-    match crate::title::world_management::symlinks(saves, &folder) {
-        Ok(links) if links.is_empty() => rename_and_drop_player(&world, &folder),
-        Ok(_) => log::warn!("Realms: the downloaded world holds a symbolic link"),
-        Err(e) => log::warn!("Realms: could not check the downloaded world: {e}"),
-    }
-    Ok(world)
+    Ok(())
 }
 
 /// `LevelStorageAccess.renameAndDropPlayer`: the folder's name as the world's, and no
@@ -769,6 +805,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_complete_nonempty_downloads_succeed() {
+        let dir = scratch("transfer-body");
+        for (name, headers, body, valid) in [
+            ("complete", vec![("Content-Length", "3")], &b"abc"[..], true),
+            ("unknown-size", vec![], &b"abc"[..], true),
+            ("short", vec![("Content-Length", "4")], &b"abc"[..], false),
+            ("empty", vec![("Content-Length", "0")], &b""[..], false),
+            (
+                "partial",
+                vec![("Content-Range", "bytes 0-2/6")],
+                &b"abc"[..],
+                false,
+            ),
+        ] {
+            let response = super::super::transport::Response {
+                status: 200,
+                headers: headers
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+                body: Box::new(io::Cursor::new(body)),
+            };
+            let target = dir.join(name);
+            let result = write_download(response, &target, &DownloadProgress::default());
+            assert_eq!(result.is_ok(), valid, "{name}: {result:?}");
+            if valid {
+                assert_eq!(fs::read(&target).unwrap(), body);
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_a_read_is_not_reported_as_success_or_failure() {
+        struct CancelOnRead(std::sync::Arc<super::super::transport::Cancellation>, bool);
+
+        impl Read for CancelOnRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.0.cancel();
+                if self.1 {
+                    Err(io::Error::new(io::ErrorKind::ConnectionReset, "closed"))
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+
+        let dir = scratch("transfer-cancel");
+        for reset in [false, true] {
+            let cancellation =
+                std::sync::Arc::new(super::super::transport::Cancellation::default());
+            let progress = DownloadProgress::managed(cancellation.clone());
+            let response = super::super::transport::Response {
+                status: 200,
+                headers: vec![],
+                body: Box::new(CancelOnRead(cancellation, reset)),
+            };
+            assert_eq!(
+                write_download(response, &dir.join(reset.to_string()), &progress),
+                Err(DownloadError::Cancelled)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_pax_record_shorter_than_its_own_prefix_is_not_a_panic() {
         assert_eq!(pax_path_of(b"1 x"), None);
         assert_eq!(pax_path_of(b"2 x"), None);
@@ -964,6 +1066,54 @@ mod tests {
         assert!(!saves.join("evil.txt").exists());
         assert!(!world.join("evil.txt").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_skipped_entry_does_not_hide_the_next_world_file() {
+        let dir = scratch("outside-before-world");
+        let archive = dir.join("world.tar.gz");
+        let mut gz = flate2::write::GzEncoder::new(
+            File::create(&archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        write_test_header(&mut gz, "outside.txt", 4, b'0');
+        write_test_data(&mut gz, &[0; 4]);
+        write_test_header(&mut gz, "world/marker", 4, b'0');
+        write_test_data(&mut gz, b"kept");
+        gz.write_all(&[0; 1024]).unwrap();
+        gz.finish().unwrap();
+
+        let saves = dir.join("saves");
+        let world =
+            extract_archive(&archive, "Friends", &saves, &DownloadProgress::default()).unwrap();
+        assert_eq!(fs::read(world.join("marker")).unwrap(), b"kept");
+        assert!(!saves.join("outside.txt").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_extraction_removes_only_its_incomplete_world() {
+        let dir = scratch("failed-extraction");
+        let archive = dir.join("world.tar.gz");
+        let mut gz = flate2::write::GzEncoder::new(
+            File::create(&archive).unwrap(),
+            flate2::Compression::default(),
+        );
+        write_test_header(&mut gz, "world/marker", 4, b'0');
+        write_test_data(&mut gz, b"kept");
+        write_test_header(&mut gz, "world/incomplete", 10, b'0');
+        gz.write_all(b"short").unwrap();
+        gz.finish().unwrap();
+
+        let saves = dir.join("saves");
+        let existing = saves.join("Friends");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("marker"), b"existing").unwrap();
+        let result = extract_archive(&archive, "Friends", &saves, &DownloadProgress::default());
+        assert!(matches!(result, Err(DownloadError::Failed(_))));
+        assert_eq!(fs::read(existing.join("marker")).unwrap(), b"existing");
+        assert_eq!(fs::read_dir(&saves).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A part with a drive prefix or a stream name would leave the world folder on Windows.

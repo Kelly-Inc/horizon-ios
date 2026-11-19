@@ -92,11 +92,12 @@ pub fn peak_step_of(nits: f32) -> f32 {
 pub const NITS_STEPS: u32 = 48;
 /// Paper White's or UI Brightness's setting at slider position `v`, 0 to 1 ([`NITS_STEPS`]).
 pub fn nits_at(v: f32) -> u32 {
-    (v * NITS_STEPS as f32).round() as u32 * 10
+    (v.clamp(0.0, 1.0) * NITS_STEPS as f32).round() as u32 * 10
 }
 /// Where a Paper White or UI Brightness setting sits on its slider, 0 to 1.
 pub fn nits_position(nits: u32) -> f32 {
-    nits as f32 / (NITS_STEPS * 10) as f32
+    let max = NITS_STEPS * 10;
+    nits.min(max) as f32 / max as f32
 }
 /// A saved Paper White or UI Brightness: Auto (0), or 10 to 480 nits.
 fn nits_setting(nits: u32) -> u32 {
@@ -1408,6 +1409,15 @@ mod tests {
 
     /// UI Brightness is saved in nits, 0 for Auto. An older file's share of Paper White reads
     /// as Auto at 100% or with Paper White on Auto, else as that share of it to the nearest step.
+    #[test]
+    fn brightness_slider_coordinates_stay_in_range() {
+        assert_eq!(nits_at(-1.0), 0);
+        assert_eq!(nits_at(0.5), 240);
+        assert_eq!(nits_at(2.0), 480);
+        assert_eq!(nits_at(f32::INFINITY), 480);
+        assert_eq!(nits_position(u32::MAX), 1.0);
+    }
+
     #[test]
     fn ui_brightness_round_trips_in_nits_and_reads_older_shares() {
         for (file, nits) in [

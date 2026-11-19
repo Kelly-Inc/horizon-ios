@@ -67,14 +67,10 @@ impl Game<'_> {
     /// part of AltGr.
     pub(super) fn types_text(&self) -> bool {
         let held = |keys: [KeyCode; 2]| keys.iter().any(|k| self.physical_keys.contains(k));
-        let edit = if cfg!(any(target_os = "macos", target_os = "ios")) {
-            held([KeyCode::SuperLeft, KeyCode::SuperRight])
-        } else {
-            held([KeyCode::ControlLeft, KeyCode::ControlRight])
-        };
         clipboard::types_text(
-            edit,
-            held([KeyCode::AltLeft, KeyCode::AltRight]),
+            self.has_control_down_with_quirk(),
+            self.touch_effective_modifiers().alt_key()
+                || held([KeyCode::AltLeft, KeyCode::AltRight]),
             clipboard::ALTGR_IS_CTRL_ALT,
         )
     }
@@ -219,6 +215,16 @@ mod tests {
             crate::game::native_entity_refs::tests::with_game(|game| {
                 game.options.execution_role = crate::game::execution_role::ExecutionRole::Client;
                 game.options.headless = true;
+                let edit = if cfg!(any(target_os = "macos", target_os = "ios")) {
+                    winit::keyboard::ModifiersState::SUPER
+                } else {
+                    winit::keyboard::ModifiersState::CONTROL
+                };
+                game.modifiers = edit;
+                assert!(game.physical_keys.is_empty());
+                assert!(!game.types_text());
+                game.modifiers = winit::keyboard::ModifiersState::empty();
+                assert!(game.types_text());
                 game.clipboard.set_text("pasted");
 
                 game.native_client_tick_pre();

@@ -1,5 +1,6 @@
 //! Main-thread, real Game and Metal reproduction of unpresented menu geometry.
 use super::super::*;
+use horizon_assets::resource_source::{ResourceRoot, ResourceSource};
 use horizon_client::{
     gamepad::{Button, PadState},
     widgets,
@@ -31,13 +32,14 @@ pub fn run() -> Result<()> {
     }
     std::fs::create_dir_all(&output)?;
     let loaded = load_resources(
-        root.to_owned(),
+        ResourceRoot::directory(root.clone()),
+        Vec::new(),
         None,
         &root,
         &Settings::default(),
         Instant::now(),
         false,
-        false,
+        execution_role::ExecutionRole::IntegratedServer,
         &Progress::new(),
         &mut |_, _| unreachable!(),
     )?;
@@ -45,6 +47,7 @@ pub fn run() -> Result<()> {
     options.resources = root.to_owned();
     options.offscreen = true;
     options.headless = true;
+    options.execution_role = execution_role::ExecutionRole::IntegratedServer;
     let mut settings = Settings::default();
     settings.gui_scale = 1;
     let game = Game::new(
@@ -53,7 +56,7 @@ pub fn run() -> Result<()> {
         loaded.gui.ok_or("graphical UI resources missing")?,
         options,
         settings,
-        Audio::silent(&root),
+        Audio::silent(&ResourceSource::directory(root)),
         None,
     )?;
     let mut app = ProbeApp {
@@ -75,6 +78,7 @@ enum SurfaceStage {
     MainReady,
     ExternalReady,
     MainAgain,
+    Recreated,
 }
 struct ProbeApp<'a> {
     game: Game<'a>,
@@ -131,7 +135,7 @@ impl ProbeApp<'_> {
         }
         match self.stage {
             SurfaceStage::MainReady => {
-                eprintln!("presentation_probe main surface presented from native RedrawRequested");
+                eprintln!("presentation_probe main surface presented");
                 let external = Arc::new(
                     event_loop.create_window(
                         Window::default_attributes()
@@ -158,8 +162,21 @@ impl ProbeApp<'_> {
                 self.stage = SurfaceStage::ExternalReady;
             }
             SurfaceStage::ExternalReady => {
-                eprintln!(
-                    "presentation_probe external surface presented from native RedrawRequested"
+                eprintln!("presentation_probe external surface presented");
+                let last_input = self.game.last_input;
+                self.game.touch_event(
+                    event_loop,
+                    Touch {
+                        device_id: DeviceId::dummy(),
+                        phase: TouchPhase::Started,
+                        location: winit::dpi::PhysicalPosition::new(50.0, 50.0),
+                        force: None,
+                        id: 71,
+                    },
+                )?;
+                assert_eq!(
+                    self.game.last_input, last_input,
+                    "phone touch must not reach the primary AirPlay game"
                 );
                 let renderer = self.game.renderer.as_mut().unwrap();
                 let generation = renderer.presentation_generation();
@@ -172,11 +189,14 @@ impl ProbeApp<'_> {
                 self.stage = SurfaceStage::MainAgain;
             }
             SurfaceStage::MainAgain => {
-                eprintln!(
-                    "presentation_probe real macOS target identity invalidation and phone-resize routing passed; not a physical iOS AirPlay test"
-                );
-                return Ok(true);
+                let renderer = self.game.renderer.as_mut().unwrap();
+                let generation = renderer.presentation_generation();
+                renderer.recreate_surface()?;
+                assert_ne!(renderer.presentation_generation(), generation);
+                assert!(!renderer.presentation_current());
+                self.stage = SurfaceStage::Recreated;
             }
+            SurfaceStage::Recreated => return Ok(true), // The new surface presented.
         }
         self.request_frame();
         Ok(false)
@@ -205,7 +225,7 @@ impl ApplicationHandler for ProbeApp<'_> {
         if let Err(error) = result {
             self.finish(event_loop, Err(error));
         }
-        // Return to AppKit before any real-surface acquisition.
+        // AppKit regains control before acquisition.
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.result.is_some() {
@@ -260,7 +280,10 @@ impl ApplicationHandler for ProbeApp<'_> {
 }
 fn frame(game: &mut Game<'_>, serial: &mut u64) -> Result<bool> {
     let r = game.renderer.as_ref().unwrap();
-    let mut batch = HudBatch::new([r.config.width, r.config.height]);
+    let mut batch = HudBatch::new(
+        [r.config.width, r.config.height],
+        game.settings.gui_scale_inputs(),
+    );
     game.draw_pause_menu(&mut batch);
     *serial += 1;
     widgets::end_frame(*serial);
@@ -276,7 +299,11 @@ fn ready(game: &mut Game<'_>, serial: &mut u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         frame(game, serial)?;
-        if game.renderer.as_ref().unwrap().presentation_current() {
+        let renderer = game.renderer.as_mut().unwrap();
+        if let Some(result) = renderer.take_screenshot_result() {
+            result?.save()?;
+        }
+        if renderer.presentation_current() {
             return Ok(());
         }
         if Instant::now() > deadline {
@@ -313,7 +340,6 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
     );
     game.renderer = Some(game.new_renderer(window.clone())?);
     game.window = Some(window);
-    horizon_client::hud::GUI_SCALE.store(1, Ordering::Relaxed);
     game.renderer.as_mut().unwrap().resize(640, 480);
     // Original, asset-free shader. The actual pack post owns resize retirement.
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -348,7 +374,8 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         frame(game, &mut serial)?;
-        if let Some((_, programs, notes)) = game.renderer.as_mut().unwrap().take_shader_report() {
+        if let Some(report) = game.renderer.as_mut().unwrap().take_shader_report() {
+            let (programs, notes) = (report.programs, report.notes);
             assert!(
                 programs.iter().any(|p| p == "final"),
                 "shader did not load: {notes:?}"
@@ -399,6 +426,16 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
                     scaled: false,
                     background: false,
                 });
+            let capture = (input == "mouse" && !bypass).then(|| out.join("resize-capture"));
+            if let Some(dir) = &capture {
+                let settings = game.render_capture_settings();
+                let renderer = game.renderer.as_mut().unwrap();
+                renderer.keep_capture_copies(true);
+                renderer.capture = Some(horizon_client::gfx::capture::Request {
+                    dir: dir.clone(),
+                    settings,
+                });
+            }
             assert!(!frame(game, &mut serial)?, "resize must remain pending");
             let target = options_target();
             let centre = (
@@ -426,6 +463,12 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
                 !b.exists(),
                 "pending render must not save a fabricated B image"
             );
+            if let Some(dir) = &capture {
+                assert!(
+                    !dir.exists(),
+                    "a pending resize must keep scene capture queued"
+                );
+            }
             activate(game, event_loop, input, target)?;
             assert_eq!(
                 game.screen == Screen::Options,
@@ -444,6 +487,10 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
             ready(game, &mut serial)?;
             assert!(game.renderer.as_ref().unwrap().presentation_current());
             assert!(std::fs::metadata(&b)?.len() > 100);
+            if let Some(dir) = &capture {
+                assert!(std::fs::metadata(dir.join("scene.json"))?.len() > 100);
+                game.renderer.as_mut().unwrap().keep_capture_copies(false);
+            }
             game.presentation_test_bypass = false;
             game.sync_presentation_input(event_loop);
             if input == "pad" && !bypass {
@@ -501,7 +548,6 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
     // A screenshot can render a new layout without presenting it to the
     // player. It must not grant that layout ownership of live menu input.
     game.renderer.as_mut().unwrap().mark_gui_geometry_changed();
-    game.renderer.as_mut().unwrap().screenshot_result = None;
     let screenshot = out.join("scaled-capture.png");
     game.renderer.as_mut().unwrap().screenshot_quality = 2;
     game.renderer.as_mut().unwrap().screenshot = Some(horizon_client::gfx::ScreenshotRequest {
@@ -514,7 +560,7 @@ fn exercise(event_loop: &ActiveEventLoop, game: &mut Game<'_>, out: &Path) -> Re
     loop {
         frame(game, &mut serial)?;
         if let Some(result) = game.renderer.as_mut().unwrap().screenshot_result.take() {
-            result.map_err(|e| format!("scaled capture: {e}"))?;
+            result?.save()?;
             assert!(
                 !game.renderer.as_ref().unwrap().presentation_current(),
                 "screenshot must not acknowledge unseen menu geometry"

@@ -42,6 +42,7 @@ type Result<T>=std::result::Result<T,Box<dyn std::error::Error>>;
 mod import{
  use super::*;
  enum Kind{Resources}impl Kind{fn marker(&self)->&str{"horizon-resources.json"}fn folder(&self)->&str{"resources"}}
+ fn damaged_prepared(path: &Path)->Option<String>{(!path.join("fixture-data").is_file()).then(||"fixture data missing".into())}
  ROOT_FUNCTION
  pub fn home()->PathBuf{PathBuf::from(std::env::var_os("HORIZON_IMPORT_ROOT_FIXTURE").unwrap()).join("home")}
 }
@@ -92,7 +93,7 @@ fn main(){
  if std::env::var_os("HORIZON_IMPORT_NATIVE_ONLY").is_none(){
  let mut retry=Loading::new(missing.clone(),missing.clone());
  retry.loaded=Some(Err("old failed generation".into()));retry.delivered=true;
- retry.load_the_files_that_arrived(home.clone()).expect("The retry still loaded the pre-import missing directory");
+ retry.load_the_files_that_arrived(arrived.clone()).expect("The retry still loaded the pre-import missing directory");
  assert_eq!(retry.vanilla_root,arrived);assert_eq!(retry.options.as_ref().unwrap().resources,arrived);
  assert_eq!(CAPTURE.lock().unwrap().last().unwrap(),&(arrived.clone(),arrived.clone()));
  if let Some(handle)=retry.handle.take(){handle.join().unwrap();}
@@ -103,7 +104,7 @@ fn main(){
  retry.loaded.take();retry.poll_menu_resources().unwrap();
  assert!(retry.loaded.is_none());assert_eq!(retry.ui_seen,vec![1],"A completed channel was consumed twice");
  // A second retry resets only generation completion, so it can publish once too.
- retry.load_the_files_that_arrived(home.clone()).unwrap();
+ retry.load_the_files_that_arrived(arrived.clone()).unwrap();
  if let Some(handle)=retry.handle.take(){handle.join().unwrap();}
  retry.poll_menu_resources().unwrap();
  assert!(matches!(retry.loaded,Some(Ok(()))));assert_eq!(retry.ui_seen,vec![1,2]);
@@ -121,13 +122,15 @@ fn main(){
  let custom=root.join("explicit");files(&custom,b"custom base");
  let overlay=root.join("overlay");files(&overlay,b"staged overlay");
  let mut explicit=Loading::new(custom.clone(),overlay.clone());
- explicit.load_the_files_that_arrived(home.clone()).unwrap();
+ explicit.refresh_import_root(&home).unwrap();
  assert_eq!(explicit.vanilla_root,custom);assert_eq!(explicit.options.as_ref().unwrap().resources,custom);
- assert_eq!(CAPTURE.lock().unwrap().last().unwrap(),&(custom.clone(),custom));
+ // A completed, validated import supplies its actual tree, independent of the prior base.
+ explicit.load_the_files_that_arrived(arrived.clone()).unwrap();
+ assert_eq!(CAPTURE.lock().unwrap().last().unwrap(),&(arrived.clone(),arrived.clone()));
  if let Some(handle)=explicit.handle.take(){handle.join().unwrap();}
 
  let mut stale_overlay=Loading::new(missing,overlay);
- stale_overlay.load_the_files_that_arrived(home.clone()).unwrap();
+ stale_overlay.load_the_files_that_arrived(arrived.clone()).unwrap();
  assert_eq!(stale_overlay.vanilla_root,arrived);assert_eq!(stale_overlay.options.as_ref().unwrap().resources,arrived);
  if let Some(handle)=stale_overlay.handle.take(){handle.join().unwrap();}
 
@@ -135,10 +138,10 @@ fn main(){
  // retry or for native cancellation to reconstruct the idle launcher.
  let mut spawn_retry=Loading::new(arrived.clone(),arrived.clone());
  FAIL_NEXT_SPAWN.store(true,std::sync::atomic::Ordering::SeqCst);
- assert!(spawn_retry.load_the_files_that_arrived(home.clone()).is_err());
+ assert!(spawn_retry.load_the_files_that_arrived(arrived.clone()).is_err());
  assert_eq!(spawn_retry.options.as_ref().expect("spawn failure consumed retry options").resources,arrived);
  assert!(spawn_retry.handle.is_none());
- spawn_retry.load_the_files_that_arrived(home).unwrap();
+ spawn_retry.load_the_files_that_arrived(arrived.clone()).unwrap();
  if let Some(handle)=spawn_retry.handle.take(){handle.join().unwrap();}
  spawn_retry.poll_menu_resources().unwrap();
  assert!(matches!(spawn_retry.loaded,Some(Ok(()))),"retry after a spawn failure did not complete");

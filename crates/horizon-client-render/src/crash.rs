@@ -179,10 +179,48 @@ impl Report {
     }
 }
 
+#[cfg(any(target_os = "ios", test))]
+fn bundle_version_label(version: &str, build: Option<&str>) -> Option<String> {
+    let valid = |value: &str| {
+        let mut parts = value.split('.');
+        parts.clone().count() <= 3
+            && parts.all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    if !valid(version) {
+        return None;
+    }
+    Some(match build.filter(|build| valid(build)) {
+        Some(build) => format!("{version} (build {build})"),
+        None => version.to_owned(),
+    })
+}
+
+#[cfg(target_os = "ios")]
+fn ios_bundle_version() -> Option<String> {
+    use objc2_foundation::{NSBundle, NSString};
+    let bundle = NSBundle::mainBundle();
+    let field = |key: &str| {
+        bundle
+            .objectForInfoDictionaryKey(&NSString::from_str(key))?
+            .downcast::<NSString>()
+            .ok()
+            .map(|value| value.to_string())
+    };
+    bundle_version_label(
+        &field("CFBundleShortVersionString")?,
+        field("CFBundleVersion").as_deref(),
+    )
+}
+
 /// The release this binary is (`v0.2.3`); a nightly's label (`Nightly 2026-10-28 · 0c02067`); for a
 /// release from before 0.2, its tag and the client's crate version; for a build from source, that
 /// version alone.
 pub fn version() -> String {
+    // iOS release packaging stamps Info.plist after compiling the executable.
+    #[cfg(target_os = "ios")]
+    if let Some(label) = ios_bundle_version() {
+        return label;
+    }
     if let Some(label) = horizon_core::release::nightly_label() {
         return label;
     }
@@ -1086,7 +1124,23 @@ mod tests {
     }
 
     #[test]
+    fn mobile_bundle_label_includes_the_installed_build_number() {
+        assert_eq!(
+            bundle_version_label("0.1.62", Some("109.2")).as_deref(),
+            Some("0.1.62 (build 109.2)")
+        );
+        assert_eq!(bundle_version_label("0.1.62", None).as_deref(), Some("0.1.62"));
+        assert_eq!(bundle_version_label("0.1.62", Some("invalid")).as_deref(), Some("0.1.62"));
+        assert_eq!(bundle_version_label("$(MARKETING_VERSION)", Some("1")), None);
+    }
+
+    #[test]
     fn a_release_reports_its_built_in_version() {
+        #[cfg(target_os = "ios")]
+        if let Some(label) = super::ios_bundle_version() {
+            assert_eq!(super::version(), label);
+            return;
+        }
         // release.yml builds with HORIZON_VERSION (docs/versioning.md): `v0.2.3`, wherever it is installed.
         if let Some(label) = horizon_core::release::nightly_label() {
             assert_eq!(super::version(), label);

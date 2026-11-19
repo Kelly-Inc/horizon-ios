@@ -13,6 +13,25 @@ impl std::fmt::Display for WorldPreparationError {
 }
 impl std::error::Error for WorldPreparationError {}
 
+fn require_saved_world(world: &std::path::Path) -> Result<()> {
+    let is_file = |file| {
+        let path = world.join(file);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(WorldPreparationError(format!("{}: {error}", path.display()))),
+        }
+    };
+    if !is_file("level.dat")? && !is_file("level.dat_old")? {
+        return Err(WorldPreparationError(format!(
+            "World save is missing a level.dat or level.dat_old file: {}",
+            world.display()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Pack preparation must finish before a server is started. The caller owns the
 /// world's SessionLock throughout; an error leaves staged inputs available.
 pub(super) fn prepare_world_packs(
@@ -162,21 +181,30 @@ impl Game<'_> {
                 }
                 Ok(())
             }
-            Err(error) => {
-                if !error.is::<WorldPreparationError>() {
-                    return Err(error);
-                }
-                let Some(title) = self.title.as_mut() else {
-                    return Err(error);
-                };
-                log::warn!("Horizon: opening world {folder}: {error}");
-                title.failed(&error);
-                self.pending_entry = None;
-                self.perf.cancel_world_opening();
-                Ok(())
-            }
+            Err(error) if self.show_world_preparation_error(error.as_ref()) => Ok(()),
+            Err(error) => Err(error),
         }
     }
+
+    /// A request acknowledged before loading can still hit a recoverable file
+    /// error on resume. Keep the title available for the player to retry.
+    pub(super) fn show_world_preparation_error(
+        &mut self,
+        error: &(dyn std::error::Error + 'static),
+    ) -> bool {
+        if !error.is::<WorldPreparationError>() {
+            return false;
+        }
+        let Some(title) = self.title.as_mut() else {
+            return false;
+        };
+        log::warn!("Horizon: could not prepare the world: {error}");
+        title.failed(error);
+        self.pending_entry = None;
+        self.perf.cancel_world_opening();
+        true
+    }
+
     /// Enter a local world from the client: it runs on the client's server thread.
     pub(super) fn open_world(
         &mut self,
@@ -186,9 +214,31 @@ impl Game<'_> {
         creative: bool,
         create: Option<&horizon_client::title::WorldOptions>,
     ) -> Result<()> {
+        let world_folder = if create.is_some() {
+            WorldFolder::New
+        } else {
+            WorldFolder::Existing
+        };
+        self.open_world_request(folder, name, seed, creative, create, world_folder)
+    }
+
+    pub(super) fn open_world_request(
+        &mut self,
+        folder: &str,
+        name: Option<&str>,
+        seed: Option<i64>,
+        creative: bool,
+        create: Option<&horizon_client::title::WorldOptions>,
+        world_folder: WorldFolder,
+    ) -> Result<()> {
+        let game_dir = std::env::current_dir()?;
+        let world = game_dir.join("saves").join(folder);
+        if world_folder == WorldFolder::Existing {
+            require_saved_world(&world)?;
+        }
         // openWorldLoadLevelData: an existing world whose level data does not read opens
         // RecoverWorldDataScreen instead.
-        if create.is_none()
+        if world_folder != WorldFolder::New
             && let Some(title) = self.title.as_mut()
             && title.open_recover(folder)
         {
@@ -201,16 +251,16 @@ impl Game<'_> {
             seed,
             creative,
             create: create.cloned().map(Box::new),
+            world_folder,
             from_title: false,
         })? {
             return Ok(());
         }
         // A world saved with mods that are not loaded now asks first (arismoko/horizon#3856), unless the player
         // already chose to open it anyway; the question reads the world and writes nothing.
-        if create.is_none() {
-            let dir = std::env::current_dir()?.join("saves").join(folder);
-            if !level_mods::is_confirmed(&dir) {
-                let missing = self.ask_missing_mods(&dir);
+        if world_folder != WorldFolder::New {
+            if !level_mods::is_confirmed(&world) {
+                let missing = self.ask_missing_mods(&world);
                 if !missing.is_empty() {
                     if let Some(title) = self.title.as_mut() {
                         title.ask_missing_mods(folder, missing);
@@ -223,15 +273,22 @@ impl Game<'_> {
             }
         }
         self.join_world_rest()?;
-        let game_dir = std::env::current_dir()?;
-        let world = game_dir.join("saves").join(folder);
         // Own the save before Create World's first write, and retain that same
         // lock through the handoff to the server's WorldRequest.
-        let session_lock = horizon_client::save::SessionLock::acquire_validated(
-            &world,
-            &game_dir.join("saves/allowed_symlinks.txt"),
-        )
+        let allowlist = game_dir.join("saves/allowed_symlinks.txt");
+        let session_lock = match world_folder {
+            WorldFolder::Existing => {
+                horizon_client::save::SessionLock::acquire_existing(&world, Some(&allowlist))
+            }
+            WorldFolder::New => horizon_client::save::SessionLock::acquire_new(&world, &allowlist),
+            WorldFolder::OpenOrCreate => {
+                horizon_client::save::SessionLock::acquire_validated(&world, &allowlist)
+            }
+        }
         .map_err(|error| WorldPreparationError(error.to_string()))?;
+        if world_folder == WorldFolder::Existing {
+            require_saved_world(&world)?;
+        }
         prepare_world_packs(&game_dir, &world, &self.vanilla_root(), create)
             .map_err(|error| WorldPreparationError(error.to_string()))?;
         // IntegratedServer.initServer's line, which other launchers read in `latest.log` to
@@ -357,6 +414,24 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::WorldFolder;
+
+    #[test]
+    fn reopening_requires_an_existing_save() {
+        let fixture = Scratch::new();
+        let world = fixture.0.join("world");
+        assert!(super::require_saved_world(&world).is_err());
+        assert!(!world.exists());
+        std::fs::create_dir(&world).unwrap();
+        assert!(super::require_saved_world(&world).is_err());
+        std::fs::create_dir(world.join("level.dat")).unwrap();
+        std::fs::create_dir(world.join("level.dat_old")).unwrap();
+        assert!(super::require_saved_world(&world).is_err());
+        std::fs::remove_dir(world.join("level.dat_old")).unwrap();
+        std::fs::write(world.join("level.dat_old"), b"recovery fixture").unwrap();
+        assert!(super::require_saved_world(&world).is_ok());
+    }
+
     struct MenuLoop;
     impl super::super::event_loop::EventLoopCtl for MenuLoop {
         fn exit(&self) {
@@ -372,11 +447,11 @@ mod tests {
             let fixture = Scratch::new();
             let world = fixture.0.join("world");
             let staged = fixture.0.join("staged");
-            std::fs::create_dir(&world).unwrap();
-            std::fs::create_dir(&staged).unwrap();
-            std::fs::write(world.join("datapacks"), b"preserve destination").unwrap();
-            let held =
-                deferred.then(|| horizon_client::save::SessionLock::acquire(&world).unwrap());
+            if deferred {
+                std::fs::create_dir(&world).unwrap();
+                std::fs::write(world.join("datapacks"), b"preserve destination").unwrap();
+            }
+            std::fs::write(&staged, b"unreadable as a pack directory").unwrap();
             let options = WorldOptions {
                 pack_dir: Some(staged.clone()),
                 ..Default::default()
@@ -403,6 +478,7 @@ mod tests {
                     seed: Some(4242),
                     creative: false,
                     create: Some(Box::new(options.clone())),
+                    world_folder: WorldFolder::New,
                     from_title: true,
                 });
                 game.resume_world_entry()
@@ -424,7 +500,7 @@ mod tests {
             );
             let title = game.title.as_mut().unwrap();
             assert!(
-                matches!(&title.mode, Mode::Error {message, ..} if message.contains(if deferred {"already open"} else {"datapacks"}))
+                matches!(&title.mode, Mode::Error {message, ..} if message.contains(if deferred {"already exists"} else {"staged"}))
             );
             title.escape();
             assert!(
@@ -434,13 +510,17 @@ mod tests {
             assert!(game.pending_entry.is_none());
             assert!(game.integrated.is_none() && game.integrated_starting.is_none());
             assert!(!world.join("level.dat").exists());
-            assert!(staged.is_dir());
             assert_eq!(
-                std::fs::read(world.join("datapacks")).unwrap(),
-                b"preserve destination"
+                std::fs::read(&staged).unwrap(),
+                b"unreadable as a pack directory"
             );
+            if deferred {
+                assert_eq!(
+                    std::fs::read(world.join("datapacks")).unwrap(),
+                    b"preserve destination"
+                );
+            }
             drop(game);
-            drop(held);
             drop(
                 horizon_client::save::SessionLock::acquire(&world)
                     .expect("failed entry releases its lock"),
@@ -470,13 +550,14 @@ mod tests {
                     seed: Some(1),
                     creative: false,
                     create: Some(Box::new(options.clone())),
+                    world_folder: WorldFolder::New,
                     from_title: false,
                 });
                 game.resume_world_entry()
             } else {
                 game.open_world(folder, Some("raw fixture"), Some(1), false, Some(&options))
             };
-            assert!(result.err().unwrap().to_string().contains("already open"));
+            assert!(result.err().unwrap().to_string().contains("already exists"));
             assert!(matches!(
                 game.title.as_ref().unwrap().mode,
                 horizon_client::title::Mode::Main
@@ -611,14 +692,8 @@ mod tests {
             structures: false,
             ..Default::default()
         };
-        let mut game = super::super::native_machines::tests::server_game();
-        let result = game.open_world(
-            root.to_str().unwrap(),
-            Some("copy fixture"),
-            Some(1),
-            false,
-            Some(&options),
-        );
+        let lock = horizon_client::save::SessionLock::acquire(&root).unwrap();
+        let result = super::prepare_world_packs(&root, &root, &root, Some(&options));
         assert!(
             result.is_err(),
             "failed pack installation must not start a world"
@@ -633,11 +708,7 @@ mod tests {
             b"preserve destination"
         );
         assert!(!root.join("level.dat").exists());
-        drop(game);
-        drop(
-            horizon_client::save::SessionLock::acquire(&root)
-                .expect("failed creation releases its lock"),
-        );
+        drop(lock);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(staged).unwrap();
     }

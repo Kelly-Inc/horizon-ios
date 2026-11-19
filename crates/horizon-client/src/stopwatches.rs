@@ -56,26 +56,26 @@ impl Stopwatches {
         }
         s
     }
-    pub fn save(&mut self, root: &Path) {
+    pub fn save(&mut self, root: &Path) -> crate::Result<()> {
         if !self.dirty && self.watches.is_empty() {
-            return;
+            return Ok(());
         }
-        self.dirty = false;
         let now = current_time();
         let map: Compound = self
             .watches
             .iter()
             .map(|(k, w)| (k.as_str().into(), Tag::Long(w.elapsed_ms(now))))
             .collect();
-        if let Err(e) = save::write_dat(
+        save::write_dat(
             &file(root),
             Tag::compound([
                 ("data", Tag::compound([("stopwatches", Tag::Compound(map))])),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]),
-        ) {
-            log::warn!("Horizon: the stopwatches are not saved: {e}");
-        }
+        )
+        .map_err(|e| format!("could not save the stopwatches: {e}"))?;
+        self.dirty = false;
+        Ok(())
     }
     pub fn ids(&self) -> Vec<String> {
         self.watches.keys().cloned().collect()

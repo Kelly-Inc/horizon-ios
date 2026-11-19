@@ -12,6 +12,27 @@ final class TouchControlsTests: XCTestCase {
     }
     override func tearDown() { defaults.removePersistentDomain(forName: suite) }
 
+    @MainActor func testNativeControlsFollowRenderViewScaleWhenItDiffersFromTheScreen() throws {
+        var configuration = TouchConfiguration()
+        let canvas = CGSize(width: 600, height: 300)
+        let click = CGPoint(x: 300, y: 150)
+        configuration.move(.leftClick, to: click, in: canvas)
+        var custom = CustomTouchButton()
+        custom.centre = TouchCentre(x: 0.8, y: 0.25)
+        configuration.customButtons = [custom]
+        let view = UIView(frame: CGRect(origin: .zero, size: canvas))
+        view.contentScaleFactor = UIScreen.main.scale + 1
+        let bridge = TouchGestureBridge(configuration: { configuration })
+
+        bridge.attach(to: view)
+        _ = bridge.poll(screen: 1, flags: 1, width: 600, height: 300,
+                        scale: Double(view.contentScaleFactor), capacity: 64)
+
+        let control = try XCTUnwrap(view.subviews.compactMap { $0 as? CustomTouchView }.first)
+        XCTAssertEqual(control.frame, custom.rect(in: canvas))
+        XCTAssertFalse(bridge.gestureRecognizer(TouchSurfaceTap(), shouldReceive: PositionedTouch(click)))
+    }
+
     @MainActor func testMenuScrollCannotCancelGameplayFingers() throws {
         let bridge = TouchGestureBridge(configuration: { TouchConfiguration() })
         let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
@@ -60,7 +81,7 @@ final class TouchControlsTests: XCTestCase {
         bridge.attach(to: view)
         func poll(_ screen: UInt64) -> [[Double]] {
             bridge.poll(screen: screen, flags: 1, width: 600, height: 300,
-                        scale: Double(UIScreen.main.scale), capacity: 64)
+                        scale: Double(view.contentScaleFactor), capacity: 64)
         }
         _ = poll(1)
         let hold = FixedGestureHold()
@@ -80,13 +101,37 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertTrue(poll(2).isEmpty)
     }
 
+    @MainActor func testLongPressOnlySuppressesTapsFromItsOwnFinger() throws {
+        let bridge = TouchGestureBridge()
+        let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        bridge.attach(to: view)
+        _ = bridge.poll(screen: 12, flags: 1, width: 600, height: 300,
+                        scale: Double(view.contentScaleFactor), capacity: 64)
+        let hold = try XCTUnwrap(view.gestureRecognizers?.compactMap { $0 as? TouchSurfaceHold }.first)
+        let taps = try XCTUnwrap(view.gestureRecognizers?.compactMap { $0 as? TouchSurfaceTap })
+        let single = try XCTUnwrap(taps.first { $0.numberOfTapsRequired == 1 })
+        let double = try XCTUnwrap(taps.first { $0.numberOfTapsRequired == 2 })
+        let held = PositionedTouch(CGPoint(x: 320, y: 200))
+        let other = PositionedTouch(CGPoint(x: 300, y: 100))
+        single.trackTapStart(other)
+        double.trackTapStart(held)
+        hold.trackHoldStart(held)
+        hold.state = .began
+        _ = bridge.perform(NSSelectorFromString("held:"), with: hold)
+
+        XCTAssertTrue(single.clickEligible)
+        XCTAssertFalse(double.clickEligible)
+        _ = bridge.gestureRecognizer(single, shouldReceive: other)
+        XCTAssertFalse(double.clickEligible)
+    }
+
     @MainActor func testHotbarTapsKeepTheirOwnOriginsAndDoubleTapStaysInOneSlot() {
         let bridge = TouchGestureBridge(configuration: { TouchConfiguration() })
         let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
         bridge.attach(to: view)
         func poll() -> [[Double]] {
             bridge.poll(screen: 1, flags: 1, width: 600, height: 300,
-                        scale: Double(UIScreen.main.scale), capacity: 64)
+                        scale: Double(view.contentScaleFactor), capacity: 64)
         }
         _ = poll()
         let original = PositionedTouch(CGPoint(x: 300, y: 299))
@@ -111,6 +156,22 @@ final class TouchControlsTests: XCTestCase {
         }
     }
 
+    @MainActor func testHotbarTrackerOnlyStartsForAnEnabledSlideInsideTheVisibleHotbar() {
+        var configuration = TouchConfiguration()
+        let view = UIView(frame: CGRect(x: 0, y: 0, width: 600, height: 300))
+        let bridge = TouchGestureBridge(configuration: { configuration })
+        bridge.attach(to: view)
+        _ = bridge.poll(screen: 1, flags: 1, width: 600, height: 300,
+                        scale: Double(view.contentScaleFactor), capacity: 64)
+        let tracker = TouchHotbarTracker()
+        let inside = PositionedTouch(CGPoint(x: 300, y: 299))
+        XCTAssertFalse(bridge.gestureRecognizer(tracker, shouldReceive: inside))
+        configuration.slideableHotbar = true
+        XCTAssertTrue(bridge.gestureRecognizer(tracker, shouldReceive: inside))
+        let outside = PositionedTouch(CGPoint(x: 300, y: 300))
+        XCTAssertFalse(bridge.gestureRecognizer(tracker, shouldReceive: outside))
+    }
+
     @MainActor func testTitleTapsIgnoreHiddenGameplayHitboxesAndGesturePreference() {
         var config = TouchConfiguration()
         config.mouseGestures = false
@@ -119,7 +180,7 @@ final class TouchControlsTests: XCTestCase {
         let bridge = TouchGestureBridge(configuration: { config })
         let surface = UIView(frame: CGRect(origin: .zero, size: size))
         bridge.attach(to: surface)
-        let scale = Double(UIScreen.main.scale)
+        let scale = Double(surface.contentScaleFactor)
         _ = bridge.poll(screen: 70, flags: 8, width: 600, height: 300, scale: scale, capacity: 64)
         let tap = TouchSurfaceTap()
         for button in [TouchButton.leftClick, .rightClick, .joystick] {
@@ -141,7 +202,7 @@ final class TouchControlsTests: XCTestCase {
         let bridge = TouchGestureBridge(configuration:{config})
         let view = UIView(frame:CGRect(origin:.zero,size:size)); bridge.attach(to:view)
         let tap = TouchSurfaceTap(), point = PositionedTouch(CGPoint(x:300,y:150))
-        let scale = Double(UIScreen.main.scale)
+        let scale = Double(view.contentScaleFactor)
         _ = bridge.poll(screen:1,flags:0,width:600,height:300,scale:scale,capacity:64)
         XCTAssertTrue(bridge.gestureRecognizer(tap,shouldReceive:point))
         _ = bridge.poll(screen:1,flags:32,width:600,height:300,scale:scale,capacity:64)
@@ -181,6 +242,29 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertEqual(r.minX, 0); XCTAssertEqual(r.maxY, 300)
     }
 
+    func testResetKeepsLargeCustomLayoutsFromOverlapping() {
+        var layout = TouchConfiguration()
+        for index in 0..<40 {
+            var button = CustomTouchButton()
+            button.name = "Button \(index)"
+            button.bindings = [65 + index % 26, 0, 0, 0]
+            layout.customButtons.append(button)
+        }
+        let controls = layout.customButtons
+        layout.resetLayout()
+
+        XCTAssertEqual(layout.customButtons.map(\.id), controls.map(\.id))
+        XCTAssertEqual(layout.customButtons.map(\.keys), controls.map(\.keys))
+        XCTAssertTrue(layout.customButtons.allSatisfy { $0.size.valid })
+        for canvas in [CGSize(width: 650, height: 300), CGSize(width: 1_194, height: 834),
+                       CGSize(width: 500, height: 500)] {
+            let buttons = layout.customButtons.map { $0.rect(in: canvas) }
+            for (index, frame) in buttons.enumerated() {
+                XCTAssertFalse(buttons.dropFirst(index + 1).contains { $0.intersects(frame) })
+            }
+        }
+    }
+
     func testResetIncludesCustomGeometryButPreservesBindingsUntilSaved() {
         let preferences = TouchPreferences(defaults: defaults)
         var original = TouchConfiguration()
@@ -189,6 +273,7 @@ final class TouchControlsTests: XCTestCase {
         original.resize(.jump, factor: 1.5, in: canvas)
         original.opacities[String(TouchButton.jump.rawValue)] = 0.5
         original.showControls = false
+        original.forwardLock = true
         var custom = CustomTouchButton()
         custom.name = "Inventory chord"
         custom.bindings = [340, 69, 0, 0]
@@ -209,6 +294,7 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertTrue(draft.sizes.isEmpty)
         XCTAssertTrue(draft.opacities.isEmpty)
         XCTAssertFalse(draft.showControls)
+        XCTAssertTrue(draft.forwardLock)
         XCTAssertNotEqual(draft.customButtons[0].centre, draft.customButtons[1].centre)
         let appearance = CustomTouchButton()
         for (reset, before) in zip(draft.customButtons, original.customButtons) {
@@ -245,6 +331,13 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertEqual(config.snapshot().0.count,100)
         XCTAssertEqual(config.snapshot().1 & 2,2)
     }
+    func testUnreadableJoystickPreferenceUsesTheCurrentDefault() throws {
+        let invalid = Data(#"{"joystick":"invalid"}"#.utf8)
+        let settings = try JSONDecoder().decode(TouchConfiguration.self, from: invalid)
+        XCTAssertEqual(settings.joystick, TouchConfiguration().joystick)
+        XCTAssertTrue(settings.buttons.contains(.joystick))
+    }
+
     func testMalformedDataAndCoordinatesCannotMoveButtonsOffscreen() {
         defaults.set(Data("invalid".utf8), forKey: TouchPreferences.key)
         XCTAssertEqual(TouchPreferences(defaults: defaults).configuration, TouchConfiguration())
@@ -266,6 +359,36 @@ final class TouchControlsTests: XCTestCase {
         XCTAssertEqual(manual.gui, CGSize(width: 1266, height: 585))
         XCTAssertEqual(manual.pointsPerUnit, 2.0 / 3.0, accuracy: 0.0001)
     }
+    func testFactoryMovementControlsFitCompactSurfaces() {
+        for size in [CGSize(width: 75, height: 64), CGSize(width: 30, height: 40)] {
+            for button: TouchButton in [.forward, .back, .left, .right, .joystick] {
+                let rect = button.rect(in: size)
+                XCTAssertGreaterThan(rect.width, 0)
+                XCTAssertGreaterThan(rect.height, 0)
+                XCTAssertGreaterThanOrEqual(rect.minX, -0.0001)
+                XCTAssertGreaterThanOrEqual(rect.minY, -0.0001)
+                XCTAssertLessThanOrEqual(rect.maxX, size.width + 0.0001)
+                XCTAssertLessThanOrEqual(rect.maxY, size.height + 0.0001)
+            }
+        }
+    }
+
+    func testToolbarFitsNarrowAndShortCanvases() {
+        let narrow = TouchEditorToolbarGeometry(canvas: CGSize(width: 240, height: 120))
+        XCTAssertTrue(narrow.compact)
+        XCTAssertEqual(narrow.width, 216)
+        let left = narrow.fittedCentre(CGPoint(x: -20, y: -20))
+        let right = narrow.fittedCentre(CGPoint(x: 1_000, y: 1_000))
+        XCTAssertEqual(left, CGPoint(x: 108, y: 60))
+        XCTAssertEqual(right, CGPoint(x: 132, y: 60))
+        XCTAssertLessThanOrEqual(right.x + narrow.width / 2, 240)
+
+        let tablet = TouchEditorToolbarGeometry(canvas: CGSize(width: 950, height: 650))
+        XCTAssertFalse(tablet.compact)
+        XCTAssertEqual(tablet.width, 500)
+        XCTAssertEqual(tablet.fittedCentre(CGPoint(x: 800, y: 900)), CGPoint(x: 700, y: 570))
+    }
+
     func testEditorUsesTheSavedUnicodeGuiScale() throws {
         let options = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: options) }
@@ -286,6 +409,52 @@ final class TouchControlsTests: XCTestCase {
                                              limit: saved.limit, forceUnicode: saved.forceUnicode)
         XCTAssertEqual(sceneScale.gui, CGSize(width: 675, height: 450))
         XCTAssertEqual(sceneScale.pointsPerUnit, 4.0 / 3.0, accuracy: 0.0001)
+    }
+
+    func testResizingKeepsTheSavedAnchorAcrossCanvasChanges() {
+        let portrait = CGSize(width: 300, height: 600)
+        let landscape = CGSize(width: 800, height: 400)
+        let button = TouchButton.jump
+        let key = String(button.rawValue)
+        let anchor = TouchCentre(x: 0.97, y: 0.95)
+        var config = TouchConfiguration()
+        config.centres[key] = anchor
+        config.sizes[key] = TouchSize(width: 0.4, height: 0.4)
+        XCTAssertLessThan(config.rect(button, in: portrait).midX, portrait.width * anchor.x)
+
+        config.resize(button, factor: 0.2, in: portrait)
+        XCTAssertEqual(config.centres[key], anchor)
+        let rect = config.rect(button, in: landscape)
+        XCTAssertEqual(rect.midX, landscape.width * anchor.x, accuracy: 0.001)
+        XCTAssertEqual(rect.midY, landscape.height * anchor.y, accuracy: 0.001)
+    }
+
+    func testRectangularButtonKeepsProportionsAtBothResizeLimits() {
+        let canvas = CGSize(width: 800, height: 400)
+        let button = TouchButton.chat
+        var config = TouchConfiguration()
+        let initial = config.rect(button, in: canvas)
+        for factor in [100.0, 0.001, 4.0] {
+            config.resize(button, factor: factor, in: canvas)
+            let rect = config.rect(button, in: canvas)
+            XCTAssertEqual(rect.width / rect.height, initial.width / initial.height, accuracy: 0.00001)
+            XCTAssertTrue(config.sizes[String(button.rawValue)]?.valid == true)
+        }
+    }
+
+    func testPinchReturningToItsInitialScaleRestoresTheStartingSize() {
+        let canvas = CGSize(width: 800, height: 400)
+        let button = TouchButton.chat
+        var config = TouchConfiguration()
+        let initial = config.relativeSize(button, in: canvas)
+        config.resize(button, factor: 100, in: canvas, from: initial)
+        config.resize(button, factor: 50, in: canvas, from: initial)
+        XCTAssertEqual(config.relativeSize(button, in: canvas).width,
+                       initial.proportionalWidthRange.upperBound, accuracy: 0.00001)
+        config.resize(button, factor: 1, in: canvas, from: initial)
+        let final = config.relativeSize(button, in: canvas)
+        XCTAssertEqual(final.width, initial.width, accuracy: 0.00001)
+        XCTAssertEqual(final.height, initial.height, accuracy: 0.00001)
     }
 
     func testSizingOpacityAndForwardLockRoundTrip() throws {
@@ -349,6 +518,9 @@ final class TouchControlsTests: XCTestCase {
         let pixels = CGSize(width: 2420, height: 1668)
         XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 670, y: 1547.999), pixels: pixels, scale: 6), -1)
         XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 670, y: 1548), pixels: pixels, scale: 6), 0)
+        XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 670, y: 1667.999), pixels: pixels, scale: 6), 0)
+        XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 670, y: 1668), pixels: pixels, scale: 6), -1)
+        XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 670, y: 1700), pixels: pixels, scale: 6), -1)
         XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 669.999, y: 1600), pixels: pixels, scale: 6), -1)
         XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 1749.999, y: 1600), pixels: pixels, scale: 6), 8)
         XCTAssertEqual(TouchHotbar.slot(point: CGPoint(x: 1750, y: 1600), pixels: pixels, scale: 6), -1)
@@ -439,6 +611,25 @@ final class TouchControlsTests: XCTestCase {
         _ = poll(screen: 3, flags: 1)
         XCTAssertTrue(button.accessibilityActivate())
         XCTAssertEqual(cursorChanges, 2)
+    }
+
+    @MainActor func testEditingAnOverlappingCustomControlPreservesItsStackingOrder() {
+        var config = TouchConfiguration()
+        let under = CustomTouchButton()
+        let over = CustomTouchButton()
+        config.customButtons = [under, over]
+        let surface = UIView(frame: CGRect(x: 0, y: 0, width: 640, height: 480))
+        let bridge = TouchGestureBridge(configuration: { config })
+        bridge.attach(to: surface)
+
+        func controlOrder() -> [UUID] {
+            _ = bridge.poll(screen: 1, flags: 1, width: 640, height: 480, scale: 1, capacity: 32)
+            return surface.subviews.compactMap { ($0 as? CustomTouchView)?.definition.id }
+        }
+
+        XCTAssertEqual(controlOrder(), [under.id, over.id])
+        config.customButtons[0].name = "Edited"
+        XCTAssertEqual(controlOrder(), [under.id, over.id])
     }
 
     func testCustomControlsPersistBeyondSixAndKeepOrderedChords() throws {

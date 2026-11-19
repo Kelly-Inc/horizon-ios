@@ -1290,6 +1290,8 @@ impl Game<'_> {
             if observe_level && let Some(level) = self.level(dim.id()) {
                 self.native_level_tick_post(level);
             }
+            #[cfg(feature = "state-digest")]
+            self.state_digest_tick(dim, running);
             horizon_client::spans::time("server_debug", || self.publish_server_debug(dim));
             // An entity that crossed into a level that already ticked this
             // server tick is in it when the tick ends (`addDuringTeleport`).
@@ -1353,6 +1355,8 @@ impl Game<'_> {
         record: impl FnOnce(TickTiming),
     ) -> Result<()> {
         let started = Instant::now();
+        // The game carried on past any turn a caught panic interrupted before this tick.
+        self.lan_interrupted_turns.clear();
         horizon_threads::work::tick_start();
         let result = self.tick_server_recorded(paused, record);
         horizon_threads::work::tick_end(started.elapsed().as_nanos() as u64);
@@ -1636,6 +1640,18 @@ impl Game<'_> {
         }
     }
 
+    pub(super) fn mark_all_resident_chunks_for_save(&mut self) {
+        self.world
+            .modified
+            .extend(self.world.chunks.keys().copied());
+        for level in self.levels.parked.values_mut() {
+            level
+                .world
+                .modified
+                .extend(level.world.chunks.keys().copied());
+        }
+    }
+
     /// Save every parked level (`MinecraftServer.saveAllChunks`); the level
     /// in place is the caller's to save.
     pub(super) fn save_parked_levels(&mut self, wait: bool) -> Result<()> {
@@ -1644,11 +1660,18 @@ impl Game<'_> {
         }
         let back = self.dim;
         let dims: Vec<Dim> = self.levels.parked.keys().copied().collect();
+        let mut result = Ok(());
         for dim in dims {
-            self.enter_level(dim)?;
-            self.save_level(wait)?;
+            if let Err(error) = self.enter_level(dim).and_then(|()| self.save_level(wait)) {
+                log::warn!("Horizon: could not save {}: {error}", dim.id());
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
-        self.enter_level(back)
+        // Restore the caller's dimension even when one of the saves failed.
+        let restored = self.enter_level(back);
+        restored.and(result)
     }
 }
 
@@ -1780,6 +1803,37 @@ mod tests {
         assert_eq!(game.border.size(), 1000.0);
         let nether = game.levels.parked_border(Dim::Nether).unwrap();
         assert_eq!(nether.size(), 100.0);
+
+        let key = (3, 4);
+        let chunk = Arc::new(horizon_client::chunk::Chunk::empty(3, 4));
+        game.world.chunks.insert(key, chunk.clone());
+        let nether = game.levels.parked_mut(Dim::Nether).unwrap();
+        nether.world.chunks.insert(key, chunk);
+        game.mark_all_resident_chunks_for_save();
+        let nether = game.levels.parked_mut(Dim::Nether).unwrap();
+        assert!(game.world.modified.contains(&key));
+        assert!(nether.world.modified.contains(&key));
+
+        // Keep running in the Overworld if the Nether's write barrier fails.
+        let blocked = tempfile::tempdir().unwrap();
+        game.world_root = blocked.path().to_path_buf();
+        std::fs::write(blocked.path().join("entities"), b"fixture").unwrap();
+        let save = Arc::new(SaveDir::new(
+            blocked.path().to_path_buf(),
+            horizon_client::save::LevelShape::OVERWORLD,
+        ));
+        let entity =
+            horizon_core::nbt::Tag::compound([("version", horizon_core::nbt::Tag::Int(3))]);
+        save.save_entities_later(vec![((0, 0), vec![entity])])
+            .unwrap();
+        game.levels.parked_mut(Dim::Nether).unwrap().save = save;
+        assert!(game.save_parked_levels(true).is_err());
+        assert_eq!(game.dim, Dim::Overworld);
+        assert_eq!(game.border.size(), 1000.0);
+        assert_eq!(
+            game.levels.parked_border(Dim::Nether).unwrap().size(),
+            100.0
+        );
     }
 
     struct LogCapture;

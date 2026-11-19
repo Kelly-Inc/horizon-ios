@@ -201,7 +201,15 @@ impl<T: 'static> EventLoop<T> {
             // `applicationWillResignActive:`
             unsafe { UIApplicationWillResignActiveNotification },
             move |_| {
-                if !scene_lifecycle { super::display_link::active(mtm, false); app_state::handle_nonuser_event(mtm, EventWrapper::StaticEvent(Event::Suspended)); }
+                if !scene_lifecycle {
+                    super::display_link::active(mtm, false);
+                    let app = UIApplication::sharedApplication(mtm);
+                    #[allow(deprecated)]
+                    for window in app.windows().iter() {
+                        super::window::release_window_hardware_keys(window);
+                    }
+                    app_state::handle_nonuser_event(mtm, EventWrapper::StaticEvent(Event::Suspended));
+                }
             },
         );
         let _will_enter_foreground_observer = create_observer(

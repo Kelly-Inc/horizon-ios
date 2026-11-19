@@ -50,15 +50,14 @@ fn device_of(controller: &horizon_gamecontroller::Controller) -> Device {
 impl Pads {
     /// Read the active pad.
     pub(super) fn read(&mut self) -> PadState {
-        let controllers = horizon_gamecontroller::snapshots();
-        let selected = horizon_gamecontroller::active_controller();
+        let (controllers, selected) = horizon_gamecontroller::snapshots_with_active();
         self.read_snapshots(controllers, selected)
     }
 
     fn read_snapshots(
         &mut self,
         controllers: Vec<horizon_gamecontroller::ConnectedController>,
-        selected: Option<horizon_gamecontroller::ConnectedController>,
+        selected: Option<PadId>,
     ) -> PadState {
         let known: Vec<_> = controllers.iter().map(|controller| controller.id).collect();
         if self.devices.started {
@@ -90,23 +89,24 @@ impl Pads {
             }
             self.devices.connected = controllers.len();
         }
-        self.devices.snapshots = controllers.clone();
-        self.device = selected
-            .as_ref()
-            .or_else(|| controllers.first())
-            .map(|pad| device_of(&pad.controller));
-        let active = selected.as_ref().map(|pad| pad.id);
+        let selected = selected
+            .and_then(|id| controllers.iter().find(|pad| pad.id == id))
+            .or_else(|| controllers.first());
+        self.device = selected.map(|pad| device_of(&pad.controller));
+        let active = selected.map(|pad| pad.id);
         if self.devices.active != active {
             // Changing/disconnecting a controller is not its A release.
             self.menu.armed = None;
             self.owner_epoch = self.owner_epoch.wrapping_add(1);
             self.devices.active = active;
         }
-        let Some(pad) = selected else {
-            return PadState::default();
+        let state = if let Some(pad) = selected {
+            self.style = style(&pad.state.category);
+            state_of(&pad.state)
+        } else {
+            PadState::default()
         };
-        self.style = style(&pad.state.category);
-        let state = state_of(&pad.state);
+        self.devices.snapshots = controllers;
         self.peaks = [state.left, state.right];
         state
     }

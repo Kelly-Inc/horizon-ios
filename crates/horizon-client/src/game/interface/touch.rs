@@ -34,14 +34,15 @@ pub(super) struct TouchInput {
     /// A pointer event derived from a finger; the trace records the original
     /// touch once, not this translation a second time.
     synthetic: bool,
+    /// Buttons held by synthetic menu presses.
+    pub(super) window_buttons: std::collections::HashSet<MouseButton>,
     /// A touch has been seen: the controls are drawn (from the start on iPhone and iPad).
     seen: bool,
     /// The last input device controls only the visibility of touch overlays.
     hardware: super::input_mode::InputMode,
     /// The finger that is the pointer over a menu.
-    menu: Option<MenuFinger>,
-    /// Clicks to release once a tick has passed: vanilla samples buttons once a tick, so a tap released in
-    /// the same frame would be lost (the pad holds its short presses back the same way).
+    pub(super) menu: Option<MenuFinger>,
+    /// Tap releases scheduled until the next simulation tick.
     late: Vec<(MouseButton, u64)>,
     /// The button a finger held still on the world is holding down: attack to mine, or use to eat, drink or
     /// draw a bow.
@@ -49,7 +50,7 @@ pub(super) struct TouchInput {
     #[cfg(target_os = "ios")]
     cursor_down: [bool; 3],
     #[cfg(target_os = "ios")]
-    cursor_cancelled: [bool; 3],
+    cursor_cancelled: [Option<u64>; 3],
     #[cfg(target_os = "ios")]
     cursor_delivery: Option<ClickContext>,
     #[cfg(target_os = "ios")]
@@ -94,11 +95,10 @@ struct CursorEdge {
     context: ClickContext,
 }
 
-/// A finger over a menu. Its press waits for a frame drawn with the pointer under it, and its release for a
-/// frame after the press: screens find what is under the pointer while drawing, so a pointer that moved and
-/// pressed in one go would press whatever was under the old position (or nothing).
-struct MenuFinger {
+/// A menu gesture waits for the cursor to draw before pressing.
+pub(super) struct MenuFinger {
     id: u64,
+    pub(super) screen: u64,
     gesture: MenuGesture,
     target: MenuTarget,
     at: (f32, f32),
@@ -190,8 +190,12 @@ impl Game<'_> {
 
     /// The world is under the fingers, with no screen over it.
     pub(super) fn touch_playing(&self) -> bool {
-        !self.menu_input_blocked()
-            && self.title.is_none()
+        !self.menu_input_blocked() && self.touch_world_unobstructed()
+    }
+
+    /// The active UI is gameplay, even before the current surface presents it.
+    pub(super) fn touch_world_unobstructed(&self) -> bool {
+        self.title.is_none()
             && self.screen == Screen::Playing
             && self.sign_edit.is_none()
             && self.book.is_none()
@@ -230,10 +234,14 @@ impl Game<'_> {
         self.touch.hardware.mouse();
     }
 
-    fn touch_shown(&self) -> bool {
+    fn accepts_phone_touch(&self) -> bool {
         // On AirPlay the phone is covered and the game is played with a controller (game/airplay.rs), but for
         // splitscreen's second player, whose controller the phone is.
-        (!self.on_airplay() || self.splitscreen.guest)
+        !self.on_airplay() || self.splitscreen.guest
+    }
+
+    fn touch_shown(&self) -> bool {
+        self.accepts_phone_touch()
             && (self.touch.seen
                 || cfg!(any(target_os = "ios", target_os = "android"))
                 || std::env::var_os("HORIZON_TOUCH").is_some_and(|v| v == "1"))
@@ -245,6 +253,9 @@ impl Game<'_> {
         event_loop: &dyn EventLoopCtl,
         touch: Touch,
     ) -> Result<()> {
+        if !self.accepts_phone_touch() {
+            return Ok(());
+        }
         if self.menu_input_blocked() {
             self.cancel_touch_for_reload();
             return Ok(());
@@ -296,7 +307,7 @@ impl Game<'_> {
         }
         if playing {
             // Loading or keyboard navigation can consume a menu finger's release.
-            // That old finger must not route a new world touch back into the menu.
+            // A finger must not route a new world touch back into the menu.
             self.touch_release_menu(event_loop);
         } else {
             if touch.phase == TouchPhase::Cancelled {
@@ -350,10 +361,10 @@ impl Game<'_> {
                 self.touch.fingers.start(touch.id, at, now, &layout)
             }
             TouchPhase::Moved => self.touch.fingers.moved(touch.id, at, &layout),
-            TouchPhase::Ended => self.touch.fingers.end(touch.id),
+            TouchPhase::Ended => self.touch.fingers.end_at(touch.id, at),
             TouchPhase::Cancelled => self.touch.fingers.cancel(touch.id),
         };
-        let result = self.touch_act(out, batch.scale);
+        let result = self.touch_act(out, batch.scale, touch.phase == TouchPhase::Cancelled);
         #[cfg(target_os = "ios")]
         self.touch_record_click_context();
         result
@@ -370,7 +381,17 @@ impl Game<'_> {
             horizon_ios_launcher::touch_gestures(0, 2, (0.0, 0.0), 1.0);
         }
         self.touch.menu = None;
-        self.touch.fingers.release_all();
+        self.touch.window_buttons.clear();
+        self.touch_drag_button = None;
+        let _released = self.touch.fingers.release_all();
+        #[cfg(target_os = "ios")]
+        for action in _released {
+            if let Out::Release(control) = action
+                && let Some(key) = key_of(control)
+            {
+                self.touch_cancel_debug_modifier(key);
+            }
+        }
         self.touch.late.clear();
         self.touch.holding = None;
         self.keys.release_source(Source::Touch);
@@ -429,7 +450,7 @@ impl Game<'_> {
         let result = due
             .into_iter()
             .try_for_each(|(button, _)| self.mouse_mapping(button, false, Source::Touch))
-            .and_then(|()| self.touch_act(out, scale));
+            .and_then(|()| self.touch_act(out, scale, !playing));
         if let Err(e) = result {
             log::warn!("Horizon: touch: {e}");
         }
@@ -572,6 +593,34 @@ impl Game<'_> {
         if self.debug_key(key, action) {
             return Ok(());
         }
+        self.touch_map_raw_key(key, pressed)
+    }
+
+    #[cfg(target_os = "ios")]
+    fn touch_cancel_key(&mut self, key: KeyCode) -> Result<()> {
+        if self.touch_key_held(key) {
+            return Ok(());
+        }
+        self.touch_cancel_debug_modifier(key);
+        self.touch_map_raw_key(key, false)
+    }
+
+    /// Drop a touch-owned debug modifier without running its key-up action.
+    #[cfg(target_os = "ios")]
+    fn touch_cancel_debug_modifier(&mut self, key: KeyCode) {
+        if !self.physical_keys.contains(&key)
+            && horizon_client::keybinds::key_name(key)
+                == Some(self.settings.keys.get("key.debug.modifier"))
+        {
+            self.debug_keys.reset();
+            if self.screen == Screen::GameModeSwitcher {
+                self.close_gamemode_switcher(false);
+            }
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    fn touch_map_raw_key(&mut self, key: KeyCode, pressed: bool) -> Result<()> {
         for mapped in self.settings.keys.translate_all(key) {
             match mapped {
                 Ok(mapped) => self.mapped_key(mapped, pressed, false, key, Source::Touch)?,
@@ -601,7 +650,7 @@ impl Game<'_> {
         Ok(())
     }
 
-    fn touch_act(&mut self, out: Vec<Out>, scale: f32) -> Result<()> {
+    fn touch_act(&mut self, out: Vec<Out>, scale: f32, _cancelled: bool) -> Result<()> {
         if self.menu_input_blocked() {
             self.cancel_touch_for_reload();
             return Ok(());
@@ -620,7 +669,7 @@ impl Game<'_> {
                 Out::Press(Control::Hide) => {
                     self.touch.hidden = !self.touch.hidden;
                     let released = self.touch.fingers.release_all();
-                    self.touch_act(released, scale)?;
+                    self.touch_act(released, scale, true)?;
                     for key in std::mem::take(&mut self.touch.toggle_keys) {
                         self.mapped_key(key, false, false, key, Source::Touch)?;
                     }
@@ -666,7 +715,11 @@ impl Game<'_> {
                 Out::Press(control) | Out::Release(control) => {
                     if let Some(key) = key_of(control) {
                         #[cfg(target_os = "ios")]
-                        self.touch_raw_key(key, matches!(o, Out::Press(_)))?;
+                        if _cancelled && matches!(o, Out::Release(_)) {
+                            self.touch_cancel_key(key)?;
+                        } else {
+                            self.touch_raw_key(key, matches!(o, Out::Press(_)))?;
+                        }
                         #[cfg(not(target_os = "ios"))]
                         self.mapped_key(
                             key,
@@ -738,6 +791,7 @@ impl Game<'_> {
         phase: TouchPhase,
         at: (f32, f32),
     ) {
+        self.discard_stale_touch_menu();
         if !at.0.is_finite() || !at.1.is_finite() {
             if self
                 .touch
@@ -776,20 +830,22 @@ impl Game<'_> {
                 } else {
                     MenuMode::Tap
                 };
+                let screen = self.key_screen();
                 if target == MenuTarget::Pointer {
-                    match self.focused_field_rect() {
-                        Some(rect) if touch::hit_rect(rect, self.screen_point(at)) => {
-                            if self.system_keyboard_hidden() {
-                                self.show_system_keyboard();
-                            }
-                        }
-                        Some(_) if self.system_keyboard_up() => self.hide_system_keyboard(),
+                    // Keep the keyboard between text fields.
+                    match self.touch_hits_text_field(self.screen_point(at)) {
+                        Some(true) if self.system_keyboard_hidden() => self.show_system_keyboard(),
+                        Some(false) if self.system_keyboard_up() => self.hide_system_keyboard(),
                         _ => {}
                     }
                     self.touch_pointer(event_loop, at);
+                    if self.key_screen() != screen || self.menu_input_blocked() {
+                        return;
+                    }
                 }
                 self.touch.menu = Some(MenuFinger {
                     id,
+                    screen,
                     gesture: MenuGesture::new(at, mode),
                     target,
                     at,
@@ -826,8 +882,7 @@ impl Game<'_> {
         }
     }
 
-    /// The same drawn targets the controller uses distinguish direct manipulation
-    /// from a tap. Fields retain selection dragging; sliders and slots retain holds.
+    /// Direct drags use the controller's drawn hit targets.
     fn touch_menu_mode(&self, at: (f32, f32)) -> MenuMode {
         if self.screen == Screen::Inventory
             || self.hud_editor_drag_target(self.screen_point(at))
@@ -855,10 +910,14 @@ impl Game<'_> {
         target: MenuTarget,
         action: MenuAction,
     ) {
+        if self.discard_stale_touch_menu() || self.touch.menu.is_none() || self.menu_input_blocked()
+        {
+            return;
+        }
         if action.finished {
             self.touch.menu = None;
         }
-        if action.scroll != 0.0 && target == MenuTarget::Pointer {
+        if action.scroll != 0.0 && target == MenuTarget::Pointer && self.pad_in_menu() {
             self.touch_wheel(event_loop, action.scroll);
         }
         if let Some(pressed) = action.button {
@@ -875,8 +934,8 @@ impl Game<'_> {
         }
     }
 
-    /// Abandon a menu gesture when another input device or the world takes over.
-    /// A missing UIKit end event must neither latch all later fingers nor create a click.
+    /// Cancel a menu gesture when another device takes over or the world opens.
+    /// A release belongs to the same menu screen.
     fn touch_release_menu(&mut self, event_loop: &dyn EventLoopCtl) {
         #[cfg(target_os = "ios")]
         if self.touch.cursor_screen.is_some() {
@@ -884,6 +943,7 @@ impl Game<'_> {
             self.touch_cursor_flush(event_loop);
         }
 
+        self.discard_stale_touch_menu();
         if let Some(mut finger) = self.touch.menu.take()
             && finger.gesture.cancel().button == Some(false)
             && finger.target == MenuTarget::Pointer
@@ -892,8 +952,9 @@ impl Game<'_> {
         }
     }
 
-    /// Advance the delayed menu press/release after drawing the pointer.
+    /// Deliver a queued tap.
     fn touch_menu_frame(&mut self, event_loop: &dyn EventLoopCtl) {
+        self.discard_stale_touch_menu();
         let Some(finger) = self.touch.menu.as_mut() else {
             return;
         };
@@ -1033,8 +1094,7 @@ impl Game<'_> {
 }
 
 impl Game<'_> {
-    /// The buttons over a screen: ✕ where the screen has no way out of its own on a touch screen
-    /// (`touch_close_shown`), and ⌨ beside it while a text field has focus.
+    /// Draw Close and Keyboard beside open screens that need them and sync the cursor layout.
     pub(super) fn draw_touch_close(&mut self, batch: &mut HudBatch) {
         #[cfg(target_os = "ios")]
         {
@@ -1047,7 +1107,10 @@ impl Game<'_> {
         if !self.touch_playing()
             && (touch::cursor_mode() || horizon_ios_launcher::native_gestures_available())
         {
-            for (c, r) in self.visible_touch_layout(batch.width, batch.height) {
+            self.touch.cursor.fit_size((batch.width, batch.height));
+            let layout = self.visible_touch_layout(batch.width, batch.height);
+            self.touch.cursor.sync_layout(&layout);
+            for (c, r) in layout {
                 if !matches!(c, Control::Hotbar(_)) {
                     let (x, y) = self.touch.cursor.joystick.thumb;
                     let point = if self.touch.cursor.joystick.velocity != (0.0, 0.0) {
@@ -1244,8 +1307,7 @@ impl Game<'_> {
         let Some(batch) = self.screen_batch() else {
             return at;
         };
-        // Match CursorMoved's physical-pixel round trip exactly. Comparing an
-        // unrounded point with the rendered cursor can stall a press forever.
+        // Match CursorMoved's pixel rounding to unblock pending presses.
         (
             (at.0 * batch.scale) / batch.scale,
             (at.1 * batch.scale) / batch.scale,
@@ -1293,7 +1355,7 @@ impl Game<'_> {
             .into_iter()
             .enumerate()
         {
-            if std::mem::take(&mut self.touch.cursor_cancelled[i]) {
+            if self.touch.cursor_cancelled[i].take() == Some(self.key_screen()) {
                 self.touch_mouse_button(event_loop, button, false);
             }
         }
@@ -1301,11 +1363,11 @@ impl Game<'_> {
     fn touch_cursor_reset(&mut self) {
         self.touch.cursor.cancel();
         self.touch.cursor_pending.clear();
-        self.touch.cursor_screen = None;
+        let screen = self.touch.cursor_screen.take();
         self.touch.cursor_drawn = None;
         for control in std::mem::take(&mut self.touch.cursor_keys) {
             if let Some(key) = key_of(control) {
-                let _ = self.touch_raw_key(key, false);
+                let _ = self.touch_cancel_key(key);
             }
         }
         for (i, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
@@ -1313,11 +1375,9 @@ impl Game<'_> {
             .enumerate()
         {
             if std::mem::take(&mut self.touch.cursor_down[i]) {
-                // The synthetic down entered the window ledger. Clear it now
-                // even when no event loop is available (reload), then route
-                // its paired menu/window up at the next dispatch opportunity.
-                self.physical_buttons.remove(&button);
-                self.touch.cursor_cancelled[i] = true;
+                // Unlatch before queueing mouse-up.
+                self.touch.window_buttons.remove(&button);
+                self.touch.cursor_cancelled[i] = screen;
             }
         }
     }
@@ -1352,11 +1412,6 @@ impl Game<'_> {
         at: (f32, f32),
         size: (f32, f32),
     ) {
-        if phase == TouchPhase::Cancelled && !self.touch.cursor.surface_finger(id) {
-            self.touch_cursor_reset();
-            self.touch_cursor_flush(event_loop);
-            return;
-        }
         if self.touch.cursor_screen != Some(self.key_screen()) {
             self.touch_cursor_reset();
             self.touch_cursor_flush(event_loop);
@@ -1364,6 +1419,7 @@ impl Game<'_> {
         }
         let surface = self.touch.cursor.primary_finger() == Some(id);
         let layout = self.visible_touch_layout(size.0, size.1);
+        let touch_cancelled = phase == TouchPhase::Cancelled;
         let phase = match phase {
             TouchPhase::Started => 0,
             TouchPhase::Moved => 1,
@@ -1392,7 +1448,7 @@ impl Game<'_> {
                         self.touch.cursor_keys.retain(|c| *c != control);
                     }
                     if control == Control::MiddleClick {
-                        self.touch_queue_cursor_button(MouseButton::Middle, down);
+                        self.touch_cursor_button_event(MouseButton::Middle, touch_cancelled);
                     }
                     if control == Control::More && down {
                         self.touch.more = !self.touch.more;
@@ -1401,7 +1457,11 @@ impl Game<'_> {
                         self.touch.hidden = !self.touch.hidden;
                     }
                     if let Some(key) = key_of(control) {
-                        let _ = self.touch_raw_key(key, down);
+                        if touch_cancelled {
+                            let _ = self.touch_cancel_key(key);
+                        } else {
+                            let _ = self.touch_raw_key(key, down);
+                        }
                     }
                     if self.touch.cursor_screen != Some(self.key_screen()) {
                         self.touch_cursor_reset();
@@ -1409,17 +1469,34 @@ impl Game<'_> {
                         break;
                     }
                 }
-                touch::desktop::Action::Button(right, down) => self.touch_queue_cursor_button(
+                touch::desktop::Action::Button(right, _) => self.touch_cursor_button_event(
                     if right {
                         MouseButton::Right
                     } else {
                         MouseButton::Left
                     },
-                    down,
+                    touch_cancelled,
                 ),
             }
         }
         self.touch_record_click_context();
+    }
+    fn touch_cursor_button_event(&mut self, button: MouseButton, cancelled: bool) {
+        let down = self.touch_menu_mouse_held(button);
+        if cancelled
+            && !down
+            && let Some(index) = self
+                .touch
+                .cursor_pending
+                .iter()
+                .rposition(|edge| edge.button.is_some_and(|(b, _)| b == button))
+            && self.touch.cursor_pending[index].button == Some((button, true))
+        {
+            // Drop the cancelled contact's queued press.
+            self.touch.cursor_pending.remove(index);
+            return;
+        }
+        self.touch_queue_cursor_button(button, down);
     }
     fn touch_menu_mouse_held(&self, button: MouseButton) -> bool {
         let (index, control) = match button {
@@ -1511,8 +1588,8 @@ impl Game<'_> {
             if edge.button.is_some_and(|(_, down)| down) {
                 let context = edge.context.clone();
                 if self.touch.cursor_drawn != Some((context.screen, context.screen_at)) {
-                    self.touch_pointer(event_loop, context.at);
                     self.touch.cursor_pending[0].due = self.frames + 1;
+                    self.touch_pointer(event_loop, context.at);
                     break;
                 }
                 if context.guard != horizon_client::widgets::capture_pointer(context.screen_at) {
@@ -1536,7 +1613,10 @@ impl Game<'_> {
             let old_delivery = self.touch.cursor_delivery.replace(edge.context.clone());
             self.modifiers = edge.context.modifiers;
             self.touch_pointer(event_loop, edge.context.at);
-            if let Some((button, down)) = edge.button {
+            if let Some((button, down)) = edge.button
+                && edge.context.screen == self.key_screen()
+                && !self.menu_input_blocked()
+            {
                 if down {
                     for later in &mut self.touch.cursor_pending {
                         if later.button == Some((button, false)) {
@@ -1712,7 +1792,7 @@ impl Game<'_> {
         let mut keys = std::mem::take(&mut self.touch.native_keys);
         keys.extend(std::mem::take(&mut self.touch.custom_keys));
         for raw in keys {
-            let _ = self.touch_raw_key(raw, false);
+            let _ = self.touch_cancel_key(raw);
         }
         for (i, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
             .into_iter()
@@ -1819,7 +1899,11 @@ impl Game<'_> {
                         log::warn!("Horizon: touch button: {error}");
                     }
                 } else {
-                    self.touch.cursor_screen = Some(self.key_screen());
+                    let screen = self.key_screen();
+                    if self.touch.cursor_screen != Some(screen) {
+                        self.touch_cursor_reset();
+                        self.touch.cursor_screen = Some(screen);
+                    }
                     self.touch_queue_cursor_button(button, down);
                 }
             }
@@ -1827,7 +1911,7 @@ impl Game<'_> {
             Physical::Keyboard => self.toggle_system_keyboard(),
             Physical::ToggleControls => {
                 let scale = self.touch_batch().map_or(1.0, |b| b.scale);
-                let _ = self.touch_act(vec![Out::Press(Control::Hide)], scale);
+                let _ = self.touch_act(vec![Out::Press(Control::Hide)], scale, false);
             }
             Physical::Cancel => self.touch_native_reset(),
             _ => {}

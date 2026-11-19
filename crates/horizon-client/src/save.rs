@@ -187,6 +187,19 @@ impl Drop for SessionLock {
 impl SessionLock {
     /// LevelStorageSource validates links before LevelStorageAccess opens its lock.
     pub fn acquire_validated(world: &Path, allowlist: &Path) -> Result<Self> {
+        Self::validate_links(world, allowlist)?;
+        Self::acquire(world)
+    }
+
+    /// File operations on a listed save must fail if it has already disappeared.
+    pub fn acquire_existing(world: &Path, allowlist: Option<&Path>) -> Result<Self> {
+        if let Some(allowlist) = allowlist {
+            Self::validate_links(world, allowlist)?;
+        }
+        Self::lock_existing(world)
+    }
+
+    fn validate_links(world: &Path, allowlist: &Path) -> Result<()> {
         let forbidden = crate::world_links::validate(world, allowlist)?;
         if !forbidden.is_empty() {
             let links = forbidden
@@ -196,12 +209,30 @@ impl SessionLock {
                 .join(", ");
             return Err(format!("World contains forbidden symbolic links: {links}").into());
         }
-        Self::acquire(world)
+        Ok(())
     }
 
     pub fn acquire(world: &Path) -> Result<Self> {
-        use std::io::Write;
         fs::create_dir_all(world)?;
+        Self::lock_existing(world)
+    }
+
+    /// Claim a new world without reusing a path another operation has occupied.
+    pub fn acquire_new(world: &Path, allowlist: &Path) -> Result<Self> {
+        if let Some(parent) = world.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        if let Err(error) = fs::create_dir(world) {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Err(format!("World folder already exists: {}", world.display()).into());
+            }
+            return Err(error.into());
+        }
+        Self::acquire_existing(world, Some(allowlist))
+    }
+
+    fn lock_existing(world: &Path) -> Result<Self> {
+        use std::io::Write;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -280,14 +311,10 @@ pub fn upgrade_older_world_with(
 /// first (`BackupStatus.FILE_FIXING_REQUIRED`). Saves of 1.8 and before have no
 /// DataVersion, read as -1.
 pub fn needs_file_fixes(world: &Path) -> bool {
-    let Some(root) = read_dat(&world.join("level.dat")) else {
-        return false;
-    };
-    let Some(data) = root.get("Data") else {
-        return false;
-    };
-    let version = number(data.get("DataVersion")).unwrap_or(-1);
-    i32::try_from(version).is_ok_and(horizon_world::datafix::files::requires_file_fixing)
+    read_dat(&world.join("level.dat"))
+        .as_ref()
+        .and_then(LevelMetadata::from_root)
+        .is_some_and(|metadata| metadata.needs_file_fixes())
 }
 /// `LevelVersion.parse`: the saved game version's name, this build's when the `Version`
 /// compound has no `Name`, and empty without a `Version` (`getWorldVersionName` then
@@ -302,27 +329,62 @@ fn saved_version_name(version: Option<&Tag>) -> String {
 /// the current `main` one). None when the world opens; otherwise the saved game
 /// version's name, empty when it has none (`getWorldVersionName`).
 pub fn incompatible_version(world: &Path) -> Option<String> {
-    let root = read_dat(&world.join("level.dat"))?;
-    let version = root.get("Data")?.get("Version");
-    let series = text(version.and_then(|v| v.get("Series"))).unwrap_or_else(|| "main".into());
-    if series == "main" {
-        return None;
-    }
-    Some(saved_version_name(version))
+    LevelMetadata::from_root(&read_dat(&world.join("level.dat"))?)?.incompatible_version()
 }
 /// `LevelSummary.backupStatus` DOWNGRADE: the saved game version's name (empty when it
-/// has none) when the world's `Version.Id` is newer than this build's `DataVersion`
-/// (`LevelVersion.parse`: no `Version` reads as 0, no `Id` as the current one).
+/// has none) when the world's `Version.Id` is newer than this build's `DataVersion`.
 pub fn downgraded_from(world: &Path) -> Option<String> {
-    let root = read_dat(&world.join("level.dat"))?;
-    let version = root.get("Data")?.get("Version");
-    let id = version.map_or(0, |v| {
-        number(v.get("Id")).unwrap_or_else(|| i64::from(DATA_VERSION))
-    });
-    if id <= i64::from(DATA_VERSION) {
-        return None;
+    LevelMetadata::from_root(&read_dat(&world.join("level.dat"))?)?.downgraded_from()
+}
+
+/// The world list and the full loader share these fields from level.dat.
+pub(crate) struct LevelMetadata<'a> {
+    pub(crate) data: &'a Tag,
+}
+
+impl<'a> LevelMetadata<'a> {
+    pub(crate) fn from_root(root: &'a Tag) -> Option<Self> {
+        let data @ Tag::Compound(_) = root.get("Data")? else {
+            return None;
+        };
+        Some(Self { data })
     }
-    Some(saved_version_name(version))
+
+    pub(crate) fn name(&self) -> String {
+        text(self.data.get("LevelName")).unwrap_or_else(|| "World".into())
+    }
+
+    pub(crate) fn game_type(&self) -> i64 {
+        number(self.data.get("GameType")).unwrap_or(0)
+    }
+
+    pub(crate) fn hardcore(&self) -> bool {
+        number(
+            self.data
+                .get("difficulty_settings")
+                .and_then(|d| d.get("hardcore")),
+        )
+        .is_some_and(|value| value != 0)
+    }
+
+    pub(crate) fn needs_file_fixes(&self) -> bool {
+        let version = number(self.data.get("DataVersion")).unwrap_or(-1);
+        i32::try_from(version).is_ok_and(horizon_world::datafix::files::requires_file_fixing)
+    }
+
+    pub(crate) fn incompatible_version(&self) -> Option<String> {
+        let version = self.data.get("Version");
+        let series = text(version.and_then(|v| v.get("Series"))).unwrap_or_else(|| "main".into());
+        (series != "main").then(|| saved_version_name(version))
+    }
+
+    pub(crate) fn downgraded_from(&self) -> Option<String> {
+        let version = self.data.get("Version");
+        let id = version.map_or(0, |v| {
+            number(v.get("Id")).unwrap_or_else(|| i64::from(DATA_VERSION))
+        });
+        (id > i64::from(DATA_VERSION)).then(|| saved_version_name(version))
+    }
 }
 /// `LevelStorageAccess.checkForLowDiskSpace`: under 64 MiB usable.
 pub const LOW_DISK_SPACE: u64 = 67_108_864;
@@ -1970,21 +2032,29 @@ impl RegionFiles {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum RegionAccess {
+    Read,
+    Write { create: bool },
+}
+
 /// The region file at `path` through the cache, which readers and the writer
 /// share, so a read never sees a header older than the sectors it points to.
-/// `create` makes a missing file (for a write); otherwise a missing file is
-/// `None`, until a write creates it.
+/// A read can use a cached miss. A writer rechecks it because clearing an
+/// existing chunk must either reach disk or report the I/O failure.
 fn cached_region(
     cache: &RegionCache,
     key: (i32, i32),
     path: &Path,
-    create: bool,
+    access: RegionAccess,
 ) -> Result<Option<Arc<Mutex<RegionFile>>>> {
+    let read = matches!(access, RegionAccess::Read);
+    let create = matches!(access, RegionAccess::Write { create: true });
     let mut cache = cache.lock().map_err(|_| "region cache poisoned")?;
     cache.clock += 1;
     let now = cache.clock;
     if let Some((cached, used)) = cache.regions.get_mut(&key)
-        && (cached.is_some() || !create)
+        && (cached.is_some() || read)
     {
         *used = now;
         return Ok(cached.clone());
@@ -1995,14 +2065,20 @@ fn cached_region(
     }
     // A file this process can't write (a read-only world) is still read.
     let region = match RegionFile::open_writable(path, create) {
-        Err(e) if !create && e.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(e)
+            if read
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+        {
             RegionFile::open(path)
         }
         other => other,
     };
     let region = match region {
         Ok(r) => Some(Arc::new(Mutex::new(r))),
-        Err(_) if !create => None,
+        Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
     cache.regions.insert(key, (region.clone(), now));
@@ -2036,10 +2112,12 @@ fn write_region_records(
         let path = region_path(root, folder, rx, rz);
         // Clearing chunks of a region that doesn't exist changes nothing.
         let create = list.iter().any(|(_, r)| r.is_some());
-        let Some(region) = cached_region(cache, (rx, rz), &path, create)? else {
+        let Some(region) = cached_region(cache, (rx, rz), &path, RegionAccess::Write { create })?
+        else {
             continue;
         };
         let mut region = region.lock().map_err(|_| "region file poisoned")?;
+        region.ensure_writable()?;
         let _writing = far_regions::writing(cache, (rx, rz));
         let mut changed = false;
         for (pos, record) in &list {
@@ -2160,9 +2238,9 @@ fn resolve_poi(
     cache: &RegionCache,
     (x, z): (i32, i32),
     record: &Record,
-) -> Option<Record> {
+) -> Result<Option<Record>> {
     let Record::Poi(chunk, tables, professions) = record else {
-        return Some(record.clone());
+        return Ok(Some(record.clone()));
     };
     let old = read_region_record(root, cache, "poi", x, z)
         .and_then(|old| {
@@ -2172,10 +2250,7 @@ fn resolve_poi(
             })
             .transpose()
         })
-        .unwrap_or_else(|e| {
-            log::warn!("Horizon: could not read the poi record of chunk {x} {z}: {e}");
-            None
-        });
+        .map_err(|e| format!("could not read the poi record of chunk {x} {z}: {e}"))?;
     let tag = match (encode_poi(chunk, tables, professions.as_deref()), old) {
         (Some(mut tag), Some(old)) => {
             keep_claims(&mut tag, &old);
@@ -2183,9 +2258,9 @@ fn resolve_poi(
         }
         (Some(tag), None) => tag,
         (None, Some(_)) => poi_root(Compound::new()),
-        (None, None) => return None,
+        (None, None) => return Ok(None),
     };
-    Some(Record::Tag(Arc::new(tag)))
+    Ok(Some(Record::Tag(Arc::new(tag))))
 }
 fn read_region_record(
     root: &Path,
@@ -2196,7 +2271,7 @@ fn read_region_record(
 ) -> Result<Option<NamedTag>> {
     let key = (x >> 5, z >> 5);
     let path = region_path(root, folder, key.0, key.1);
-    let Some(region) = cached_region(cache, key, &path, false)? else {
+    let Some(region) = cached_region(cache, key, &path, RegionAccess::Read)? else {
         return Ok(None);
     };
     let record = region
@@ -2985,18 +3060,40 @@ pub fn read_dat(path: &Path) -> Option<Tag> {
 }
 /// `read_dat`, with why the file did not read.
 fn try_read_dat(path: &Path) -> std::result::Result<Tag, DatIssue> {
-    let bytes = fs::read(path).map_err(|e| match e.kind() {
+    let issue = |error: std::io::Error| match error.kind() {
         std::io::ErrorKind::NotFound => DatIssue::Missing,
-        _ => DatIssue::Unreadable(e.to_string()),
-    })?;
-    let raw = match Compression::Gzip.decode(&bytes, Limits::saved().max_bytes) {
-        Ok(raw) => raw,
-        Err(_) => bytes,
+        _ => DatIssue::Unreadable(error.to_string()),
     };
+    if !fs::metadata(path).map_err(issue)?.is_file() {
+        return Err(DatIssue::Unreadable(
+            "Expected a regular saved data file".into(),
+        ));
+    }
+    let file = fs::File::open(path).map_err(issue)?;
+    let raw = read_dat_bytes(std::io::BufReader::new(file), Limits::saved().max_bytes)
+        .map_err(issue)?;
     crate::recipe_book::read_saved(&raw)
         .map(|(named, _)| named.tag)
         .map_err(|e| DatIssue::Unreadable(e.to_string()))
 }
+// Read either form directly from disk. A gzip lead byte cannot start raw NBT.
+fn read_dat_bytes(mut file: impl std::io::BufRead, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let cap = limit as u64 + 1;
+    let mut raw = Vec::new();
+    if file.fill_buf()?.first() == Some(&0x1f) {
+        flate2::bufread::MultiGzDecoder::new(file)
+            .take(cap)
+            .read_to_end(&mut raw)?;
+    } else {
+        file.take(cap).read_to_end(&mut raw)?;
+    }
+    if raw.len() > limit {
+        return Err(std::io::Error::other("saved data exceeds its size limit"));
+    }
+    Ok(raw)
+}
+
 /// What `LevelStorageAccess.collectIssues` finds wrong with a level.dat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DatIssue {
@@ -3009,18 +3106,29 @@ pub enum DatIssue {
 /// `old`) can't be read as the world's level data, `None` when it can.
 pub fn level_dat_issue(dir: &Path, old: bool) -> Option<DatIssue> {
     let file = if old { "level.dat_old" } else { "level.dat" };
-    match try_read_dat(&dir.join(file)) {
-        Ok(root) if matches!(root.get("Data"), Some(Tag::Compound(_))) => None,
-        Ok(_) => Some(DatIssue::Unreadable("Invalid root tag".into())),
-        Err(issue) => Some(issue),
+    try_read_level_dat(&dir.join(file)).err()
+}
+
+fn try_read_level_dat(path: &Path) -> std::result::Result<Tag, DatIssue> {
+    let root = try_read_dat(path)?;
+    if LevelMetadata::from_root(&root).is_none() {
+        return Err(DatIssue::Unreadable("Invalid root tag".into()));
     }
+    Ok(root)
 }
 /// `WorldOpenFlows.openWorldLoadLevelData`: what keeps `world`'s level data from reading, which
 /// opens RecoverWorldDataScreen instead of the world. A folder with neither level.dat nor
 /// level.dat_old is a world not made yet, not a broken one.
 pub fn level_data_needs_recovery(world: &Path) -> Option<DatIssue> {
     match level_dat_issue(world, false)? {
-        DatIssue::Missing if !world.join("level.dat_old").exists() => None,
+        DatIssue::Missing
+            if matches!(
+                fs::metadata(world.join("level.dat_old")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) =>
+        {
+            None
+        }
         issue => Some(issue),
     }
 }
@@ -3030,18 +3138,68 @@ pub fn level_data_needs_recovery(world: &Path) -> Option<DatIssue> {
 /// success even when level.dat_old could not be moved in; here the broken
 /// level.dat goes back and the failure is reported.
 pub fn restore_level_data_from_old(dir: &Path) -> bool {
-    let (current, latest) = (dir.join("level.dat"), dir.join("level.dat_old"));
-    let backup = dir.join(format!("level.dat_corrupted_{}", backup_stamp()));
-    if current.exists() && fs::rename(&current, &backup).is_err() {
+    // Recheck under the caller's session lock. The state displayed before a
+    // backup or confirmation may no longer describe the files on disk.
+    if level_dat_issue(dir, false).is_none() || level_dat_issue(dir, true).is_some() {
         return false;
     }
+    restore_level_data_from_old_at(dir, &backup_stamp())
+}
+
+fn restore_level_data_from_old_at(dir: &Path, stamp: &str) -> bool {
+    let (current, latest) = (dir.join("level.dat"), dir.join("level.dat_old"));
+    let backup = match move_unreadable_level_data(&current, stamp) {
+        Ok(backup) => backup,
+        Err(error) => {
+            log::warn!("Horizon: could not preserve unreadable level data: {error}");
+            return false;
+        }
+    };
     if fs::rename(&latest, &current).is_err() {
-        if backup.exists() {
-            let _ = fs::rename(&backup, &current);
+        // Roll back only the file moved by this attempt. A previous
+        // recovery may have left another backup with the same timestamp.
+        if let Some(backup) = backup
+            && let Err(error) = fs::rename(&backup, &current)
+        {
+            log::warn!(
+                "Horizon: could not put level data back from {}: {error}",
+                backup.display()
+            );
         }
         return false;
     }
     true
+}
+
+/// Keep each failed level.dat, even if multiple repairs happen in one second.
+fn move_unreadable_level_data(path: &Path, stamp: &str) -> std::io::Result<Option<PathBuf>> {
+    move_unreadable_dat(path, &format!("level.dat_corrupted_{stamp}"), "")
+}
+
+fn move_unreadable_dat(path: &Path, name: &str, suffix: &str) -> std::io::Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Err(std::io::ErrorKind::IsADirectory.into()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    for sequence in 0u32.. {
+        let filename = if sequence == 0 {
+            format!("{name}{suffix}")
+        } else {
+            format!("{name}_{sequence}{suffix}")
+        };
+        let backup = path.with_file_name(filename);
+        match fs::symlink_metadata(&backup) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::rename(path, &backup)?;
+                return Ok(Some(backup));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 /// `FileNameDateFormatter`: the time in the names of backed-up unreadable files.
 fn backup_stamp() -> String {
@@ -3052,78 +3210,96 @@ fn backup_stamp() -> String {
 /// (`restoreLevelDataFromOld`). Whether it did; `false` leaves the world as it was, for the
 /// caller to refuse (both files broken, or nothing to fall back to).
 pub fn fall_back_to_level_dat_old(world: &Path) -> bool {
-    level_dat_issue(world, false).is_some()
-        && world.join("level.dat_old").exists()
-        && level_dat_issue(world, true).is_none()
-        && restore_level_data_from_old(world)
+    restore_level_data_from_old(world)
 }
 /// `LevelStorageSource.readLevelDataTagFixed`: level.dat, else level.dat_old.
 fn read_level_dat(dir: &Path) -> Option<Tag> {
-    read_dat(&dir.join("level.dat")).or_else(|| read_dat(&dir.join("level.dat_old")))
+    try_read_level_dat(&dir.join("level.dat"))
+        .or_else(|_| try_read_level_dat(&dir.join("level.dat_old")))
+        .ok()
 }
 /// `restoreLevelDataFromOld`: an unreadable level.dat is kept as
 /// `level.dat_corrupted_<time>` and level.dat_old takes its place, so the next
 /// write does not bury either file.
-fn restore_level_dat(dir: &Path) {
-    let path = dir.join("level.dat");
-    if read_dat(&path).is_some() {
-        return;
+fn restore_level_dat(dir: &Path) -> Result<()> {
+    if level_dat_issue(dir, false).is_none() {
+        return Ok(());
     }
-    if path.exists() {
-        let _ = fs::rename(
-            &path,
-            dir.join(format!("level.dat_corrupted_{}", backup_stamp())),
-        );
+    if level_dat_issue(dir, true).is_none() {
+        if !restore_level_data_from_old(dir) {
+            return Err("could not restore level.dat from level.dat_old".into());
+        }
+    } else {
+        move_unreadable_level_data(&dir.join("level.dat"), &backup_stamp())
+            .map_err(|error| format!("could not preserve unreadable level data: {error}"))?;
     }
-    let old = dir.join("level.dat_old");
-    if read_dat(&old).is_some() {
-        let _ = fs::rename(old, path);
-    }
+    Ok(())
 }
-/// `PlayerDataStorage.backup`: a player file that fails to load is copied to
-/// `<uuid>_corrupted_<time>.dat` before it is written over.
-fn back_up_unreadable_player(path: &Path) {
-    if path.is_file()
-        && read_dat(path).is_none()
-        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-    {
-        let _ = fs::copy(
-            path,
-            path.with_file_name(format!("{stem}_corrupted_{}.dat", backup_stamp())),
-        );
-    }
-}
-/// Write a gzip NBT file the way vanilla does (`<name>_new`, keep `_old`).
+/// Write a gzip NBT file and keep the previous version as `_old`.
 pub fn write_dat(path: &Path, tag: Tag) -> Result<()> {
-    write_dat_as(path, tag, false)
+    write_dat_as(path, tag, false, publish_dat)
 }
 
 /// [`write_dat`], synced to the disk: the new file before it is renamed into place, and the
 /// folder after, so a power loss leaves the old file or the new one. A hand-over's commit
 /// point (`player-confirm`) replies only once its files are.
 pub fn write_dat_durable(path: &Path, tag: Tag) -> Result<()> {
-    write_dat_as(path, tag, true)
+    write_dat_as(path, tag, true, publish_dat)
 }
 
-/// `bytes` written to `path` through `<name>_new` and a rename, synced to the disk as
-/// [`write_dat_durable`] syncs: never a half-written file in place.
+/// Persist a player while retaining the last good copy if the current save is damaged.
+pub fn write_player_dat(path: &Path, tag: Tag, durable: bool) -> Result<()> {
+    write_dat_as(path, tag, durable, publish_player_dat)
+}
+
+/// Publish synced bytes from a private sibling file. Concurrent writers
+/// each stage a complete file, and only the final rename replaces the destination.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let file = path.file_name().and_then(|n| n.to_str()).unwrap_or("data");
-    let temporary = path.with_file_name(format!("{file}_new"));
-    write_synced(&temporary, bytes)?;
-    fs::rename(&temporary, path)?;
+    with_staged_save(path, bytes, true, |temporary| fs::rename(temporary, path))?;
     sync_folder(path)?;
     Ok(())
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+fn with_staged_save(
+    path: &Path,
+    bytes: &[u8],
+    durable: bool,
+    publish: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::{ErrorKind, Write};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let (temporary, mut file) = loop {
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_file_name(format!(
+            ".horizon-save-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+        }
+        drop(file);
+        publish(&temporary)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// The folder of `path` synced, so that a rename into it is on the disk (POSIX; Windows has
@@ -3138,10 +3314,12 @@ fn sync_folder(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_dat_as(path: &Path, tag: Tag, durable: bool) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
+fn write_dat_as(
+    path: &Path,
+    tag: Tag,
+    durable: bool,
+    publish: impl FnOnce(&Path, &Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let bytes = nbt::write_named(
         &NamedTag {
             name: "".into(),
@@ -3155,26 +3333,79 @@ fn write_dat_as(path: &Path, tag: Tag, durable: bool) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("data.dat");
-    let temporary = path.with_file_name(format!("{file}_new"));
-    if durable {
-        write_synced(&temporary, &compressed)?;
-    } else {
-        fs::write(&temporary, compressed)?;
-    }
-    if path.exists() {
-        let old = match file.strip_suffix(".dat") {
-            Some(stem) => path.with_file_name(format!("{stem}.dat_old")),
-            None => path.with_file_name(format!("{file}_old")),
-        };
-        // Util.safeReplaceFile: no backup, no replacement.
-        fs::rename(path, old).map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    fs::rename(temporary, path)?;
+    let old = match file.strip_suffix(".dat") {
+        Some(stem) => path.with_file_name(format!("{stem}.dat_old")),
+        None => path.with_file_name(format!("{file}_old")),
+    };
+    with_staged_save(path, &compressed, durable, |temporary| {
+        publish(path, temporary, &old)
+    })?;
     if durable {
         sync_folder(path)?;
     }
     Ok(())
 }
+
+fn publish_player_dat(path: &Path, temporary: &Path, old: &Path) -> std::io::Result<()> {
+    if !path.is_file() || read_dat(path).is_some() {
+        return publish_dat(path, temporary, old);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| std::io::Error::other("Invalid player save filename"))?;
+    let name = format!("{stem}_corrupted_{}", backup_stamp());
+    let preserved = move_unreadable_dat(path, &name, ".dat")?;
+    // With the damaged file set aside, the existing recovery copy stays intact.
+    let result = publish_dat(path, temporary, old);
+    if result.is_err()
+        && let Some(preserved) = preserved
+        && let Err(restore) = fs::rename(&preserved, path)
+    {
+        log::error!(
+            "Horizon: could not restore damaged player data from {}: {restore}",
+            preserved.display()
+        );
+    }
+    result
+}
+
+/// Rotate the previous save and publish the staged one. Restore the previous
+/// save if the final rename fails after the rotation.
+fn publish_dat(path: &Path, temporary: &Path, old: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    // Refuse a missing or invalid staged file before touching either save.
+    if !fs::symlink_metadata(temporary)?.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "staged save is not a regular file",
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Err(Error::from(ErrorKind::IsADirectory)),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let backed_up = match fs::rename(path, old) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !path.exists() => false,
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = fs::rename(temporary, path) {
+        if backed_up && let Err(restore) = fs::rename(old, path) {
+            log::error!(
+                "Horizon: could not restore {} from {} after failed save: {restore}",
+                path.display(),
+                old.display()
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 mod saved_data;
 use saved_data::{read_saved_data, saved_data_path, write_saved_data};
 /// The world's generator settings: world_gen_settings.dat (26.3) or
@@ -3625,13 +3856,16 @@ impl Level {
         root: Tag,
         registry: std::sync::Arc<crate::gamerules::RuleRegistry>,
     ) -> Option<Self> {
-        let data = root.get("Data")?;
+        let metadata = LevelMetadata::from_root(&root)?;
+        let data = metadata.data;
+        let game_type = metadata.game_type();
         let n = |t: Option<&Tag>| number(t).unwrap_or(0);
         let mut level = Self {
             rule_registry: registry,
-            name: text(data.get("LevelName")).unwrap_or_else(|| "World".into()),
-            creative: n(data.get("GameType")) == 1,
-            game_mode: n(data.get("GameType")) as i32,
+            name: metadata.name(),
+            creative: game_type == 1,
+            game_mode: game_type as i32,
+            hardcore: metadata.hardcore(),
             time: n(data.get("Time")),
             health: 20.0,
             food: 20,
@@ -3644,7 +3878,6 @@ impl Level {
         level.read_world_spawn(data);
         if let Some(d) = data.get("difficulty_settings") {
             level.difficulty = text(d.get("difficulty")).unwrap_or_else(|| "normal".into());
-            level.hardcore = n(d.get("hardcore")) != 0;
             level.difficulty_locked = n(d.get("locked")) != 0;
         }
         level.allow_commands = Some(n(data.get("allowCommands")) != 0);
@@ -4167,11 +4400,16 @@ impl Level {
     }
     /// Write every file; a world without a player UUID gets a random one.
     pub fn write(&mut self, dir: &Path) -> Result<()> {
-        self.write_internal(dir, true, false)
+        self.write_internal(dir, true, false, false)
     }
     /// Dedicated servers save connected players separately.
     pub fn write_without_player(&mut self, dir: &Path) -> Result<()> {
-        self.write_internal(dir, false, false)
+        self.write_internal(dir, false, false, false)
+    }
+    /// A crash's save that must leave the player as last saved: no player file, and a legacy
+    /// `Data.Player` stays, since before the first normal save it is the owner's only copy.
+    pub fn write_keeping_player(&mut self, dir: &Path) -> Result<()> {
+        self.write_internal(dir, false, false, true)
     }
     /// The temporary world a Realms upload packs
     /// (`RealmsCreateWorldFlow.createTemporaryWorldFolder`): level.dat as
@@ -4179,7 +4417,7 @@ impl Level {
     /// generation and game rules, and no player file or weather/clocks the server makes
     /// on its own. The caller writes the data packs and removes the folder.
     pub fn write_upload(&mut self, dir: &Path) -> Result<()> {
-        self.write_internal(dir, false, true)
+        self.write_internal(dir, false, true, false)
     }
 
     /// The player's file alone, `players/data/<singleplayer_uuid>.dat`
@@ -4190,13 +4428,18 @@ impl Level {
             .join("players")
             .join("data")
             .join(format!("{}.dat", uuid_text(uuid)));
-        back_up_unreadable_player(&player_file);
-        write_dat(&player_file, self.player_tag())
+        write_player_dat(&player_file, self.player_tag(), false)
     }
 
-    fn write_internal(&mut self, dir: &Path, write_player: bool, upload: bool) -> Result<()> {
+    fn write_internal(
+        &mut self,
+        dir: &Path,
+        write_player: bool,
+        upload: bool,
+        keep_legacy_player: bool,
+    ) -> Result<()> {
         fs::create_dir_all(dir)?;
-        restore_level_dat(dir);
+        restore_level_dat(dir)?;
         let mut root = compound_or_empty(read_dat(&dir.join("level.dat")));
         let legacy = root
             .get("Data")
@@ -4238,6 +4481,9 @@ impl Level {
                 "CustomBossEvents",
                 "DragonFight",
             ] {
+                if keep_legacy_player && key == "Player" {
+                    continue;
+                }
                 map.remove(&JavaString::from(key));
             }
         }
@@ -4998,7 +5244,8 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
             .save
             .save_protos(saved, self.registry.registry, &self.biomes)
         {
-            log::warn!("Horizon: failed to save proto chunks: {e}");
+            self.save
+                .note_snapshot_failure(format!("failed to save proto chunks: {e}"));
         }
     }
     fn save_finished(&self, mut chunk: Chunk) {
@@ -5012,7 +5259,8 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
             .save_later(&[Arc::new(chunk)], self.registry.registry, &self.biomes)
             .and_then(|_| self.save.save_entities_later(vec![(key, entities)]));
         if let Err(e) = saved {
-            log::warn!("Horizon: failed to save chunk {} {}: {e}", key.0, key.1);
+            self.save
+                .note_snapshot_failure(format!("failed to save chunk {} {}: {e}", key.0, key.1));
         }
     }
     fn decorates(&self) -> bool {
@@ -5271,6 +5519,214 @@ mod tests {
         // A readable level.dat is left alone.
         assert!(!fall_back_to_level_dat_old(&world));
         let _ = fs::remove_dir_all(&world);
+    }
+
+    #[test]
+    fn a_decodable_but_invalid_level_root_does_not_hide_the_backup() {
+        for broken in [
+            Tag::compound([("Other", Tag::Int(1))]),
+            Tag::compound([("Data", Tag::Int(1))]),
+        ] {
+            let world = tempfile::tempdir().unwrap();
+            let world = world.path();
+            let current = world.join("level.dat");
+            let old = world.join("level.dat_old");
+            write_dat(
+                &old,
+                Tag::compound([(
+                    "Data",
+                    Tag::compound([("LevelName", Tag::String("Recovered world".into()))]),
+                )]),
+            )
+            .unwrap();
+            write_dat(&current, broken).unwrap();
+            let before = fs::read(&current).unwrap();
+            assert!(matches!(
+                level_dat_issue(world, false),
+                Some(DatIssue::Unreadable(_))
+            ));
+            assert!(Level::read_summary(world).is_none());
+            assert_eq!(Level::read(world).unwrap().name, "Recovered world");
+            assert_eq!(fs::read(&current).unwrap(), before);
+            assert!(old.is_file());
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_the_files_if_the_current_or_backup_changed() {
+        let valid = |name: &str| {
+            Tag::compound([(
+                "Data",
+                Tag::compound([("LevelName", Tag::String(name.into()))]),
+            )])
+        };
+        for current_repaired in [false, true] {
+            let world = tempfile::tempdir().unwrap();
+            let dir = world.path();
+            let current = dir.join("level.dat");
+            let old = dir.join("level.dat_old");
+            if current_repaired {
+                write_dat(&current, valid("Repaired")).unwrap();
+                write_dat(&old, valid("Older")).unwrap();
+            } else {
+                fs::write(&current, b"original damaged data").unwrap();
+                write_dat(&old, Tag::compound([("Data", Tag::Int(1))])).unwrap();
+            }
+            let current_before = fs::read(&current).unwrap();
+            let old_before = fs::read(&old).unwrap();
+
+            assert!(!restore_level_data_from_old(dir));
+            assert_eq!(fs::read(&current).unwrap(), current_before);
+            assert_eq!(fs::read(&old).unwrap(), old_before);
+            assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn same_second_level_recoveries_keep_both_damaged_files() {
+        let world = tempfile::tempdir().unwrap();
+        let world = world.path();
+        let current = world.join("level.dat");
+        let old = world.join("level.dat_old");
+        let stamp = "2026-11-17_17-00-00";
+        for damaged in [b"first", b"again"] {
+            fs::write(&current, damaged).unwrap();
+            fs::write(&old, b"recovered data").unwrap();
+            assert!(restore_level_data_from_old_at(world, stamp));
+        }
+        assert_eq!(
+            fs::read(world.join(format!("level.dat_corrupted_{stamp}"))).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            fs::read(world.join(format!("level.dat_corrupted_{stamp}_1"))).unwrap(),
+            b"again"
+        );
+        assert_eq!(fs::read(&current).unwrap(), b"recovered data");
+    }
+
+    #[test]
+    fn failed_level_recovery_rolls_back_only_its_own_backup() {
+        let world = tempfile::tempdir().unwrap();
+        let world = world.path();
+        let current = world.join("level.dat");
+        let stamp = "2026-11-17_17-00-00";
+        let earlier = world.join(format!("level.dat_corrupted_{stamp}"));
+        fs::write(&earlier, b"previous repair").unwrap();
+
+        assert!(!restore_level_data_from_old_at(world, stamp));
+        assert!(!current.exists());
+        fs::write(&current, b"current data").unwrap();
+        assert!(!restore_level_data_from_old_at(world, stamp));
+        assert_eq!(fs::read(&current).unwrap(), b"current data");
+        assert_eq!(fs::read(&earlier).unwrap(), b"previous repair");
+    }
+
+    #[test]
+    fn nbt_saves_use_private_staging_and_keep_the_previous_version() {
+        let world = tempfile::tempdir().unwrap();
+        let file = world.path().join("level.dat");
+        let legacy_stage = world.path().join("level.dat_new");
+        let backup = world.path().join("level.dat_old");
+        let tag = |time| Tag::compound([("Data", Tag::compound([("Time", Tag::Long(time))]))]);
+
+        write_dat(&file, tag(1)).unwrap();
+        fs::create_dir(&legacy_stage).unwrap();
+        fs::write(legacy_stage.join("keep"), b"fixture").unwrap();
+        write_dat_durable(&file, tag(2)).unwrap();
+
+        assert_eq!(read_dat(&file), Some(tag(2)));
+        assert_eq!(read_dat(&backup), Some(tag(1)));
+        assert_eq!(fs::read(legacy_stage.join("keep")).unwrap(), b"fixture");
+        assert_eq!(fs::read_dir(world.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn durable_metadata_retries_past_an_old_staging_entry() {
+        let world = tempfile::tempdir().unwrap();
+        let current = world.path().join("datapacks.json");
+        let old_stage = world.path().join("datapacks.json_new");
+        fs::write(&current, b"previous metadata").unwrap();
+        fs::create_dir(&old_stage).unwrap();
+        fs::write(old_stage.join("keep"), b"unrelated").unwrap();
+
+        write_durable(&current, b"new metadata").unwrap();
+        assert_eq!(fs::read(&current).unwrap(), b"new metadata");
+        assert_eq!(fs::read(old_stage.join("keep")).unwrap(), b"unrelated");
+        assert_eq!(fs::read_dir(world.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn level_save_stops_if_recovery_cannot_preserve_the_current_entry() {
+        let world = tempfile::tempdir().unwrap();
+        let current = world.path().join("level.dat");
+        let backup = world.path().join("level.dat_old");
+        fs::create_dir(&current).unwrap();
+        fs::write(current.join("keep"), b"fixture").unwrap();
+        write_dat(
+            &backup,
+            Tag::compound([("Data", Tag::compound([("Time", Tag::Long(1))]))]),
+        )
+        .unwrap();
+        let previous = fs::read(&backup).unwrap();
+
+        assert!(Level::default().write(world.path()).is_err());
+        assert_eq!(fs::read(current.join("keep")).unwrap(), b"fixture");
+        assert_eq!(fs::read(&backup).unwrap(), previous);
+    }
+
+    #[test]
+    fn failed_dat_publication_restores_the_current_save() {
+        let world = tempfile::tempdir().unwrap();
+        let current = world.path().join("level.dat");
+        let backup = world.path().join("level.dat_old");
+        let staged = world.path().join("level.dat_new");
+        fs::write(&current, b"last good save").unwrap();
+        fs::write(&backup, b"older save").unwrap();
+
+        // A missing stage cannot consume the previous backup.
+        assert!(publish_dat(&current, &staged, &backup).is_err());
+        assert_eq!(fs::read(&current).unwrap(), b"last good save");
+        assert_eq!(fs::read(&backup).unwrap(), b"older save");
+
+        fs::write(&staged, b"new save").unwrap();
+        publish_dat(&current, &staged, &backup).unwrap();
+        assert_eq!(fs::read(&current).unwrap(), b"new save");
+        assert_eq!(fs::read(&backup).unwrap(), b"last good save");
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn save_publication_does_not_move_a_directory_at_the_current_path() {
+        let world = tempfile::tempdir().unwrap();
+        let current = world.path().join("level.dat");
+        let backup = world.path().join("level.dat_old");
+        let staged = world.path().join("level.dat_new");
+        fs::create_dir(&current).unwrap();
+        fs::write(current.join("keep"), b"directory contents").unwrap();
+        fs::write(&staged, b"new save").unwrap();
+
+        let error = publish_dat(&current, &staged, &backup).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
+        assert_eq!(
+            fs::read(current.join("keep")).unwrap(),
+            b"directory contents"
+        );
+        assert!(!backup.exists());
+        assert_eq!(fs::read(&staged).unwrap(), b"new save");
+    }
+
+    #[test]
+    fn a_failed_first_dat_publication_leaves_an_existing_backup_alone() {
+        let world = tempfile::tempdir().unwrap();
+        let current = world.path().join("level.dat");
+        let backup = world.path().join("level.dat_old");
+        let staged = world.path().join("level.dat_new");
+        fs::write(&backup, b"previous save").unwrap();
+
+        assert!(publish_dat(&current, &staged, &backup).is_err());
+        assert!(!current.exists());
+        assert_eq!(fs::read(&backup).unwrap(), b"previous save");
     }
 
     #[test]
@@ -5671,6 +6127,365 @@ mod tests {
             .expect("referenced saved start");
         assert_eq!(restored.save(), original.save());
         assert_eq!(format!("{restored:?}"), format!("{original:?}"));
+    }
+
+    /// The three scattered-feature starts (desert pyramid, jungle temple,
+    /// buried treasure) are generated by the worldgen code, written through
+    /// the level's own chunk writer, read back with its reader, and the
+    /// generation that continues from them places the same chests, traps and
+    /// loot tables. A saved start that loses its state would regenerate the
+    /// loot or the buried-treasure search.
+    #[test]
+    fn saved_scattered_starts_reload_chests_traps_and_continue_placement() {
+        use super::*;
+        use crate::streaming::Proto;
+        use crate::vanillagen::{TerrainResources, VanillaTerrain};
+        use horizon_world::native_load_context::DataLoadOrigin;
+        let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        if !root.join("worldgen/world_presets.json").exists() {
+            eprintln!("skipping: no worldgen bundle at {}", root.display());
+            return;
+        }
+        let assets = Arc::new(crate::assets::Assets::load(&root).expect("assets"));
+        let biomes = Arc::new(
+            Biomes::load(&horizon_assets::resource_source::ResourceRoot::directory(
+                root.clone(),
+            ))
+            .expect("biomes"),
+        );
+        let item_data = crate::test_resources::item_data(&root, DataLoadOrigin::ServerDataLoad)
+            .expect("item data");
+        let worldgen = root.join("worldgen");
+        let resources = TerrainResources {
+            data: None,
+            dir: &worldgen,
+            registry: assets.registry,
+            biomes: &biomes,
+            item_data: &item_data,
+        };
+        // The names, their placed loot, and the chest/trap flags a placed
+        // start carries.
+        let specs: [(&str, &[(&str, usize)], &[&str]); 3] = [
+            (
+                "minecraft:desert_pyramid",
+                &[("minecraft:chests/desert_pyramid", 4)],
+                &[
+                    "hasPlacedChest0",
+                    "hasPlacedChest1",
+                    "hasPlacedChest2",
+                    "hasPlacedChest3",
+                ],
+            ),
+            (
+                "minecraft:jungle_pyramid",
+                &[
+                    ("minecraft:chests/jungle_temple", 2),
+                    ("minecraft:chests/jungle_temple_dispenser", 2),
+                ],
+                &[
+                    "placedMainChest",
+                    "placedHiddenChest",
+                    "placedTrap1",
+                    "placedTrap2",
+                ],
+            ),
+            (
+                "minecraft:buried_treasure",
+                &[("minecraft:chests/buried_treasure", 1)],
+                &[],
+            ),
+        ];
+        let inner = Arc::new(VanillaTerrain::new(resources, 1234).expect("terrain"));
+        let start_chunk = |name: &str| -> ChunkPos {
+            let names = [name.to_owned()];
+            // A placement-set start, as `/locate structure` and an exploration
+            // map find one: generated by the worldgen code, not written here.
+            for radius in [64, 256, 1024] {
+                if let Some((found, at)) = inner.locate(&names, [0, 64, 0], radius) {
+                    assert_eq!(found, name);
+                    return ChunkPos::new(at[0] >> 4, at[2] >> 4);
+                }
+            }
+            panic!("no {name} start near the origin");
+        };
+        let loot_table = |tag: &Tag| -> Option<String> {
+            let Tag::Compound(map) = tag else { return None };
+            let Tag::String(table) = map.get(&"LootTable".into())? else {
+                return None;
+            };
+            Some(table.to_string_lossy())
+        };
+        let entities = |list: &[Tag], table: &str| -> Vec<Tag> {
+            list.iter()
+                .filter(|tag| loot_table(tag).as_deref() == Some(table))
+                .cloned()
+                .collect()
+        };
+        let flag = |tag: &Compound, key: &str| -> bool {
+            matches!(tag.get(&key.into()), Some(Tag::Byte(v)) if *v != 0)
+        };
+        // The dimensions, settled height and chest/trap flags are the first
+        // piece's fields, not the start's.
+        fn piece_tag(start: &Compound) -> &Compound {
+            match start.get(&"Children".into()) {
+                Some(Tag::List(children)) => match children.first() {
+                    Some(Tag::Compound(piece)) => piece,
+                    _ => panic!("start has a piece"),
+                },
+                _ => panic!("start has children"),
+            }
+        }
+        let raw_start = |proto: &SavedProto, name: &str| -> Compound {
+            match proto
+                .column
+                .saved_structure_starts()
+                .and_then(|starts| starts.get(&name.into()).cloned())
+            {
+                Some(Tag::Compound(map)) => map,
+                other => panic!("{name}: no saved start: {other:?}"),
+            }
+        };
+        let typed_start = |proto: &SavedProto, name: &str| -> Compound {
+            match proto
+                .column
+                .structure_starts
+                .iter()
+                .find(|start| start.name == name)
+                .and_then(|start| start.save())
+            {
+                Some(Tag::Compound(map)) => map,
+                other => panic!("{name}: no generated start: {other:?}"),
+            }
+        };
+        let save_dir = |which: &str, index: usize| -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "horizon-saved-scattered-{which}-{}-{index}",
+                std::process::id()
+            ))
+        };
+        let write_protos = |dir: &Path, protos: Vec<SavedProto>| {
+            let save = SaveDir::new(dir.to_path_buf(), LevelShape::OVERWORLD);
+            let _ = save.tables.set(Arc::new(SaveTables::new(&assets)));
+            save.save_protos(protos, assets.registry, &biomes)
+                .expect("save proto chunks");
+            save.flush().expect("flush");
+        };
+        for (index, (name, loot, flags)) in specs.into_iter().enumerate() {
+            let at = start_chunk(name);
+            let (sx, sz) = (at.x, at.z);
+            // The region at STATUS terrain: generation has made the start,
+            // nothing has been placed yet.
+            let mut worker = inner.worker();
+            let terrain: [Proto; 9] = std::array::from_fn(|i| {
+                inner.proto(&mut worker, sx + i as i32 % 3 - 1, sz + i as i32 / 3 - 1)
+            });
+            let before_region: Vec<SavedProto> = terrain
+                .iter()
+                .map(|proto| inner.saved_proto(proto).expect("proto"))
+                .collect();
+            let before = typed_start(&before_region[4], name);
+            let start = before_region[4]
+                .column
+                .structure_starts
+                .iter()
+                .find(|start| start.name == name)
+                .unwrap_or_else(|| panic!("{name} is the start of its chunk"));
+            let bounds = start
+                .pieces
+                .iter()
+                .map(|piece| piece.bounding_box())
+                .reduce(|mut a, b| {
+                    a.encapsulate(&b);
+                    a
+                })
+                .expect("pieces");
+            // Save the proto chunks and read the same record back. The
+            // start is marked referenced as an exploration map that found it
+            // would: a regenerated start has no references, a loaded one does.
+            let mut before = before;
+            before.insert("references".into(), Tag::Int(1));
+            let first = save_dir("first", index);
+            let save = SaveDir::new(first.clone(), LevelShape::OVERWORLD);
+            let _ = save.tables.set(Arc::new(SaveTables::new(&assets)));
+            let tables = save.tables.get().cloned().expect("save tables");
+            let mut records = Vec::new();
+            for (i, proto) in before_region.iter().enumerate() {
+                let mut root = encode_proto(
+                    proto,
+                    assets.registry,
+                    &biomes,
+                    Some(tables.as_ref()),
+                    LevelShape::OVERWORLD,
+                );
+                if i == 4 {
+                    let Tag::Compound(root) = &mut root.tag else {
+                        panic!("{name}: root")
+                    };
+                    let Tag::Compound(structures) =
+                        root.get_mut(&"structures".into()).expect("structures")
+                    else {
+                        panic!("{name}: structures")
+                    };
+                    let Tag::Compound(starts) =
+                        structures.get_mut(&"starts".into()).expect("starts")
+                    else {
+                        panic!("{name}: starts")
+                    };
+                    let Tag::Compound(start) = starts.get_mut(&name.into()).expect("start") else {
+                        panic!("{name}: start")
+                    };
+                    start.insert("references".into(), Tag::Int(1));
+                }
+                records.push(((proto.column.x, proto.column.z), Some(root)));
+            }
+            save.write_records("region", records, true)
+                .expect("write saved proto chunks");
+            drop(save);
+            let reader = SaveDir::new(first.clone(), LevelShape::OVERWORLD);
+            let _ = reader.tables.set(Arc::new(SaveTables::new(&assets)));
+            let loaded = reader
+                .load_proto(sx, sz, assets.registry, &biomes)
+                .expect("saved proto chunk");
+            assert!(!loaded.decorated, "{name}: saved before decoration");
+            assert_eq!(
+                raw_start(&loaded, name),
+                before,
+                "{name}: the saved start reads back before generation continues"
+            );
+            // A fresh generator over the save continues the statuses: the
+            // saved start is loaded and its pieces place chests and traps.
+            let reopened = Arc::new(VanillaTerrain::new(resources, 1234).expect("terrain"));
+            let generator = Persistent {
+                inner: reopened.clone(),
+                save: Arc::new(reader),
+                registry: assets.clone(),
+                biomes: biomes.clone(),
+            };
+            let mut worker = generator.worker();
+            let mut region: [Proto; 9] = std::array::from_fn(|i| {
+                generator.proto(&mut worker, sx + i as i32 % 3 - 1, sz + i as i32 / 3 - 1)
+            });
+            generator.decorate(&mut worker, &mut region);
+            let placed = reopened
+                .saved_proto(&region[4])
+                .unwrap_or_else(|| panic!("{name}: decorated proto chunk"));
+            assert!(placed.decorated, "{name}: generation continued");
+            let placed_start = typed_start(&placed, name);
+            for &(table, count) in loot {
+                let found = entities(&placed.block_entities, table);
+                assert_eq!(
+                    found.len(),
+                    count,
+                    "{name}: {table} placed after loading the saved start"
+                );
+                for entity in &found {
+                    let Tag::Compound(map) = entity else {
+                        unreachable!()
+                    };
+                    let pos = ["x", "y", "z"].map(|key| match map.get(&key.into()) {
+                        Some(Tag::Int(v)) => *v,
+                        other => panic!("{name}: {table} has {key}: {other:?}"),
+                    });
+                    // Chests and traps sit inside the piece's footprint;
+                    // some (the pyramid cellars) are below its saved box.
+                    assert!(
+                        bounds.min[0] <= pos[0]
+                            && pos[0] <= bounds.max[0]
+                            && bounds.min[2] <= pos[2]
+                            && pos[2] <= bounds.max[2],
+                        "{name}: {table} at {pos:?} outside its pieces' footprint {bounds:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                placed_start.get(&"references".into()),
+                Some(&Tag::Int(1)),
+                "{name}: placement uses the loaded start's references"
+            );
+            for &key in flags {
+                assert!(
+                    flag(piece_tag(&placed_start), key),
+                    "{name}: {key} after placement"
+                );
+            }
+            // The dimensions survive placement; the settled height is read
+            // only after placement, and compared across the second save below.
+            let before_piece = piece_tag(&before);
+            let placed_piece = piece_tag(&placed_start);
+            for key in ["Width", "Height", "Depth"] {
+                assert_eq!(
+                    placed_piece.get(&key.into()),
+                    before_piece.get(&key.into()),
+                    "{name}: {key} survives save, load and placement"
+                );
+            }
+            if name != "minecraft:buried_treasure" {
+                assert!(
+                    matches!(placed_piece.get(&"HPos".into()), Some(Tag::Int(h)) if *h >= 0),
+                    "{name}: placement settled the height it saves"
+                );
+            }
+            // Save the decorated proto chunks: block entities carry the loot
+            // table and its seed, so a regenerated chest would differ.
+            let decorated: Vec<SavedProto> = region
+                .iter()
+                .map(|proto| reopened.saved_proto(proto).expect("decorated proto"))
+                .collect();
+            let center_entities = decorated[4].block_entities.clone();
+            let second = save_dir("second", index);
+            write_protos(&second, decorated);
+            let reader = SaveDir::new(second.clone(), LevelShape::OVERWORLD);
+            let _ = reader.tables.set(Arc::new(SaveTables::new(&assets)));
+            let loaded = reader
+                .load_proto(sx, sz, assets.registry, &biomes)
+                .expect("saved decorated proto chunk");
+            assert!(loaded.decorated, "{name}: chests saved with features");
+            assert_eq!(
+                loaded.block_entities, center_entities,
+                "{name}: chests, traps and loot tables survive the save"
+            );
+            assert_eq!(
+                raw_start(&loaded, name),
+                placed_start,
+                "{name}: the placed start survives the save"
+            );
+            for &(table, count) in loot {
+                assert_eq!(
+                    entities(&loaded.block_entities, table).len(),
+                    count,
+                    "{name}: {table} kept by the reader"
+                );
+            }
+            // And the next worker starts from the same saved state: generating
+            // the saved chunk again restores its block entities rather than
+            // placing new loot.
+            let reopened = Arc::new(VanillaTerrain::new(resources, 1234).expect("terrain"));
+            let generator = Persistent {
+                inner: reopened.clone(),
+                save: Arc::new(reader),
+                registry: assets.clone(),
+                biomes: biomes.clone(),
+            };
+            let mut worker = generator.worker();
+            let restored = generator.proto(&mut worker, sx, sz);
+            let restored = reopened
+                .saved_proto(&restored)
+                .expect("restored proto chunk");
+            assert_eq!(
+                restored.block_entities, center_entities,
+                "{name}: a restored chunk keeps its chests, traps and loot seeds"
+            );
+            assert_eq!(
+                typed_start(&restored, name),
+                placed_start,
+                "{name}: a restored chunk keeps its start"
+            );
+            let _ = std::fs::remove_dir_all(&first);
+            let _ = std::fs::remove_dir_all(&second);
+        }
     }
 
     #[test]
@@ -6641,7 +7456,7 @@ mod tests {
             &save.regions,
             (0, 0),
             &save.region_path("region", 0, 0),
-            true,
+            super::RegionAccess::Write { create: true },
         )
         .unwrap()
         .unwrap();
@@ -6650,7 +7465,7 @@ mod tests {
                 &save.regions,
                 (x, 0),
                 &save.region_path("region", x, 0),
-                true,
+                super::RegionAccess::Write { create: true },
             )
             .unwrap()
             .unwrap();
@@ -6686,15 +7501,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn a_clear_only_write_reports_open_errors_after_a_cached_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cache = super::RegionCache::default();
+        let path = root.join("entities/r.0.0.mca");
+        assert!(
+            super::cached_region(&cache, (0, 0), &path, super::RegionAccess::Read)
+                .unwrap()
+                .is_none()
+        );
+        let records = [((0, 0), &super::Record::Delete)];
+        assert!(super::write_region_records(root, &cache, "entities", &records).is_ok());
+        assert!(!path.exists());
+
+        fs::write(root.join("entities"), b"blocked").unwrap();
+        assert!(super::write_region_records(root, &cache, "entities", &records).is_err());
+    }
+
+    #[test]
     fn write_completion_polls_without_waiting_and_keeps_latest_snapshot() {
         let dir = std::env::temp_dir().join(format!("horizon-save-poll-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let save = super::SaveDir::new(dir.clone(), LevelShape::OVERWORLD);
         let lock = super::SessionLock::acquire(&dir).unwrap();
         let path = save.region_path("entities", 0, 0);
-        let region = super::cached_region(&save.entity_regions, (0, 0), &path, true)
-            .unwrap()
-            .unwrap();
+        let region = super::cached_region(
+            &save.entity_regions,
+            (0, 0),
+            &path,
+            super::RegionAccess::Write { create: true },
+        )
+        .unwrap()
+        .unwrap();
         // Hold the actual region lock, rather than relying on disk speed or sleeps.
         let blocked = region.lock().unwrap();
         let entity = |version| Tag::compound([("version", Tag::Int(version))]);
@@ -6745,6 +7584,62 @@ mod tests {
         assert!(save.flush().is_err());
         drop(save);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_poi_records_do_not_report_a_successful_save() {
+        use super::{Chunk, Folder, LevelShape, SaveDir, SaveTables};
+        use std::sync::Arc;
+
+        let dir =
+            std::env::temp_dir().join(format!("horizon-poi-read-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("poi"), b"blocked").unwrap();
+        let save = SaveDir::new(dir.clone(), LevelShape::OVERWORLD);
+        // This chunk has no POIs. A failed read previously looked like an
+        // absent record, so the batch quietly did nothing and flushed as OK.
+        let tables = SaveTables::for_heightmaps(crate::assets::Properties::for_tests(&[]));
+        save.tables.set(Arc::new(tables)).ok().unwrap();
+        save.save_poi(&[Arc::new(Chunk::empty(0, 0))], false)
+            .unwrap();
+
+        let error = save.flush().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not read the poi record of chunk 0 0")
+        );
+        assert!(save.writes_finished().is_err());
+        assert!(
+            save.pending
+                .lock()
+                .unwrap()
+                .contains_key(&(Folder::Poi, 0, 0))
+        );
+        assert_eq!(std::fs::read(dir.join("poi")).unwrap(), b"blocked");
+        drop(save);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn creating_a_world_never_locks_or_changes_an_occupied_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let world = root.path().join("saves/World");
+        let allowlist = root.path().join("allowed_symlinks.txt");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join("level.dat"), "existing").unwrap();
+
+        assert!(SessionLock::acquire_new(&world, &allowlist).is_err());
+        assert_eq!(fs::read(world.join("level.dat")).unwrap(), b"existing");
+        assert!(!world.join("session.lock").exists());
+
+        let fresh = root.path().join("saves/World (1)");
+        let lock = SessionLock::acquire_new(&fresh, &allowlist).unwrap();
+        assert!(SessionLock::is_locked(&fresh));
+        assert!(SessionLock::acquire_new(&fresh, &allowlist).is_err());
+        drop(lock);
+        assert!(!SessionLock::is_locked(&fresh));
     }
 
     #[test]
@@ -7998,6 +8893,45 @@ mod tests {
         let reopened = Level::read(&dir).unwrap();
         assert_eq!(reopened.day_time, 12345);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A crash's save before the first normal one keeps a legacy owner's only copy (#18117).
+    #[test]
+    fn a_crash_save_keeps_a_legacy_level_dat_player() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-crash-legacy-player-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut level = Level {
+            name: "Test".into(),
+            inventory: vec![(0, "minecraft:diamond".into(), 7, 0)],
+            ..Level::default()
+        };
+        level.write(&dir).unwrap();
+        // The owner's file moves into level.dat's Data.Player, as an older world keeps it.
+        let player_file = dir
+            .join("players")
+            .join("data")
+            .join(format!("{}.dat", uuid_text(level.player_uuid.unwrap())));
+        let player = read_dat(&player_file).unwrap();
+        fs::remove_file(&player_file).unwrap();
+        let mut root = read_dat(&dir.join("level.dat")).unwrap();
+        if let Some(data) = root.get_mut("Data") {
+            put(data, "Player", player);
+        }
+        write_dat(&dir.join("level.dat"), root).unwrap();
+
+        let mut crashed = Level::read(&dir).unwrap();
+        crashed.inventory.clear();
+        crashed.write_keeping_player(&dir).unwrap();
+
+        let reopened = Level::read(&dir).unwrap();
+        assert_eq!(
+            reopened.inventory,
+            vec![(0, "minecraft:diamond".to_owned(), 7, 0)]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

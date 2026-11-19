@@ -61,6 +61,7 @@ fn reveal_pending(revealed: Option<u64>, now: u64) -> bool {
 /// pass instead.
 #[derive(Clone)]
 struct Pending {
+    screen: u64,
     button: Button,
     from: Rect,
     generation: u64,
@@ -135,12 +136,12 @@ pub(super) struct MenuCursor {
     step_scroll: bool,
     stick_scrolled: Option<StickScrolled>,
     /// The held D-pad direction and when it last stepped.
-    repeat: Option<(Button, Instant, bool)>,
+    repeat: Option<(Button, Instant, bool, (u64, bool))>,
     /// Pointer buttons the pad holds down.
     pub(super) held: [bool; 2],
     /// The focused button A went down on: letting go presses it, unless the
     /// focus moved or the input was cancelled first.
-    pub(super) armed: Option<Rect>,
+    pub(super) armed: Option<(u64, Rect)>,
     /// The frame count when `pad_reveal` scrolled the focused row into view: the frames drawn
     /// before it still show the row where it was, so the focus isn't looked for in them.
     pub(super) revealed: Option<u64>,
@@ -275,10 +276,16 @@ fn beside(rect: Rect, targets: &[Rect]) -> Option<usize> {
 
 /// Where letting go of A clicks: the armed button, if the focus is still on it. A row scrolled
 /// into view under A (`pad_reveal`) is found again a fraction of a pixel off.
-fn armed_click(armed: Option<Rect>, focus: Option<Target>) -> Option<(f32, f32)> {
+fn armed_click(
+    armed: Option<(u64, Rect)>,
+    screen: u64,
+    focus: Option<Target>,
+) -> Option<(f32, f32)> {
     let same = |a: Rect, b: Rect| a.iter().zip(b).all(|(a, b)| (a - b).abs() < SAME_RECT);
     focus
-        .filter(|focus| armed.is_some_and(|armed| same(armed, focus.rect)))
+        .filter(|focus| {
+            armed.is_some_and(|(owner, rect)| owner == screen && same(rect, focus.rect))
+        })
         .map(|focus| focus.center())
 }
 
@@ -773,7 +780,7 @@ impl Game<'_> {
                 }
                 Button::South if self.pad.menu.armed.is_some() => {
                     let armed = self.pad.menu.armed.take();
-                    if let Some(at) = armed_click(armed, self.pad.menu.focus) {
+                    if let Some(at) = armed_click(armed, self.key_screen(), self.pad.menu.focus) {
                         self.pad_click_at(event_loop, at, false);
                     }
                 }
@@ -788,7 +795,7 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        // The pad takes the focus back from the keyboard.
+        let owner = self.pad_repeat_owner();
         self.pad.menu.keyboard = false;
         // A with LT held over the crafting book is LT + A: LT coming up changes no category.
         if button == Button::South
@@ -855,7 +862,7 @@ impl Game<'_> {
                 button,
                 Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight
             ) {
-                self.pad.menu.repeat = Some((button, Instant::now(), false));
+                self.pad.menu.repeat = Some((button, Instant::now(), false, owner));
             }
             return Ok(());
         }
@@ -925,6 +932,7 @@ impl Game<'_> {
             Button::Select | Button::LeftStick if book_control => {}
             Button::East | Button::Start => return self.pad_back(),
             Button::South if self.pad_focusing() => {
+                let screen = self.key_screen();
                 let focus = self.pad_reveal(self.pad.menu.focus.expect("focusing"));
                 self.pad.menu.focus = Some(focus);
                 match focus.kind {
@@ -941,7 +949,7 @@ impl Game<'_> {
                     }
                     Kind::Button | Kind::Tab(_) => {
                         self.pad_pointer_to(event_loop, focus.center());
-                        self.pad.menu.armed = Some(focus.rect);
+                        self.pad.menu.armed = Some((screen, focus.rect));
                     }
                     _ => {
                         self.pad_pointer_to(event_loop, focus.center());
@@ -994,7 +1002,7 @@ impl Game<'_> {
             Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight => {
                 self.pad.menu.repeats = 0;
                 self.pad_step(event_loop, button);
-                self.pad.menu.repeat = Some((button, Instant::now(), false));
+                self.pad.menu.repeat = Some((button, Instant::now(), false, owner));
             }
             // The recipe book open: bumpers turn its pages, triggers change its category.
             Button::LeftBumper | Button::RightBumper if self.pad_recipe_book_showing() => {
@@ -1208,6 +1216,8 @@ impl Game<'_> {
     ) {
         // The focus goes on from where the scroll leaves it (a held direction's
         // repeat can come first).
+        let screen = self.key_screen();
+        self.pad.menu.pending.take_if(|p| p.screen != screen);
         if self.pad.menu.pending.is_some() {
             return;
         }
@@ -1247,6 +1257,7 @@ impl Game<'_> {
                 // the next frame.
                 self.pad_step_wheel(event_loop, button);
                 self.pad.menu.pending = Some(Pending {
+                    screen,
                     button,
                     from: focus.rect,
                     generation: widgets::generation(),
@@ -1558,13 +1569,14 @@ impl Game<'_> {
                 }
                 self.pad.menu.stick = dir;
                 if let Some(button) = dir {
+                    let owner = self.pad_repeat_owner();
                     if self.pad.menu.pos.is_none() && self.pad.menu.osk.is_none() {
                         self.pad_take_pointer(event_loop);
                     } else {
                         self.pad.menu.repeats = 0;
                         self.pad_step(event_loop, button);
                     }
-                    self.pad.menu.repeat = Some((button, now, false));
+                    self.pad.menu.repeat = Some((button, now, false, owner));
                 }
             }
         } else {
@@ -1602,8 +1614,7 @@ impl Game<'_> {
                 self.pad_follow_targets();
             }
         }
-        // Nothing scrolls under the on-screen keyboard; over chat its right stick picks a
-        // suggestion.
+        // The on-screen keyboard uses the right stick for suggestions.
         let scroll = if let Some(keyboard) = self.pad.menu.osk.as_mut() {
             if let Some(out) = keyboard.stick(state.right[1]) {
                 self.pad_osk_output(out);
@@ -1625,14 +1636,16 @@ impl Game<'_> {
             // Stick right scrolls right: the wheel's x runs the other way.
             self.pad_stick_wheel(event_loop, focus_mode, &targets, [-lines[0], lines[1]]);
         }
-        if let Some((button, since, repeating)) = self.pad.menu.repeat {
+        let owner = self.pad_repeat_owner();
+        self.pad.menu.repeat.take_if(|r| r.3 != owner);
+        if let Some((button, since, repeating, owner)) = self.pad.menu.repeat {
             let wait = if repeating {
                 self.settings.controller.repeat_interval
             } else {
                 self.settings.controller.repeat_delay
             };
             if now.duration_since(since).as_secs_f32() >= wait {
-                self.pad.menu.repeat = Some((button, now, true));
+                self.pad.menu.repeat = Some((button, now, true, owner));
                 self.pad.menu.repeats = self.pad.menu.repeats.saturating_add(1);
                 self.pad_step(event_loop, button);
             }
@@ -1819,10 +1832,11 @@ impl Game<'_> {
         }
     }
 
-    /// Focus mode, each poll: find the focused widget in the new frame (a
-    /// list scrolled, a page changed), finish a step that scrolled a list,
-    /// and keep the hidden pointer on the focused widget.
+    /// Refollow menu focus after a list scroll, except while the keyboard owns controller navigation.
     fn pad_follow_focus(&mut self, event_loop: &dyn EventLoopCtl, targets: &[Target]) {
+        if self.pad.menu.osk.is_some() {
+            return;
+        }
         let rects: Vec<Rect> = targets.iter().map(|t| t.rect).collect();
         let screen = self.key_screen();
         let stick_scrolled = self
@@ -1831,6 +1845,7 @@ impl Game<'_> {
             .stick_scrolled
             .take_if(|s| widgets::generation() > s.generation)
             .filter(|s| s.screen == screen);
+        self.pad.menu.pending.take_if(|p| p.screen != screen);
         let ready = self
             .pad
             .menu
@@ -2060,6 +2075,22 @@ impl Game<'_> {
             || (self.title.is_none() && self.screen == Screen::Chat && self.ui.in_bed_chat)
     }
 
+    /// Whether a touch hits a drawn field, or misses a known focused field.
+    pub(super) fn touch_hits_text_field(&self, point: (f32, f32)) -> Option<bool> {
+        if field_at(&widgets::last_targets(), point) {
+            return Some(true);
+        }
+        self.focused_field_rect().map(|rect| {
+            field_at(
+                &[Target {
+                    rect,
+                    kind: Kind::Field,
+                }],
+                point,
+            )
+        })
+    }
+
     /// The focused field's box (GUI pixels), where the screen can say: a title screen's field or an options
     /// page's search box. `None` for the rest (chat, a sign), which the touch controls leave alone.
     pub(super) fn focused_field_rect(&self) -> Option<[f32; 4]> {
@@ -2072,30 +2103,28 @@ impl Game<'_> {
         self.title.as_ref()?.focused_rect(self.gui_size())
     }
 
-    /// Ask for the system's keyboard again, whatever the last request did: a request iOS ignored (it can,
-    /// while a touch is being handled) is otherwise never repeated, as `sync_system_keyboard` only asks on a
-    /// change. The touch controls' keyboard button, when the keyboard is down.
+    /// The touch keyboard button retries opening UIKit's keyboard even if
+    /// the last request was ignored while a touch event was being handled.
     pub(super) fn show_system_keyboard(&mut self) {
-        if self.menu_input_blocked() {
+        if !self.owns_window_ime() || self.menu_input_blocked() {
             return;
         }
         self.bed_chat_focus(true);
         self.pad.menu.osk = None;
         self.pad.menu.system_keyboard = true;
         self.pad.menu.system_keyboard_hidden = false;
-        if let Some(window) = &self.window {
-            window.set_ime_allowed(false);
-            window.set_ime_allowed(true);
-        }
+        // UIKit can ignore an open request made during a touch. Restart the
+        // input session to retry, and discard the old composition before it
+        // can supply an Enter suppression flag to the reopened field.
+        self.set_window_ime(false);
+        self.set_window_ime(true);
     }
 
     /// Hide IME for a loading overlay without treating it as the player's
     /// explicit hide preference; the focused field may reopen it afterwards.
     pub(super) fn suspend_system_keyboard(&mut self) {
         self.pad.menu.system_keyboard = false;
-        if let Some(window) = &self.window {
-            window.set_ime_allowed(false);
-        }
+        self.set_window_ime(false);
     }
 
     /// Put the system's keyboard away while the field keeps its focus and text: the touch controls' keyboard
@@ -2106,9 +2135,7 @@ impl Game<'_> {
         }
         self.pad.menu.system_keyboard = false;
         self.pad.menu.system_keyboard_hidden = true;
-        if let Some(window) = &self.window {
-            window.set_ime_allowed(false);
-        }
+        self.set_window_ime(false);
     }
 
     /// The touch controls' keyboard button: it brings the system's keyboard up, and puts it away again.
@@ -2125,6 +2152,14 @@ impl Game<'_> {
         self.pad.menu.system_keyboard
     }
 
+    /// A manual hide belongs to the old screen, even when focus moves
+    /// directly to a text field on the new one.
+    #[cfg(target_os = "ios")]
+    pub(super) fn reset_system_keyboard_for_screen(&mut self) {
+        self.pad.menu.system_keyboard_hidden = false;
+        self.suspend_system_keyboard();
+    }
+
     /// The player put the system's keyboard away, the field still focused.
     pub(super) fn system_keyboard_hidden(&self) -> bool {
         self.pad.menu.system_keyboard_hidden
@@ -2135,6 +2170,10 @@ impl Game<'_> {
     /// A player who put it away keeps it away until the focus moves. winit types its keys into the window as
     /// `KeyboardInput`, which the fields already read.
     pub(super) fn sync_system_keyboard(&mut self) {
+        // Only the owning seat can change the shared keyboard.
+        if !self.owns_window_ime() {
+            return;
+        }
         let focused =
             self.field_focused() && (self.screen != Screen::Chat || self.chat_text_focused());
         if !focused {
@@ -2148,9 +2187,8 @@ impl Game<'_> {
             && !self.pad.menu.system_keyboard_hidden;
         if want != self.pad.menu.system_keyboard {
             self.pad.menu.system_keyboard = want;
-            if let Some(window) = &self.window {
-                window.set_ime_allowed(want);
-            }
+            // Redraw sees the updated IME flag and leaves this request alone.
+            self.set_window_ime(want);
         }
     }
 
@@ -2194,6 +2232,9 @@ impl Game<'_> {
     /// Steam's on a Steam Deck (`steam://open/keyboard`, which types into
     /// the window like a real keyboard).
     fn pad_open_keyboard(&mut self) {
+        self.pad.menu.armed = None;
+        self.pad.menu.pending = None;
+        self.pad.menu.stick_scrolled = None;
         // Without xdg-open (macOS, Windows), Horizon's keyboard instead.
         if gamepad::steam_keyboard(self.settings.controller.keyboard)
             && std::process::Command::new("xdg-open")
@@ -2559,12 +2600,12 @@ mod tests {
         let rect = [10.0, 20.0, 100.0, 20.0];
         let kind = Kind::Button;
         let focus = Some(Target { rect, kind });
-        assert_eq!(armed_click(Some(rect), focus), Some((60.0, 30.0)));
+        assert_eq!(armed_click(Some((1, rect)), 1, focus), Some((60.0, 30.0)));
         let refound = Some(Target {
             rect: [10.0, 20.000_002, 100.0, 20.0],
             kind,
         });
-        assert!(armed_click(Some(rect), refound).is_some());
+        assert!(armed_click(Some((1, rect)), 1, refound).is_some());
         // A row scrolled into view at frame 10 is looked for again from frame 12.
         assert!(!reveal_pending(None, 10));
         assert!(reveal_pending(Some(10), 10) && reveal_pending(Some(10), 11));
@@ -2573,9 +2614,10 @@ mod tests {
             rect: [10.0, 44.0, 100.0, 20.0],
             kind,
         });
-        assert_eq!(armed_click(Some(rect), moved), None);
-        assert_eq!(armed_click(Some(rect), None), None);
-        assert_eq!(armed_click(None, focus), None);
+        assert_eq!(armed_click(Some((1, rect)), 1, moved), None);
+        assert_eq!(armed_click(Some((1, rect)), 1, None), None);
+        assert_eq!(armed_click(None, 1, focus), None);
+        assert_eq!(armed_click(Some((1, rect)), 2, focus), None);
     }
 
     #[test]

@@ -90,9 +90,13 @@ mod command_exploration_map_tests {
             .data()
             .and_then(|d| d.other("minecraft:map_decorations"))
             .cloned();
-        game.save_maps();
-        let saved =
-            horizon_client::save::read_dat(&game.world_root.join("data/minecraft/maps/0.dat"));
+        let map_path = game.world_root.join("data/minecraft/maps/0.dat");
+        std::fs::create_dir_all(&map_path).unwrap();
+        let error = game.save_maps().unwrap_err();
+        assert!(error.to_string().contains("0.dat"), "{error}");
+        std::fs::remove_dir(&map_path).unwrap();
+        game.save_maps().unwrap();
+        let saved = horizon_client::save::read_dat(&map_path);
         let counter = horizon_client::save::read_dat(
             &game.world_root.join("data/minecraft/maps/last_id.dat"),
         );

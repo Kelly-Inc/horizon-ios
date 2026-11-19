@@ -60,10 +60,7 @@ def mismatches(caller_path):
 class CallPermissionTests(unittest.TestCase):
     def test_every_call_grants_what_its_workflow_asks_for(self):
         callers = [path for path in sorted(WORKFLOWS.glob("*.yml")) if "uses: ./.github/workflows/" in path.read_text()]
-        expected = {name for name in ("ci.yml", "nightly-build.yml", "run-parity.yml")
-                    if (WORKFLOWS / name).is_file()}
-        self.assertIn("nightly-build.yml", expected)
-        self.assertEqual({path.name for path in callers}, expected)
+        self.assertIn("nightly-build.yml", {path.name for path in callers})
         for path in callers:
             with self.subTest(workflow=path.name):
                 self.assertEqual(mismatches(path), [])

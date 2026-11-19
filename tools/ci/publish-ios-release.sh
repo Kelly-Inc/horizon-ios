@@ -5,6 +5,17 @@ set -euo pipefail
 tag="ios-build-${BUILD}"
 ipa_name=$(basename "$IPA")
 checksum_name=$(basename "$CHECKSUM")
+python3 - "$IPA" "$CHECKSUM" <<'PYCHECKSUM'
+import hashlib
+import sys
+from pathlib import Path
+
+ipa, checksum = map(Path, sys.argv[1:])
+with ipa.open("rb") as stream:
+    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+if checksum.read_bytes() != f"{digest}  {ipa.name}\n".encode("utf-8"):
+    raise SystemExit("Checksum does not match the IPA")
+PYCHECKSUM
 # An existing release's tag determines its commit. A commit lookup with an
 # explicit tag ref also works when a branch happens to have the same name.
 check_release_tag() {
@@ -89,18 +100,19 @@ for path in files:
 PYUPLOAD
 }
 
-if gh release view "$tag" --json isDraft,targetCommitish,assets > release-state.json; then
-  if [[ "$tag_exists" == false ]]; then
-    # GitHub only uses targetCommitish when it still has to create the tag.
-    # An untagged draft must name the exact build commit, never a moving branch.
-    python3 - "$GITHUB_SHA" <<'PYTARGET'
+check_draft_target() {
+  # GitHub only uses targetCommitish when it still has to create the tag.
+  python3 - "$GITHUB_SHA" <<'PYTARGET'
 import json, sys
 
 release = json.load(open("release-state.json"))
 if not release["isDraft"] or release["targetCommitish"] != sys.argv[1]:
     raise SystemExit("Release has no matching tag or draft commit")
 PYTARGET
-  fi
+}
+
+if gh release view "$tag" --json isDraft,targetCommitish,assets > release-state.json; then
+  if [[ "$tag_exists" == false ]]; then check_draft_target; fi
   release_asset_plan plan > release-upload-plan.txt
   uploads=()
   while IFS= read -r asset; do
@@ -118,13 +130,27 @@ for asset in json.load(open("release-state.json"))["assets"]:
         print(name)
 PYASSETS
 else
+  # A failed release view can also mean the API is unreachable or the
+  # response could not be read. Confirm absence, including pending draft tags.
+  if ! missing=$(gh api graphql \
+    -f query='query($owner: String!, $name: String!, $tag: String!) {
+      repository(owner: $owner, name: $name) { release(tagName: $tag) { id } }
+    }' \
+    -f owner="${GH_REPO%/*}" -f name="${GH_REPO#*/}" -f tag="$tag" \
+    --jq '((.errors // []) | length == 0) and (.data.repository | type == "object" and has("release") and .release == null)'); then
+    missing=false
+  fi
+  if [[ "$missing" != true ]]; then
+    echo '::error::Could not confirm the release is absent; refusing to create a draft.'
+    exit 1
+  fi
   gh release create "$tag" --target "$GITHUB_SHA" --draft \
     --title "Horizon iOS $VERSION — build $BUILD" --notes-file release-notes.md
 fi
 if ((${#uploads[@]})); then
   gh release upload "$tag" "${uploads[@]}" --clobber
   # Verify the server-side bytes before retiring older downloads or publishing.
-  gh release view "$tag" --json isDraft,assets > release-state.json
+  gh release view "$tag" --json isDraft,targetCommitish,assets > release-state.json
   release_asset_plan verify
 fi
 check_release_tag
@@ -132,6 +158,8 @@ if [[ "$had_tag" == true && "$tag_exists" == false ]]; then
   echo '::error::Release tag disappeared during publication; stopping.'
   exit 1
 fi
+# The draft may have changed while the artifacts were being uploaded.
+if [[ "$tag_exists" == false ]]; then check_draft_target; fi
 while IFS= read -r obsolete; do
   [[ -z "$obsolete" ]] || gh release delete-asset "$tag" "$obsolete" --yes
 done < obsolete-assets.txt

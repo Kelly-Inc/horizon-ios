@@ -356,7 +356,9 @@ impl Game<'_> {
         // `pendingReload`, which `runTick` starts once the overlay is gone).
         if reload_waits(
             self.pack_context_loading(),
-            self.pack_reload.is_some() || self.content_reload_busy(),
+            self.pack_reload.is_some()
+                || self.content_reload_busy()
+                || self.server_packs.pending_active.is_some(),
         ) {
             self.pending_pack_reload = true;
             return;
@@ -422,7 +424,15 @@ impl Game<'_> {
             self.ui.vanilla_root = vanilla.clone();
         }
         let selected = self.settings.resource_packs.clone();
-        let server = self.server_packs.active.clone();
+        let server = match kind {
+            ReloadKind::Selection => &self.server_packs.active,
+            ReloadKind::Server => self
+                .server_packs
+                .pending_active
+                .as_ref()
+                .unwrap_or(&self.server_packs.active),
+        }
+        .clone();
         let (mods, catalog) = selection;
         let previous = self.pack.content.clone();
         let needs_rollback = (self.integrated.is_some()
@@ -536,7 +546,7 @@ impl Game<'_> {
         self.pack_reload = None;
         // The latest selection replaces an obsolete local result without an
         // unnecessary GPU swap. Server outcomes must still reach their state machine.
-        if kind == ReloadKind::Selection && self.pending_pack_reload {
+        if self.pack_selection_superseded(kind) {
             return;
         }
         if let Ok(staged) = staged {
@@ -545,13 +555,19 @@ impl Game<'_> {
             self.finish_content_reload(kind, staged.map(|_| ()));
         }
     }
+    fn pack_selection_superseded(&self, kind: ReloadKind) -> bool {
+        kind == ReloadKind::Selection && self.pending_pack_reload
+    }
+
     fn finish_content_reload(&mut self, kind: ReloadKind, result: Result<(), String>) {
         if result.is_ok() {
             self.mods_reloaded(true);
         }
         match kind {
             ReloadKind::Selection => {
-                if let Err(e) = result {
+                if let Err(e) = result
+                    && !self.pack_selection_superseded(kind)
+                {
                     self.selection_reload_failed(&e);
                 }
             }
@@ -761,7 +777,8 @@ impl Game<'_> {
                 renderer.resize(old.config.width, old.config.height);
             }
             self.renderer = Some(renderer);
-            self.airplay = None;
+            self.dynamic_resolution.restart_measurements();
+            self.airplay = Default::default();
             self.apply_ui_settings();
         }
         // Horizon's own shader pack is built again: its sprite tags name the old atlas's

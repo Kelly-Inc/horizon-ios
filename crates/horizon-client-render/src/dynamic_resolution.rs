@@ -61,9 +61,12 @@ const MIN_TIMED: usize = 8;
 /// The scale in use and what it has measured since the last verdict.
 #[derive(Clone, Debug, Default)]
 pub struct DynamicResolution {
+    /// Resolution floor, FPS target, and sampling pace for the current measurements.
+    sampling: Option<(u32, u32, Pace)>,
     gpu: Vec<f32>,
     window_ms: f64,
     since_change_ms: f64,
+    unsettled_ms: f64,
     /// The scale in use, in percent; `None` until the first change (the floor).
     scale: Option<u32>,
 }
@@ -76,6 +79,28 @@ impl DynamicResolution {
     /// Back to the floor, with nothing measured (turned off, or the world changed).
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Discard measurements from the old renderer while keeping the active scale.
+    pub fn restart_measurements(&mut self) {
+        self.gpu.clear();
+        self.window_ms = 0.0;
+        self.since_change_ms = 0.0;
+        self.unsettled_ms = 0.0;
+    }
+
+    /// Skip loading and menu frames. A gap as long as a measurement window
+    /// invalidates pending samples, while a brief chunk load can be skipped.
+    pub fn skip_frame(&mut self, frame_ms: f32) {
+        let Some((_, _, pace)) = self.sampling else {
+            return;
+        };
+        if frame_ms.is_finite() && frame_ms > 0.0 {
+            self.unsettled_ms += f64::from(frame_ms);
+            if self.unsettled_ms >= pace.window_ms() {
+                self.restart_measurements();
+            }
+        }
     }
 
     /// The scale in use, in percent, for a Resolution Scale of `floor`: never below it, never
@@ -95,9 +120,21 @@ impl DynamicResolution {
         target_fps: u32,
         pace: Pace,
     ) -> Option<u32> {
+        if !frame_ms.is_finite() || frame_ms <= 0.0 {
+            return None;
+        }
+        let sampling = Some((floor, target_fps, pace));
+        if self.sampling != sampling {
+            self.sampling = sampling;
+            // A partial window collected with other settings cannot decide
+            // the new scale. Keep the active scale but start measuring again.
+            self.restart_measurements();
+        }
+        self.unsettled_ms = 0.0;
         self.window_ms += f64::from(frame_ms);
         self.since_change_ms += f64::from(frame_ms);
-        if let Some(gpu) = gpu_ms {
+        // An empty timestamp interval is an untimed frame, not spare GPU time.
+        if let Some(gpu) = gpu_ms.filter(|gpu| gpu.is_finite() && *gpu > 0.0) {
             self.gpu.push(gpu);
         }
         // A window lasts its time and holds enough timed frames: a slow scene (or timestamps that
@@ -229,6 +266,114 @@ mod tests {
             assert_eq!(d.observe(None, 8.0, 70, 60, Pace::Quick), None);
         }
         assert_eq!(d.scale(70), 70);
+    }
+
+    #[test]
+    fn invalid_gpu_times_do_not_trigger_a_resolution_change() {
+        for gpu in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut resolution = DynamicResolution::new();
+            assert_eq!(
+                run(&mut resolution, 3_000.0, gpu, 8.0, 70, Pace::Quick),
+                None
+            );
+            assert_eq!(resolution.scale(70), 70);
+            assert!(run(&mut resolution, 1_200.0, 8.0, 8.0, 70, Pace::Quick).is_some());
+        }
+    }
+
+    #[test]
+    fn invalid_frame_time_cannot_skip_the_settling_window() {
+        let mut resolution = DynamicResolution::new();
+        assert_eq!(
+            resolution.observe(Some(8.0), f32::NAN, 70, 60, Pace::Quick),
+            None
+        );
+        assert_eq!(
+            run(&mut resolution, 900.0, 8.0, 8.0, 70, Pace::Quick),
+            None
+        );
+        assert_eq!(
+            run(&mut resolution, 300.0, 8.0, 8.0, 70, Pace::Quick),
+            Some(75)
+        );
+    }
+
+    #[test]
+    fn changing_sampling_settings_starts_a_fresh_window() {
+        for (old_floor, old_target, old_pace) in [
+            (65, 60, Pace::Quick),
+            (70, 30, Pace::Quick),
+            (70, 60, Pace::Gentle),
+        ] {
+            let mut resolution = DynamicResolution::new();
+            for _ in 0..120 {
+                assert_eq!(
+                    resolution.observe(Some(8.0), 8.0, old_floor, old_target, old_pace),
+                    None
+                );
+            }
+            assert_eq!(run(&mut resolution, 100.0, 8.0, 8.0, 70, Pace::Quick), None);
+            assert_eq!(resolution.scale(70), 70);
+            assert_eq!(
+                run(&mut resolution, 1_100.0, 8.0, 8.0, 70, Pace::Quick),
+                Some(75)
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_the_renderer_keeps_scale_and_waits_for_new_samples() {
+        let mut resolution = DynamicResolution {
+            sampling: Some((70, 60, Pace::Quick)),
+            since_change_ms: 1_000.0,
+            scale: Some(100),
+            ..DynamicResolution::default()
+        };
+        assert_eq!(
+            run(&mut resolution, 480.0, 25.0, 8.0, 70, Pace::Quick),
+            None
+        );
+        resolution.restart_measurements();
+        assert_eq!(resolution.scale(70), 100);
+        assert_eq!(
+            run(&mut resolution, 100.0, 25.0, 8.0, 70, Pace::Quick),
+            None
+        );
+        assert_eq!(resolution.scale(70), 100);
+        assert_eq!(
+            run(&mut resolution, 950.0, 25.0, 8.0, 70, Pace::Quick),
+            Some(95)
+        );
+    }
+
+    #[test]
+    fn a_long_gap_discards_timings_but_a_brief_load_does_not() {
+        let mut before_gap = DynamicResolution {
+            sampling: Some((70, 60, Pace::Quick)),
+            since_change_ms: 1_000.0,
+            scale: Some(100),
+            ..DynamicResolution::default()
+        };
+        assert_eq!(
+            run(&mut before_gap, 480.0, 25.0, 8.0, 70, Pace::Quick),
+            None
+        );
+
+        let mut paused = before_gap.clone();
+        for _ in 0..32 {
+            paused.skip_frame(16.0);
+        }
+        assert_eq!(paused.scale(70), 100);
+        assert_eq!(run(&mut paused, 100.0, 25.0, 8.0, 70, Pace::Quick), None);
+        assert_eq!(run(&mut paused, 950.0, 25.0, 8.0, 70, Pace::Quick), Some(95));
+
+        for _ in 0..3 {
+            before_gap.skip_frame(16.0);
+        }
+        assert_eq!(
+            run(&mut before_gap, 100.0, 25.0, 8.0, 70, Pace::Quick),
+            Some(95)
+        );
     }
 
     #[test]

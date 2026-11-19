@@ -58,23 +58,29 @@ impl Game<'_> {
             self.keys.remove(&key);
         }
     }
+    /// Modifier events describe the keyboard alone.
+    /// Other devices can still hold the gameplay mapping.
+    fn non_keyboard_holds_modifier_mapping(&self, slot: usize) -> bool {
+        let key = [KeyCode::ShiftLeft, KeyCode::ControlLeft][slot];
+        let mapping = ["key.sneak", "key.sprint"][slot];
+        self.input_holds(mapping)
+            || [Source::Touch, Source::Agent, Source::Mod]
+                .into_iter()
+                .any(|source| self.keys.held_by(&key, source))
+    }
     pub(super) fn update_modifiers(&mut self, state: winit::keyboard::ModifiersState) {
         self.modifiers = state;
         if let Some(title) = &mut self.title {
             title.set_alt_down(state.alt_key());
         }
+        let other_held = [SNEAK, SPRINT].map(|slot| self.non_keyboard_holds_modifier_mapping(slot));
         horizon_client_input::modifiers::reconcile(
             self.modifiers,
             &mut self.physical_keys,
             &self.settings.keys,
             &mut self.toggles,
             [self.settings.toggle_crouch, self.settings.toggle_sprint],
-            [
-                self.pad.holds_action("key.sneak")
-                    || self.keys.held_by(&KeyCode::ShiftLeft, Source::Touch),
-                self.pad.holds_action("key.sprint")
-                    || self.keys.held_by(&KeyCode::ControlLeft, Source::Touch),
-            ],
+            other_held,
         );
         self.sync_toggle(SNEAK);
         self.sync_toggle(SPRINT);
@@ -130,15 +136,11 @@ impl Game<'_> {
                 Some(KeyCode::ControlLeft | KeyCode::ControlRight) => control,
                 _ => continue,
             };
-            // A controller's stick click acts as the key without setting the modifier: it is held
-            // while the pad holds it (or its release waits for a tick), not when the keyboard says.
             let logical_key = [KeyCode::ShiftLeft, KeyCode::ControlLeft][slot];
-            let pad = self.input_holds(mapping) || self.keys.held_by(&logical_key, Source::Mod);
-            let touch = self.keys.held_by(&logical_key, Source::Touch);
             if !held && !needs_toggle {
                 self.keys.release(&logical_key, Source::Keyboard);
             }
-            if !held && !pad && !touch {
+            if !held && !self.non_keyboard_holds_modifier_mapping(slot) {
                 self.toggles.0[slot].set_down(false, needs_toggle);
                 self.sync_toggle(slot);
             }
@@ -613,7 +615,7 @@ impl Game<'_> {
         self.cancel_emote_controller();
         self.cancel_touch_for_reload();
         self.suspend_system_keyboard();
-        self.ui.options.release();
+        self.finish_interrupted_option_drag();
         if let Some(title) = &mut self.title {
             title.release();
             title.release_field();

@@ -30,6 +30,7 @@ class LocalPackReloadTests(unittest.TestCase):
         method = "\n".join(production_method(signature) for signature in (
             "    fn pack_context_loading(",
             "    pub(super) fn drive_pack_reload(",
+            "    fn pack_selection_superseded(",
             "    fn finish_content_reload(",
         ))
         transaction = (ROOT / "crates/horizon-client/src/game/world/packs/transaction.rs").read_text()

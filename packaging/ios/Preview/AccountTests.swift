@@ -41,13 +41,19 @@ private final class MemoryAccountVault: AccountVault {
 private final class AuthURLProtocol: URLProtocol {
     static var failure: Error?
     static var rawBody: ((URLRequest) -> Data?)?
+    static var retryAfter: ((Int) -> String?)?
+    static var stall = false
+    static var stallRequest: ((URLRequest) -> Bool)?
     static var response: (URLRequest) -> (Int, [String: Any]) = { _ in (500, [:]) }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        if Self.stall || Self.stallRequest?(request) == true { return }
         if let error = Self.failure { client?.urlProtocol(self, didFailWithError: error); return }
         let (status, body) = Self.response(request)
-        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+        var headers = ["Content-Type": "application/json"]
+        headers["Retry-After"] = Self.retryAfter?(status)
+        let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let data = Self.rawBody?(request) ?? (try! JSONSerialization.data(withJSONObject: body))
         client?.urlProtocol(self, didLoad: data)
@@ -85,6 +91,8 @@ final class AccountTests: XCTestCase {
         session.invalidateAndCancel()
         defaults.removePersistentDomain(forName: suite)
         AuthURLProtocol.response = { _ in (500, [:]) }; AuthURLProtocol.failure = nil; AuthURLProtocol.rawBody = nil
+        AuthURLProtocol.retryAfter = nil
+        AuthURLProtocol.stall = false; AuthURLProtocol.stallRequest = nil
     }
     private func seed(expired: Bool = true) throws {
         defaults.set(try JSONEncoder().encode(MicrosoftAccount.Catalog(profiles: [alice, bob], selected: alice.uuid)), forKey: "microsoftAccounts.v2")
@@ -137,6 +145,77 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(account.profile, alice); XCTAssertEqual(account.accounts.count, 2)
         XCTAssertTrue(bridgeCommands.isEmpty)
     }
+    func testTemporaryRefreshFailureKeepsAStillValidMinecraftSession() async throws {
+        try seed()
+        vault.values[alice.uuid] = AccountSecrets(refresh: "fixture-old-refresh", token: "fixture-old-access",
+                                                 expires: instant.addingTimeInterval(90))
+        network(downstreamError: true)
+        let account = model()
+
+        try await account.handOver()
+
+        XCTAssertEqual(account.profile, alice)
+        XCTAssertEqual(account.state, .idle)
+        XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-rotated")
+        XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
+        XCTAssertEqual(bridgeCommands.count, 1)
+        XCTAssertTrue(bridgeCommands[0].contains("fixture-old-access"))
+    }
+
+    func testDNSFailureKeepsValidSession() async throws {
+        try seed()
+        vault.values[alice.uuid] = AccountSecrets(refresh: "refresh", token: "cached",
+                                                 expires: instant.addingTimeInterval(90))
+        AuthURLProtocol.failure = URLError(.dnsLookupFailed)
+        try await model().handOver()
+        XCTAssertTrue(bridgeCommands.first?.contains("cached") == true)
+    }
+
+    func testTemporaryStatusTakesPrecedenceOverAnErrorBodyDuringRenewal() async throws {
+        let outages: [(String, Int, [String: Any], String)] = [
+            ("/oauth2/v2.0/token", 503, ["error": "invalid_grant"], "fixture-old-refresh"),
+            ("/xsts/authorize", 429, ["XErr": 2_148_916_233], "fixture-rotated"),
+            ("/authentication/login_with_xbox", 503, ["errorMessage": "Invalid app"], "fixture-rotated"),
+        ]
+        for (endpoint, status, body, refreshToken) in outages {
+            try seed()
+            vault.values[alice.uuid] = AccountSecrets(refresh: "fixture-old-refresh", token: "fixture-old-access",
+                                                      expires: instant.addingTimeInterval(90))
+            network()
+            let response = AuthURLProtocol.response
+            AuthURLProtocol.response = { request in
+                if request.url?.path.hasSuffix(endpoint) == true { return (status, body) }
+                return response(request)
+            }
+            bridgeCommands.removeAll()
+            let account = model()
+
+            try await account.handOver()
+
+            XCTAssertEqual(account.profile, alice)
+            XCTAssertEqual(vault.values[alice.uuid]?.refresh, refreshToken)
+            XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
+            XCTAssertEqual(bridgeCommands.count, 1)
+            XCTAssertTrue(bridgeCommands.first?.contains("fixture-old-access") == true)
+        }
+    }
+
+    func testExplicitRefreshDenialDoesNotReuseTheCachedSession() async throws {
+        try seed()
+        vault.values[alice.uuid] = AccountSecrets(refresh: "fixture-old-refresh", token: "fixture-old-access",
+                                                 expires: instant.addingTimeInterval(90))
+        network(tokenError: true)
+        let account = model()
+
+        do {
+            try await account.handOver()
+            XCTFail("Microsoft's explicit denial must stop Play")
+        } catch {
+            XCTAssertTrue((error as? AccountError)?.reauthenticate == true)
+        }
+        XCTAssertTrue(bridgeCommands.isEmpty)
+    }
+
     func testBlankReplacementTokenKeepsThePreviousRefreshCredential() async throws {
         try seed()
         network()
@@ -151,6 +230,39 @@ final class AccountTests: XCTestCase {
         try await account.handOver()
         XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-old-refresh")
         XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-new-access")
+    }
+
+    func testSessionNearExpiryIsUsableWhenItsRefreshCredentialIsMissing() async throws {
+        try seed()
+        vault.values[alice.uuid] = AccountSecrets(refresh: "", token: "fixture-old-access",
+                                                expires: instant.addingTimeInterval(90))
+        network()
+        let account = model()
+        try await account.handOver()
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertEqual(bridgeCommands.count, 1)
+        XCTAssertTrue(bridgeCommands[0].contains("fixture-old-access"))
+    }
+
+    func testBooleanSessionLifetimeCannotReplaceACachedToken() async throws {
+        try seed()
+        network()
+        let response = AuthURLProtocol.response
+        AuthURLProtocol.response = { request in
+            if request.url?.path == "/authentication/login_with_xbox" {
+                return (200, ["access_token": "fixture-replacement", "expires_in": true])
+            }
+            return response(request)
+        }
+        let account = model()
+        do {
+            try await account.handOver()
+            XCTFail("A Boolean lifetime cannot establish a session")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("valid session expiry"))
+        }
+        XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
+        XCTAssertTrue(bridgeCommands.isEmpty)
     }
 
     func testExpiredAccountWithBlankCredentialAsksToSignInWithoutRequestingTokens() async throws {
@@ -227,6 +339,53 @@ final class AccountTests: XCTestCase {
             XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
             XCTAssertEqual(account.profile, alice)
         }
+        XCTAssertTrue(bridgeCommands.isEmpty)
+    }
+
+    func testRenewalRejectsProfilesTheGameCannotUse() async throws {
+        XCTAssertEqual(
+            MicrosoftAccount.Profile.validated(name: "Alice", uuid: "069A79F4-44E9-4726-A5BE-FCA90E38AAF5")?.uuid,
+            "069a79f444e94726a5befca90e38aaf5"
+        )
+        for (id, name) in [
+            (String(repeating: "ａ", count: 32), "Alice"),
+            (alice.uuid, "Name with spaces"),
+            (alice.uuid, String(repeating: "a", count: 17)),
+        ] {
+            try seed()
+            network()
+            let response = AuthURLProtocol.response
+            AuthURLProtocol.response = { request in
+                if request.url?.path == "/minecraft/profile" { return (200, ["id": id, "name": name]) }
+                return response(request)
+            }
+            let account = model()
+            do {
+                try await account.handOver()
+                XCTFail("An unusable Minecraft profile must stop Play")
+            } catch {
+                XCTAssertEqual(error.localizedDescription, "Minecraft returned an invalid account profile.")
+            }
+            XCTAssertEqual(account.profile, alice)
+            XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-old-access")
+            XCTAssertTrue(bridgeCommands.isEmpty)
+        }
+    }
+
+    func testInvalidSavedProfileAsksForSignInWithoutUsingItsToken() async throws {
+        let invalid = MicrosoftAccount.Profile(name: "Name with spaces", uuid: alice.uuid)
+        defaults.set(try JSONEncoder().encode(MicrosoftAccount.Catalog(profiles: [invalid], selected: invalid.uuid)),
+                     forKey: "microsoftAccounts.v2")
+        vault.values[invalid.uuid] = AccountSecrets(refresh: "fixture-refresh", token: "fixture-access",
+                                                    expires: instant.addingTimeInterval(3600))
+        let account = model()
+        do {
+            try await account.handOver()
+            XCTFail("An invalid saved profile must stop Play")
+        } catch {
+            XCTAssertTrue((error as? AccountError)?.reauthenticate == true)
+        }
+        XCTAssertNotNil(vault.values[invalid.uuid])
         XCTAssertTrue(bridgeCommands.isEmpty)
     }
 
@@ -345,6 +504,96 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(account.profile, bob)
         XCTAssertTrue(bridgeCommands.allSatisfy { $0.contains("fixture-bob-access") })
     }
+    func testCancellingPlayStopsWaitingWithoutCancellingTheSharedRefresh() async throws {
+        try seed()
+        network()
+        let account = model()
+        let requested = expectation(description: "shared refresh reached Microsoft")
+        let cancelled = expectation(description: "first Play stopped waiting")
+        let release = DispatchSemaphore(value: 0)
+        let response = AuthURLProtocol.response
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/token") {
+                requested.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return response(request)
+        }
+        let first = Task {
+            do {
+                try await account.handOver()
+                XCTFail("Cancelled Play should not hand over the session")
+            } catch is CancellationError {
+                cancelled.fulfill()
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+        }
+        await fulfillment(of: [requested], timeout: 2)
+        first.cancel()
+        await fulfillment(of: [cancelled], timeout: 2)
+        XCTAssertTrue(bridgeCommands.isEmpty)
+
+        let second = Task { try await account.handOver() }
+        release.signal()
+        await first.value
+        try await second.value
+        XCTAssertEqual(lock.withLock { requests.filter { $0.hasSuffix("/token") }.count }, 1)
+        XCTAssertEqual(vault.values[alice.uuid]?.refresh, "fixture-rotated")
+        XCTAssertEqual(bridgeCommands.count, 1)
+    }
+
+    func testFreshSignInSupersedesAStalledRefreshOfTheSameAccount() async throws {
+        try seed()
+        network()
+        let account = model()
+        let refreshing = expectation(description: "older refresh is stalled")
+        let signedIn = expectation(description: "fresh sign-in selected the same account")
+        let cancelled = expectation(description: "old Play stopped waiting")
+        var firstTokenRequest = true
+        let gate = NSLock()
+        AuthURLProtocol.stallRequest = { request in
+            guard request.url?.path.hasSuffix("/token") == true else { return false }
+            return gate.withLock {
+                guard firstTokenRequest else { return false }
+                firstTokenRequest = false
+                refreshing.fulfill()
+                return true
+            }
+        }
+        let response = AuthURLProtocol.response
+        AuthURLProtocol.response = { request in
+            if request.url?.path.hasSuffix("/devicecode") == true {
+                return (200, ["device_code": "fixture-device", "user_code": "FIXTURE",
+                              "verification_uri": "https://microsoft.com/link", "expires_in": 900, "interval": 1])
+            }
+            return response(request)
+        }
+        let oldPlay = Task {
+            do {
+                try await account.handOver()
+                XCTFail("The old Play request must be cancelled")
+            } catch is CancellationError {
+                cancelled.fulfill()
+            } catch {
+                XCTFail("Expected cancellation, got \(error)")
+            }
+        }
+        defer { oldPlay.cancel(); account.cancel() }
+        await fulfillment(of: [refreshing], timeout: 2)
+        let profile = account.$profile.sink { selected in
+            if selected?.name == "AliceRenewed" { signedIn.fulfill() }
+        }
+        defer { profile.cancel() }
+        account.signIn()
+        await fulfillment(of: [signedIn, cancelled], timeout: 3)
+
+        XCTAssertEqual(account.profile?.uuid, alice.uuid)
+        XCTAssertEqual(vault.values[alice.uuid]?.token, "fixture-new-access")
+        XCTAssertTrue(bridgeCommands.isEmpty)
+        await oldPlay.value
+    }
+
     func testFailedRefreshIsCancelledIfThePlayerChangedAccounts() async throws {
         try seed()
         network(tokenError: true)
@@ -435,6 +684,43 @@ final class AccountTests: XCTestCase {
         account.cancel()
     }
 
+    func testOldHandoffCannotPublishAfterANewerSignInEnds() async throws {
+        for cancelSignIn in [true, false] {
+            try seed(expired: false)
+            AuthURLProtocol.response = { _ in (503, [:]) }
+            let requested = expectation(description: "older handoff submitted")
+            var reply: CheckedContinuation<[String: Any], Never>?
+            let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session,
+                                           clock: { self.instant }, client: "fixture-client") { _ in
+                await withCheckedContinuation {
+                    reply = $0
+                    requested.fulfill()
+                }
+            }
+            let pending = Task { try await account.handOver() }
+            await fulfillment(of: [requested], timeout: 2)
+            account.signIn()
+            if cancelSignIn {
+                account.cancel()
+            } else {
+                for _ in 0..<100 {
+                    if case .failed = account.state { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                if case .failed = account.state {} else { XCTFail("Expected sign-in failure") }
+            }
+            let newerState = account.state
+            reply?.resume(returning: cancelSignIn ? ["error": "Old handoff failed"] : ["ok": true])
+            do {
+                try await pending.value
+                XCTFail("The superseded handoff must not authorize Play")
+            } catch is CancellationError {
+                XCTAssertEqual(account.state, newerState)
+                XCTAssertEqual(account.profile, alice)
+            }
+        }
+    }
+
     func testFailedRemovalDoesNotDiscardAnInFlightTokenRotation() async throws {
         try seed()
         network()
@@ -501,6 +787,149 @@ final class AccountTests: XCTestCase {
             XCTAssertEqual(waits, [initial, initial + 5, initial + 10].map {UInt64($0) * 1_000_000_000})
         }
     }
+    func testDevicePollingBacksOffAfterTimeoutsAndStopsWhenDeclined() async {
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/devicecode") {
+                return (200, ["device_code": "fixture-device", "user_code": "FIXTURE", "verification_uri": "https://microsoft.com/link", "expires_in": 900, "interval": 5])
+            }
+            return (400, ["error": "access_denied"])
+        }
+        var waits: [UInt64] = []
+        let finished = expectation(description: "device sign-in declined")
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: { self.instant }, sleep: { delay in
+            waits.append(delay)
+            AuthURLProtocol.failure = waits.count < 3 ? URLError(.timedOut) : nil
+        }, client: "fixture-client")
+        let observation = account.$state.sink { state in
+            if case .failed = state { finished.fulfill() }
+        }
+        defer { observation.cancel(); account.cancel(); AuthURLProtocol.failure = nil }
+        account.signIn()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(waits, [5, 10, 20].map { UInt64($0) * 1_000_000_000 })
+        XCTAssertEqual(account.state, .failed("The sign-in was declined."))
+    }
+
+    func testDevicePollingKeepsTheCodeThroughTemporaryHTTPFailures() async {
+        var replies: [(Int, [String: Any])] = [
+            (503, [:]), (503, ["error": "expired_token"]),
+            (429, ["error": "access_denied"]), (400, ["error": "access_denied"]),
+        ]
+        let lock = NSLock()
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/devicecode") {
+                return (200, ["device_code": "fixture-device", "user_code": "FIXTURE",
+                              "verification_uri": "https://microsoft.com/link", "expires_in": 900, "interval": 5])
+            }
+            return lock.withLock { replies.isEmpty ? (500, [:]) : replies.removeFirst() }
+        }
+        var waits: [UInt64] = []
+        var clock = instant
+        var deviceTime = ContinuousClock.now
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: { clock }, deviceClock: { deviceTime }, sleep: { delay in
+            waits.append(delay)
+            clock.addTimeInterval(Double(delay) / 1_000_000_000)
+            deviceTime = deviceTime.advanced(by: .nanoseconds(Int64(delay)))
+        }, client: "fixture-client")
+        let finished = expectation(description: "device sign-in declined")
+        let observation = account.$state.sink { state in
+            if case .failed = state { finished.fulfill() }
+        }
+        defer { observation.cancel(); account.cancel() }
+
+        account.signIn()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(waits, [5, 10, 20, 40].map { UInt64($0) * 1_000_000_000 })
+        XCTAssertEqual(account.state, .failed("The sign-in was declined."))
+    }
+
+    func testDevicePollingHonorsRetryAfterWithoutExtendingTheCode() async {
+        AuthURLProtocol.retryAfter = { $0 == 429 ? "120" : nil }
+        var clock = instant
+        var deviceTime = ContinuousClock.now
+        var waits: [UInt64] = []
+        AuthURLProtocol.response = { request in
+            if request.url!.path.hasSuffix("/devicecode") {
+                return (200, ["device_code": "fixture-device", "user_code": "FIXTURE",
+                              "verification_uri": "https://example.invalid", "expires_in": 40, "interval": 5])
+            }
+            return (429, ["error": "temporarily_unavailable"])
+        }
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: { clock }, deviceClock: { deviceTime }, sleep: { delay in
+            waits.append(delay)
+            clock.addTimeInterval(Double(delay) / 1_000_000_000)
+            deviceTime = deviceTime.advanced(by: .nanoseconds(Int64(delay)))
+        }, client: "fixture-client")
+        let finished = expectation(description: "device sign-in expired")
+        let observation = account.$state.sink { state in
+            if case .failed = state { finished.fulfill() }
+        }
+        defer { observation.cancel(); account.cancel() }
+        account.signIn()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(waits, [5, 35].map { UInt64($0) * 1_000_000_000 })
+        XCTAssertEqual(account.state, .failed("The code expired. Try again."))
+    }
+
+    func testRetryAfterAcceptsSecondsAndHTTPDates() {
+        let now = Date(timeIntervalSince1970: 0)
+        XCTAssertEqual(AccountNet.retryDelay("90", now: now), 90)
+        for date in ["Thu, 01 Jan 1970 00:01:30 GMT", "Thursday, 01-Jan-70 00:01:30 GMT", "Thu Jan  1 00:01:30 1970"] {
+            XCTAssertEqual(AccountNet.retryDelay(date, now: now), 90)
+        }
+        XCTAssertEqual(AccountNet.retryDelay("invalid", now: now), 0)
+    }
+
+    func testDevicePollCancelsAStalledRequestAtTheCodeDeadline() async throws {
+        AuthURLProtocol.stall = true
+        defer { AuthURLProtocol.stall = false }
+        let net = AccountNet(session: session)
+        do {
+            _ = try await net.form("https://example.invalid/token", [:], allowErrors: true,
+                                   deadline: ContinuousClock.now.advanced(by: .milliseconds(100)))
+            XCTFail("The stalled request should have expired")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "The code expired. Try again.")
+        }
+    }
+
+    func testDeviceCodeExpiryIgnoresWallClockChanges() async {
+        for jump in [-3_600.0, 3_600.0] {
+            var polls = 0
+            let lock = NSLock()
+            AuthURLProtocol.response = { request in
+                if request.url!.path.hasSuffix("/devicecode") {
+                    return (200, ["device_code": "fixture-device", "user_code": "FIXTURE",
+                                  "verification_uri": "https://example.invalid", "expires_in": 10, "interval": 5])
+                }
+                return lock.withLock {
+                    polls += 1
+                    return (400, ["error": polls == 1 ? "authorization_pending" : "access_denied"])
+                }
+            }
+            var wall = instant
+            var deviceTime = ContinuousClock.now
+            var waits: [UInt64] = []
+            let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session,
+                                           clock: { wall }, deviceClock: { deviceTime }, sleep: { delay in
+                waits.append(delay)
+                wall.addTimeInterval(waits.count == 1 ? jump : Double(delay) / 1_000_000_000)
+                deviceTime = deviceTime.advanced(by: .nanoseconds(Int64(delay)))
+            }, client: "fixture-client")
+            let finished = expectation(description: "device code expired")
+            let observation = account.$state.sink { state in
+                if case .failed = state { finished.fulfill() }
+            }
+            account.signIn()
+            await fulfillment(of: [finished], timeout: 5)
+            observation.cancel()
+            XCTAssertEqual(account.state, .failed("The code expired. Try again."))
+            XCTAssertEqual(lock.withLock { polls }, 1)
+            XCTAssertEqual(waits, [5_000_000_000, 5_000_000_000])
+            account.cancel()
+        }
+    }
+
     func testDeviceSignInStopsIfTheCodeExpiresWhileWaiting() async throws {
         var tokenRequests = 0
         AuthURLProtocol.response = { request in
@@ -511,8 +940,10 @@ final class AccountTests: XCTestCase {
             return (400, ["error": "expired_token"])
         }
         var clock = instant
-        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: {clock}, sleep: { delay in
+        var deviceTime = ContinuousClock.now
+        let account = MicrosoftAccount(defaults: defaults, vault: vault, session: session, clock: { clock }, deviceClock: { deviceTime }, sleep: { delay in
             clock.addTimeInterval(Double(delay) / 1_000_000_000)
+            deviceTime = deviceTime.advanced(by: .nanoseconds(Int64(delay)))
         }, client: "fixture-client")
         let finished = expectation(description: "expired code ends sign-in")
         let observation = account.$state.sink {state in
@@ -537,6 +968,51 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(account.profile, alice); XCTAssertEqual(account.state, .idle)
         XCTAssertEqual(account.accounts, [alice, bob])
     }
+    func testInstalledGameFilesRetryRestartsLoadingWithoutLookingUpADownload() async throws {
+        var commands: [String] = []
+        var state: [String: Any] = ["phase": "needs_files", "retry_loader": true]
+        let game = GameLink(stopAudio: {}) { command in
+            commands.append(command)
+            if command == "launcher-retry-loader" {
+                state = ["phase": "loading"]
+                return ["ok": true]
+            }
+            return state
+        }
+        await game.refresh()
+        let retry = try XCTUnwrap(game.retryInstalledFiles)
+        await retry()
+        await retry()
+        XCTAssertEqual(commands, ["launcher-state", "launcher-retry-loader", "launcher-state"])
+        XCTAssertEqual(game.phase, .loading(0))
+        XCTAssertNil(game.retryInstalledFiles)
+    }
+
+    func testOlderServerListCannotReplaceTheNewestList() async {
+        let requested = expectation(description: "old server list requested")
+        var oldReply: CheckedContinuation<[String: Any], Never>?
+        var listRequests = 0
+        let game = GameLink(send: { command in
+            XCTAssertEqual(command, "servers")
+            listRequests += 1
+            if listRequests == 1 {
+                return await withCheckedContinuation {
+                    oldReply = $0
+                    requested.fulfill()
+                }
+            }
+            return ["servers": [["name": "Current", "address": "current.invalid"]]]
+        })
+        let old = Task { await game.reloadServers() }
+        await fulfillment(of: [requested], timeout: 2)
+        await game.reloadServers()
+        oldReply?.resume(returning: ["servers": [["name": "Old", "address": "old.invalid"]]])
+        await old.value
+
+        XCTAssertEqual(game.servers.map(\.address), ["current.invalid"])
+        XCTAssertEqual(game.serverRound, 1)
+    }
+
     func testCancelLaunchWhilePreparingDoesNotUncover() async throws {
         let game = GameLink(); var uncovered = false
         var preparationCancelled = false
@@ -658,6 +1134,41 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(bridgeCommands.last, "launcher-session off")
     }
 
+    func testRemovingAnotherAccountKeepsUnresolvedSelectionAcrossRelaunch() async throws {
+        try seed(expired: false)
+        defaults.set(try JSONEncoder().encode(MicrosoftAccount.Catalog(
+            profiles: [alice, bob], selected: "missing"
+        )), forKey: "microsoftAccounts.v2")
+        let account = model()
+        XCTAssertTrue(account.needsAccountSelection)
+
+        await account.remove(bob)
+        let relaunched = model()
+        XCTAssertEqual(relaunched.accounts, [alice])
+        XCTAssertTrue(relaunched.needsAccountSelection)
+        relaunched.select(bob)
+        XCTAssertTrue(relaunched.needsAccountSelection)
+        XCTAssertNil(relaunched.profile)
+        XCTAssertTrue(bridgeCommands.isEmpty)
+    }
+
+    func testUnreadableCatalogRequiresExplicitOfflineChoice() async throws {
+        let unreadable = Data("unreadable accounts".utf8)
+        defaults.set(unreadable, forKey: "microsoftAccounts.v2")
+        let account = model()
+        XCTAssertTrue(account.needsAccountSelection)
+        do {
+            try await account.handOver()
+            XCTFail("Unreadable account metadata must not silently launch Offline")
+        } catch {}
+        XCTAssertTrue(bridgeCommands.isEmpty)
+        XCTAssertEqual(defaults.data(forKey: "microsoftAccounts.v2"), unreadable)
+
+        await account.signOut()
+        XCTAssertFalse(model().needsAccountSelection)
+        XCTAssertEqual(bridgeCommands, ["launcher-session off"])
+    }
+
     func testSuccessfulSignInRepairsMissingSelectedAccount() async throws {
         try seed(expired: false)
         defaults.set(try JSONEncoder().encode(MicrosoftAccount.Catalog(profiles: [alice], selected: "missing")), forKey: "microsoftAccounts.v2")
@@ -740,6 +1251,7 @@ final class LaunchCancellationTests: XCTestCase {
         var owner: String?
         var committed = false
         var pendingCancel: String?
+        var stoppedOwner: String?
         var commands: [String] = []
         var starts: [String] = []
         var commits: [String] = []
@@ -749,6 +1261,7 @@ final class LaunchCancellationTests: XCTestCase {
         var onCommit: ((String) -> Void)?
         var onCancel: ((String) -> Void)?
         var holdStart = true
+        var startReplyError: String?
         var holdCommit = false
         var holdCancel = false
         var holdCommittedCancelReply = false
@@ -760,7 +1273,11 @@ final class LaunchCancellationTests: XCTestCase {
 
         func send(_ command: String) async -> [String: Any] {
             commands.append(command)
-            if command == "launcher-state" { return ["phase": phase] }
+            if command == "launcher-state" {
+                var status: [String: Any] = ["phase": phase]
+                status["stopped_owner"] = stoppedOwner
+                return status
+            }
             if command.hasPrefix("launcher-start ") {
                 let id = String(command.dropFirst("launcher-start ".count))
                 guard pendingCancel == nil else { return ["error": "Cancellation is still draining"] }
@@ -773,6 +1290,7 @@ final class LaunchCancellationTests: XCTestCase {
                 if holdStart {
                     return await withCheckedContinuation { startReplies[id] = (replyPhase, $0) }
                 }
+                if let startReplyError { return ["error": startReplyError] }
                 return ["ok": true, "phase": replyPhase]
             }
             if command.hasPrefix("launcher-commit-start ") {
@@ -836,8 +1354,9 @@ final class LaunchCancellationTests: XCTestCase {
     @MainActor
     private final class Presentation { var count = 0 }
 
-    private func game(_ engine: Engine, _ shown: Presentation) async -> GameLink {
-        let game = GameLink { await engine.send($0) }
+    private func game(_ engine: Engine, _ shown: Presentation,
+                      stopAudio: @escaping () -> Void = {}) async -> GameLink {
+        let game = GameLink(stopAudio: stopAudio) { await engine.send($0) }
         game.prepareSession = {}
         game.uncover = { shown.count += 1 }
         await game.refresh()
@@ -858,8 +1377,11 @@ final class LaunchCancellationTests: XCTestCase {
 
     func testCancelWhileStartAcknowledgmentIsPendingStopsHiddenEngine() async {
         let engine = Engine(), shown = Presentation()
-        let game = await game(engine, shown)
+        var audioStops = 0
+        let game = await game(engine, shown) { audioStops += 1 }
         let play = await heldStart(engine, game)
+        XCTAssertEqual(game.phase, .waiting, "The start acknowledgement is still pending")
+        let audioStopsBeforeCancel = audioStops
         let id = engine.starts[0]
         XCTAssertNotNil(game.launching, "The launcher still exposes Cancel during this await")
         XCTAssertTrue(engine.running)
@@ -870,6 +1392,33 @@ final class LaunchCancellationTests: XCTestCase {
         XCTAssertEqual(shown.count, 0)
         XCTAssertFalse(engine.running)
         XCTAssertTrue(engine.commits.isEmpty, "Cancellation won before presentation commit")
+        XCTAssertEqual(audioStops, audioStopsBeforeCancel + 1)
+    }
+
+    func testUnconfirmedStartDrainsOwnedEngineBeforeEnablingPlayAgain() async {
+        let engine = Engine(), shown = Presentation()
+        engine.holdStart = false
+        engine.holdCancel = true
+        engine.startReplyError = "Unusable start reply"
+        let game = await game(engine, shown)
+        let play = Task { await game.play() }
+        await until({ engine.pendingCancel != nil }, "The ambiguous start must request shutdown")
+        guard let id = engine.pendingCancel else {
+            await play.value
+            return
+        }
+        XCTAssertTrue(engine.running)
+        XCTAssertNotNil(game.launching)
+        await game.play()
+        XCTAssertEqual(engine.starts, [id])
+        XCTAssertEqual(shown.count, 0)
+
+        engine.releaseCancel(id)
+        await play.value
+        XCTAssertFalse(engine.running)
+        XCTAssertNil(game.launching)
+        XCTAssertEqual(game.problem, "Unusable start reply")
+        XCTAssertEqual(engine.cancels, [id])
     }
 
     func testTaskCancellationAfterAcceptedStartCannotUncoverOrLeaveHiddenEngine() async {
@@ -1063,6 +1612,31 @@ final class LaunchCancellationTests: XCTestCase {
         XCTAssertEqual(shown.count, 0)
         XCTAssertEqual(engine.cancels, [id, id])
     }
+    func testMissedCancellationReplyRecoversOnlyForTheMatchingOwner() async {
+        let engine = Engine(), shown = Presentation()
+        engine.cancelFailures = 1
+        let game = await game(engine, shown)
+        let play = await heldStart(engine, game)
+        let id = engine.starts[0]
+        game.cancelLaunch()
+        await until({ game.problem != nil })
+
+        engine.reset()
+        engine.stoppedOwner = UUID().uuidString
+        await game.refresh()
+        XCTAssertNotNil(game.launching)
+
+        engine.stoppedOwner = id
+        await game.refresh()
+        XCTAssertNil(game.launching)
+        XCTAssertNil(game.problem)
+        XCTAssertEqual(game.phase, .waiting)
+        XCTAssertEqual(engine.cancels, [id])
+        engine.releaseStart(id)
+        await play.value
+        XCTAssertEqual(shown.count, 0)
+    }
+
     func testLateCommittedStartReplyCannotPresentOrClearANewerLaunch() async {
         let engine = Engine(), shown = Presentation()
         engine.holdStart = false

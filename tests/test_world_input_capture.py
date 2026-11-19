@@ -43,6 +43,62 @@ def function(source, name):
 
 
 class WorldInputCaptureTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("rustc"), "requires Rust")
+    def test_ios_redraw_uses_live_view_size_without_a_resize_event(self):
+        gfx = (ROOT / "crates/horizon-client-render/src/gfx.rs").read_text()
+        sync = function(gfx, "sync_ios_window_size")
+        source = r"""
+#[derive(Clone, Copy, PartialEq, Eq, Debug)] struct Size { width: u32, height: u32 }
+struct Window(Size);
+impl Window { fn inner_size(&self) -> Size { self.0 } }
+struct Renderer {
+    window: Window, config: Size, external: bool,
+    offscreen: Option<()>, suspended: bool, resizes: usize,
+}
+impl Renderer {
+    fn targeted(&self) -> bool { self.external }
+    fn resize(&mut self, width: u32, height: u32) {
+        self.resizes += 1;
+        self.suspended = width == 0 || height == 0;
+        if !self.suspended { self.config = Size { width, height }; }
+    }
+    SYNC
+}
+fn main() {
+    let landscape = Size { width: 2796, height: 1290 };
+    let portrait = Size { width: 1290, height: 2796 };
+    let mut renderer = Renderer {
+        window: Window(landscape), config: portrait, external: false,
+        offscreen: None, suspended: false, resizes: 0,
+    };
+    assert!(renderer.sync_ios_window_size());
+    assert_eq!(renderer.config, landscape);
+    assert!(!renderer.sync_ios_window_size());
+    assert_eq!(renderer.resizes, 1);
+
+    renderer.window.0.width = 0;
+    assert!(!renderer.sync_ios_window_size() && renderer.suspended);
+    renderer.window.0 = landscape;
+    assert!(renderer.sync_ios_window_size() && !renderer.suspended);
+
+    renderer.window.0 = portrait;
+    renderer.external = true;
+    assert!(!renderer.sync_ios_window_size());
+    renderer.external = false;
+    renderer.offscreen = Some(());
+    assert!(!renderer.sync_ios_window_size());
+    assert_eq!(renderer.config, landscape);
+    assert_eq!(renderer.resizes, 3);
+}
+""".replace("SYNC", sync)
+        with tempfile.TemporaryDirectory(prefix="horizon-mobile-geometry-") as folder:
+            rust = Path(folder) / "probe.rs"
+            binary = Path(folder) / "probe"
+            rust.write_text(source)
+            subprocess.run(["rustc", "--edition=2024", str(rust), "-o", str(binary)],
+                           check=True, timeout=60)
+            subprocess.run([str(binary)], check=True, timeout=10)
+
     def test_loading_completion_wiring(self):
         game = "".join((ROOT / "crates/horizon-client/src" / path).read_text(encoding="utf-8")
                        for path in ("game/world/player_spawn.rs", "game/runtime/window_handler.rs", "game.rs"))
@@ -161,7 +217,8 @@ struct Game {
 impl Default for Game {
     fn default() -> Self {
         Self { stale: false, splitscreen: SplitScreen::default(), left: false, right: false,
-            focused: true, agent_pointer: false, window: Some(Window::default()),
+            focused: true, agent_pointer: false,
+            window: Some(Window { focus: Cell::new(true), ..Window::default() }),
             keyboard_mouse: true, split_window: false, view_at: [0, 0],
             mouse: Mouse::default(), captured: false, capture_mode: None, regrab_on_refocus: false, title: None,
             screen: Screen::Playing, remote: None, studio: Studio::default(), replay: Replay::default(),
@@ -206,6 +263,53 @@ fn main() {
       assert_eq!(game.window.as_ref().unwrap().grabs.get(),0);
       horizon_ios_launcher::COVERED.with(|c|c.set(false));
       game.capture(true);assert!(game.captured); }
+    // A direct grab while the title screen is open leaves the native pointer alone.
+    {
+        let mut game = Game::default();
+        game.title = Some(());
+        game.window.as_ref().unwrap().visible.set(true);
+        game.capture(true);
+        assert!(!game.captured);
+        let window = game.window.as_ref().unwrap();
+        assert_eq!((window.grabs.get(), window.warps.get()), (0, 0));
+        assert!(window.visible.get());
+    }
+    // The game can still capture logically on the title screen in internal runs.
+    for (offscreen, unclaimed, scripted) in [
+        (true, false, false), (false, true, false), (false, false, true),
+    ] {
+        let mut game = Game::default();
+        game.title = Some(());
+        game.options.offscreen = offscreen;
+        game.unclaimed_window = unclaimed;
+        game.scripted = scripted;
+        game.agent_pointer = true;
+        let window = game.window.as_ref().unwrap();
+        window.focus.set(false);
+        window.visible.set(true);
+        game.capture(true);
+        assert!(game.captured);
+        assert!(game.mouse.ignore_first);
+        assert!(!game.agent_pointer);
+        assert!(game.capture_mode.is_none());
+        let window = game.window.as_ref().unwrap();
+        assert_eq!((window.grabs.get(), window.warps.get()), (0, 0));
+        assert!(window.visible.get());
+    }
+    // A window opened in the background has not sent a focus-loss event yet.
+    {
+        let mut game = Game::default();
+        game.window.as_ref().unwrap().focus.set(false);
+        game.window.as_ref().unwrap().visible.set(true);
+        game.capture(true);
+        assert!(!game.captured);
+        let window = game.window.as_ref().unwrap();
+        assert_eq!((window.grabs.get(), window.warps.get()), (0, 0));
+        assert!(window.visible.get());
+        window.focus.set(true);
+        game.capture(true);
+        assert!(game.captured);
+    }
     // The server pack prompt keeps the pointer: nothing grabs it while it is open.
     {
         let mut game = Game::default();
@@ -427,6 +531,7 @@ fn main() {
     {
         let mut game = Game::default();
         game.unclaimed_window = true;
+        game.window.as_ref().unwrap().focus.set(false);
         game.claim_window(&Loop);
         assert_eq!(game.applied_focus, vec![false]);
         game.capture(true);
@@ -547,7 +652,10 @@ fn main() {
         capture = method(source, "capture").replace(
             "horizon_client::mouse::mouse_position_after_grab_change",
             "mouse_position_after_grab_change")
-        fixture = fixture.replace("HELPER", function(mouse, "mouse_position_after_grab_change"))
+        grab_start = source.index("struct Grab {")
+        grab_helpers = source[grab_start:source.index("\n#[cfg(test)]", grab_start)]
+        fixture = fixture.replace("HELPER", function(mouse, "mouse_position_after_grab_change") +
+                                  "\n" + grab_helpers)
         fixture = fixture.replace("METHODS", capture + "\n" +
                                   method(source, "capture_loaded_world") + "\n" +
                                   method(source, "regrab_on_refocus") + "\n" +

@@ -58,7 +58,10 @@ pub fn plain_path(path: &str) -> bool {
 /// `horizon-shaders.toml`, or a `.hshader` file.
 pub fn is_pack(path: &Path) -> bool {
     path.join(MANIFEST).is_file()
-        || (path.is_file() && path.extension().is_some_and(|e| e == EXTENSION))
+        || (path.is_file()
+            && path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION)))
 }
 
 /// Every file of the `.hshader` at `path`, by its path in the package.

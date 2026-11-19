@@ -442,7 +442,7 @@ mod tests {
             assert!(bar.add_player(game, a));
             let dir = std::env::temp_dir().join(format!("boss-save-{}", std::process::id()));
             game.world_root = dir.clone();
-            game.save_bossbars();
+            game.save_bossbars().unwrap();
             let root = horizon_client::save::read_dat(&game.bossbar_path()).unwrap();
             let loaded = horizon_client::bossbar::BossBars::unpack(root.get("data").unwrap());
             let kept = loaded.get("mod:bar").unwrap();
@@ -567,7 +567,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert!(bar.set_value(game, 7));
-            game.save_bossbars();
+            game.save_bossbars().unwrap();
             // The world opens again and loads the bars, as `finish_open_world` does.
             game.bosses = Default::default();
             game.load_bossbars();

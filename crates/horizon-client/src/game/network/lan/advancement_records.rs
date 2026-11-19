@@ -6,44 +6,41 @@ impl Game<'_> {
         &self,
         host: &LanHost,
         guest: &horizon_client::lan::guest::Guest,
-    ) {
+    ) -> horizon_client::Result<()> {
         if !guest.placed
             || guest.released
             || !guest.participates_in_player_simulation()
             || self.adv.tree.list.is_empty()
         {
-            return;
+            return Ok(());
         }
         let Some(uuid) = self.records_uuid(host, guest.uuid) else {
-            return;
+            return Ok(());
         };
         let path = super::stats::player_json(&self.world_root, "advancements", uuid);
         let json = guest
             .advancements
             .to_json(&self.adv.tree, horizon_world::DATA_VERSION);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
-        }
+        // A failed write must leave the previous advancement file readable.
+        super::stats::write_player_json(&path, &json)
     }
     /// `PlayerAdvancements.save` and `ServerStatsCounter.save` of a network player.
     pub(in crate::game) fn save_guest_records(
         &self,
         host: &LanHost,
         guest: &horizon_client::lan::guest::Guest,
-    ) {
+    ) -> horizon_client::Result<()> {
         if !guest.placed || guest.released || !guest.participates_in_player_simulation() {
-            return;
+            return Ok(());
         }
         let Some(uuid) = self.records_uuid(host, guest.uuid) else {
-            return;
+            return Ok(());
         };
-        self.save_guest_advancements(host, guest);
-        if let Some(play) = host.play.get(&guest.conn) {
-            play.stats
-                .write(&super::stats::player_json(&self.world_root, "stats", uuid));
-        }
+        let advancements = self.save_guest_advancements(host, guest);
+        let stats = host.play.get(&guest.conn).map_or(Ok(()), |play| {
+            let path = super::stats::player_json(&self.world_root, "stats", uuid);
+            super::stats::write_player_json(&path, &play.stats.to_json())
+        });
+        advancements.and(stats)
     }
 }

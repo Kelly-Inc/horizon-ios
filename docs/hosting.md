@@ -1,6 +1,6 @@
 # Host a server
 
-> This shared guide covers hosting a server on a computer. For playing on iPhone/iPad, use the [mobile README](../README.md). Report mobile-client problems in [heyskylo/horizon-ios](https://github.com/heyskylo/horizon-ios/issues).
+> This shared guide covers hosting a server on a computer. For playing on iPhone/iPad, use the [mobile README](../README.md). Report mobile-client problems in [Kelly-Inc/horizon-ios](https://github.com/Kelly-Inc/horizon-ios/issues).
 
 `horizon-server` hosts a Minecraft Java Edition 26.3 server with Horizon's own game as the engine: one native
 program, no Java, one settings file, a command line, and a web panel. Vanilla 26.3 clients and Horizon clients
@@ -501,7 +501,7 @@ or keeps its settings, fix both in `server.toml`:
 ```toml
 [api]
 bind = "127.0.0.1:8131"      # or your tailnet address, 100.x.y.z:8131
-token = "a long random string only the bot knows"
+token = "b0t-0nly-2f9c41a7d8e35b60"   # 16 characters or more, no spaces
 ```
 
 The same rules as the panel's hold: a tailnet or loopback address, unless `allow_public = true` (the token is then
@@ -757,7 +757,7 @@ No image is published: build one from the repository. The image holds none of Mi
 folder you prepared (step 2) read-only.
 
 ```sh
-git clone https://github.com/heyskylo/horizon-ios.git horizon && cd horizon
+git clone https://github.com/Kelly-Inc/horizon-ios.git horizon && cd horizon
 docker build -f packaging/server/Dockerfile -t horizon-server .
 
 docker run -d --name horizon -p 25565:25565 --stop-timeout 180 \
@@ -782,7 +782,7 @@ docker run -d --name horizon -p 25565:25565 --stop-timeout 180 \
 ## 10. How fast is it
 
 The latest bot benchmark compares Horizon with vanilla 26.3, Paper and Fabric + Lithium:
-[benchmarks/server-four-way-2026-10-19](https://github.com/heyskylo/horizon-ios/blob/main/benchmarks/server-four-way-2026-10-19/README.md).
+[benchmarks/server-four-way-2026-10-19](https://github.com/Kelly-Inc/horizon-ios/blob/main/benchmarks/server-four-way-2026-10-19/README.md).
 It ran release v2026.10.19 on a 4-thread laptop CPU (i7-7500U), with 1 to 50 players walking, exploring and
 standing around spawn, the bots on another machine. All four servers did the same work. Against
 Pumpkin: [performance/server-vs-pumpkin.md](performance/server-vs-pumpkin.md). In short:

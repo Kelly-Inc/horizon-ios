@@ -1,8 +1,9 @@
 //! Worlds and the multiplayer server list from the control socket: what the Select World, Edit
 //! World and Multiplayer screens do, by world folder. Changing a world needs the title screen
 //! (no world open), as those screens do; deleting one needs `--confirm`.
-use super::Game;
+use super::{Game, WorldFolder};
 use horizon_client::{Result, title};
+use horizon_protocol::servers::ServerEntry;
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -81,6 +82,32 @@ impl NativeWorldCreation {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct SavedServerSelection {
+    index: usize,
+    name: String,
+    address: String,
+}
+
+fn server_remove_index(argument: &str, list: &[ServerEntry]) -> Result<usize> {
+    if !argument.starts_with('{') {
+        return Ok(argument
+            .split_whitespace()
+            .next()
+            .ok_or("server-remove INDEX")?
+            .parse()?);
+    }
+    let selection: SavedServerSelection = serde_json::from_str(argument)?;
+    if list
+        .get(selection.index)
+        .is_some_and(|entry| entry.name == selection.name && entry.ip == selection.address)
+    {
+        Ok(selection.index)
+    } else {
+        Err("The saved server list changed. Select the server again before deleting it.".into())
+    }
+}
+
 fn saves() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join("saves"))
 }
@@ -114,7 +141,7 @@ pub(super) fn file_command(
         }
         "servers" => {
             let file = horizon_client::multiplayer::servers_file(&saves()?);
-            let servers: Vec<Value> = horizon_protocol::servers::load(&file)
+            let servers: Vec<Value> = horizon_protocol::servers::load_checked(&file)?
                 .iter()
                 .map(|s| json!({ "name": s.name, "address": s.ip, "icon": s.icon }))
                 .collect();
@@ -130,21 +157,26 @@ pub(super) fn file_command(
                 .filter(|n| !n.is_empty())
                 .unwrap_or("Minecraft Server");
             let file = horizon_client::multiplayer::servers_file(&saves()?);
-            let mut list = horizon_protocol::servers::load(&file);
-            list.push(horizon_protocol::servers::ServerEntry::new(name, address));
-            horizon_protocol::servers::save(&file, &list)?;
-            json!({ "ok": true, "index": list.len() - 1 })
+            let _guard = horizon_protocol::servers::lock();
+            let index =
+                horizon_protocol::servers::append_visible(&file, &ServerEntry::new(name, address))?;
+            json!({ "ok": true, "index": index })
         }
         "server-remove" => {
-            let index: usize = words.get(1).ok_or("server-remove INDEX")?.parse()?;
+            let argument = line
+                .trim_start()
+                .strip_prefix("server-remove")
+                .unwrap_or("")
+                .trim();
             let file = horizon_client::multiplayer::servers_file(&saves()?);
-            let mut list = horizon_protocol::servers::load(&file);
-            if index >= list.len() {
+            let _guard = horizon_protocol::servers::lock();
+            let list = horizon_protocol::servers::load_checked(&file)?;
+            let index = server_remove_index(argument, &list)?;
+            let Some(selected) = list.get(index) else {
                 return Err(format!("no server at {index}; servers lists {}", list.len()).into());
-            }
-            let removed = list.remove(index);
-            horizon_protocol::servers::save(&file, &list)?;
-            json!({ "ok": true, "removed": removed.ip })
+            };
+            horizon_protocol::servers::remove_visible_at(&file, index, selected)?;
+            json!({ "ok": true, "removed": selected.ip })
         }
         "server-ping" => {
             let address = (*words.get(1).ok_or("server-ping ADDRESS")?).to_owned();
@@ -302,7 +334,14 @@ impl Game<'_> {
                 let name = rest.trim();
                 let name = if name.is_empty() { "New World" } else { name };
                 let folder = title::new_world_folder(&saves()?, name);
-                self.open_world(&folder, Some(name), seed, creative, None)?;
+                self.open_world_request(
+                    &folder,
+                    Some(name),
+                    seed,
+                    creative,
+                    None,
+                    WorldFolder::New,
+                )?;
                 json!({ "ok": true, "folder": folder, "name": name })
             }
             _ => return Ok(None),
@@ -314,6 +353,16 @@ impl Game<'_> {
 #[cfg(test)]
 mod native_creation_tests {
     use super::*;
+    #[test]
+    fn server_remove_rejects_a_row_that_now_refers_to_another_server() {
+        let mut current = vec![ServerEntry::new("Second", "second.invalid")];
+        let selection = r#"{"index":0,"name":"First","address":"first.invalid"}"#;
+        assert!(server_remove_index(selection, &current).is_err());
+        current.insert(0, ServerEntry::new("First", "first.invalid"));
+        assert_eq!(server_remove_index(selection, &current).unwrap(), 0);
+        assert_eq!(server_remove_index("1", &current).unwrap(), 1);
+    }
+
     #[test]
     fn native_creation_carries_all_generation_choices() {
         let v: NativeWorldCreation = serde_json::from_str(r#"{"name":"A world with spaces","seed":"hello world","mode":"creative","difficulty":"easy","commands":true,"flat":true,"structures":false,"bonus_chest":true}"#).unwrap();

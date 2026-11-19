@@ -423,11 +423,26 @@ impl Renderer {
         surface_config(&self.config, self.hdr.as_ref().map(|hdr| hdr.output))
     }
 
-    /// After a new window surface: what it offers, and an output that failed on the old one
+    /// After attaching a window surface: what it offers, and an output that failed on the old one
     /// may be tried again. The settings apply again.
     pub(super) fn surface_recreated(&mut self) {
-        let offer = offer(self.surface.as_deref(), &self.adapter);
-        self.output_caps.hdr = offer.unwrap_or(self.output_caps.hdr);
+        if let Some(surface) = &self.surface {
+            let caps = surface.get_capabilities(&self.adapter);
+            self.output_caps.hdr = hdr::output(&caps);
+            if self.hdr.as_ref().is_some_and(|hdr| !hdr.output.supported(&caps)) {
+                // The new display must be drawable before the owner's next
+                // output update. Keep the frame pipelines and use SDR for now.
+                self.frame_gen.stop_to_configure();
+                self.queue.wait();
+                self.hdr = None;
+                self.output.encoding = None;
+                self.drop_hdr_marker();
+                log::info!("Horizon renderer: using SDR on the new surface");
+            }
+        }
+        if let Some(watch) = &mut self.display {
+            watch.surface_changed_at(Instant::now());
+        }
         self.display_fresh = true;
         self.output_rejected = None;
     }
@@ -440,10 +455,9 @@ impl Renderer {
     /// poll or an event then.
     pub fn display_changed(&mut self) -> bool {
         super::flush_display_log();
-        if std::mem::take(&mut self.display_fresh) {
-            return true;
-        }
-        self.read_display(Instant::now())
+        let fresh = std::mem::take(&mut self.display_fresh);
+        let changed = self.read_display(Instant::now());
+        fresh || changed
     }
 
     /// The display read where a poll is due or Auto's grace is over (`poll_display`).
@@ -495,6 +509,31 @@ mod tests {
         ray_tracing: false,
         shaders_pack: false,
     };
+    #[test]
+    fn an_reattached_surface_refreshes_the_display_before_the_next_scheduled_poll() {
+        let now = Instant::now();
+        let mut watch = DisplayWatch {
+            polled: Some(now + super::super::DISPLAY_POLL),
+            ..Default::default()
+        };
+        let (mut caps, mut reading) = window(Some(Pq), Some(true));
+        let (_, phone) = window(None, Some(false));
+        assert_eq!(watch.poll(reading, now, || phone), None);
+
+        watch.surface_changed_at(now);
+        assert!(poll_display(
+            Some(&mut watch),
+            &mut reading,
+            &mut caps,
+            None,
+            now,
+            || phone,
+            || Some(None),
+        ));
+        assert_eq!(reading, phone);
+        assert_eq!(caps.hdr, None);
+    }
+
     fn on() -> Graphics {
         Graphics {
             hdr: HdrMode::On,

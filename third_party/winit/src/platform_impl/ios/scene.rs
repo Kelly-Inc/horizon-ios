@@ -44,6 +44,9 @@ fn windows(scene: &UIWindowScene, focused: Option<bool>, occluded: Option<bool>)
             if !window.isKindOfClass(WinitUIWindow::class()) {
                 return None;
             }
+            if focused == Some(false) {
+                super::window::release_window_hardware_keys(window);
+            }
             let id = WindowId(super::window::WindowId::from(
                 window as *const _ as usize as u64,
             ));

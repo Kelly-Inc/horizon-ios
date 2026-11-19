@@ -266,12 +266,6 @@ static TABLE: LazyLock<Vec<Def>> = LazyLock::new(|| {
     t
 });
 
-/// Mth.floor for doubles.
-fn floor_int(v: f64) -> i32 {
-    let i = v as i32;
-    if v < f64::from(i) { i - 1 } else { i }
-}
-
 fn number(json: &Json) -> Option<&str> {
     match json {
         Json::Number(n) => Some(n),
@@ -282,7 +276,9 @@ fn codec_int(json: &Json) -> Option<i32> {
     number(json).map(Json::int_value)
 }
 fn codec_double(json: &Json) -> Option<f64> {
-    number(json).map(Json::double_value)
+    number(json)
+        .map(Json::double_value)
+        .filter(|value| value.is_finite())
 }
 fn codec_bool(json: &Json) -> Option<bool> {
     match json {
@@ -300,8 +296,19 @@ fn double_range(v: f64, lo: f64, hi: f64) -> Option<f64> {
     // Double.compareTo: -0.0 sorts below 0.0 and NaN above everything.
     (v.total_cmp(&lo).is_ge() && v.total_cmp(&hi).is_le() && !v.is_nan()).then_some(v)
 }
-fn log_mouse(value: i32) -> f64 {
+pub(crate) fn log_mouse(value: i32) -> f64 {
     horizon_core::jmath::pow(10.0, f64::from(value) / 100.0)
+}
+pub(crate) fn wheel_step(value: f64) -> f64 {
+    let step = horizon_core::jmath::log10(value) * 100.0;
+    let nearest = step.round();
+    // A canonical step can round just below its integer after log10.
+    let canonical = log_mouse(nearest as i32);
+    if value == canonical || value == f64::from(canonical as f32) {
+        nearest
+    } else {
+        step.floor()
+    }
 }
 fn unit_alt(json: &Json) -> Option<f64> {
     codec_double(json)
@@ -355,6 +362,9 @@ impl Spec {
     /// `ValueSet.validateValue`; `None` makes `OptionInstance.set` fall back
     /// to the option's initial value.
     fn validate(self, v: &V) -> Option<V> {
+        if matches!(v, V::Double(value) if !value.is_finite()) {
+            return None;
+        }
         match (self, v) {
             (Spec::Bool, V::Bool(_)) => Some(v.clone()),
             (Spec::Int(lo, hi), V::Int(x)) => (*x >= lo && *x <= hi).then(|| v.clone()),
@@ -369,10 +379,13 @@ impl Spec {
             }
             (Spec::Fov, V::Int(x)) => (30..=110).contains(x).then(|| v.clone()),
             (Spec::WheelSensitivity, V::Double(x)) => {
-                let i = floor_int(horizon_core::jmath::log10(*x) * 100.0);
-                (-200..=100).contains(&i).then(|| V::Double(log_mouse(i)))
+                let step = wheel_step(*x);
+                (-200.0..=100.0)
+                    .contains(&step)
+                    .then(|| V::Double(log_mouse(step as i32)))
             }
-            (Spec::Unit, V::Double(x)) => (*x >= 0.0 && *x <= 1.0).then(|| v.clone()),
+            // The on-disk codec accepts positive zero. Canonicalize signed zero from input.
+            (Spec::Unit, V::Double(x)) => (0.0..=1.0).contains(x).then(|| V::Double(x.abs())),
             (Spec::UnitSquare | Spec::UnitSquareImplicit, V::Double(x)) => {
                 let root = x.sqrt();
                 (0.0..=1.0)
@@ -564,6 +577,20 @@ impl OptionsFile {
             .validate(&value)
             .unwrap_or_else(|| TABLE[i].default.clone());
     }
+    pub(crate) fn set_f32(&mut self, key: &str, value: f32) {
+        let mut widened = f64::from(value);
+        if let Some(index) = Self::index(key)
+            && let Kind::Option(Spec::Scaled(_, _, factor, ..)) = TABLE[index].kind
+        {
+            // The slider already picked a step. Widening f32 can put it just below that step.
+            let step = (widened * factor).round() / factor;
+            if step as f32 == value {
+                widened = step;
+            }
+        }
+        self.set(key, V::Double(widened));
+    }
+
     /// Select an enum option by serialized name.
     pub fn set_name(&mut self, key: &str, name: &str) {
         let Some(i) = Self::index(key) else { return };
@@ -739,6 +766,20 @@ pub fn keys() -> Vec<&'static str> {
     TABLE.iter().map(|d| d.key.as_str()).collect()
 }
 
+/// Parse the shared launcher and control-socket setting command. Its value may contain spaces.
+pub fn parse_set_command(line: &str) -> Result<(&str, &str), &'static str> {
+    let (_, arguments) = line
+        .trim()
+        .split_once(char::is_whitespace)
+        .filter(|(verb, _)| *verb == "options-set")
+        .ok_or("options-set KEY VALUE")?;
+    let (key, value) = arguments
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or("options-set KEY VALUE: missing the value")?;
+    Ok((key, value.trim_start()))
+}
+
 /// What an option accepts, for the control socket (`options-get`).
 fn accepts(kind: Kind) -> serde_json::Value {
     use serde_json::json;
@@ -805,6 +846,26 @@ impl OptionsFile {
         Some(out)
     }
 
+    /// Describe the requested keys, or every known option when none are named.
+    pub fn describe_options(
+        &self,
+        requested: &[&str],
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        let wanted = if requested.is_empty() {
+            keys()
+        } else {
+            requested.to_vec()
+        };
+        wanted
+            .into_iter()
+            .map(|key| {
+                self.describe(key)
+                    .map(|description| (key.to_owned(), description))
+                    .ok_or_else(|| format!("unknown option {key}; options-get lists them all"))
+            })
+            .collect()
+    }
+
     /// Set an option from text, as the control socket's `options-set` does:
     /// enums by name, key bindings by key name (`key.keyboard.w`), lists as
     /// JSON. Unlike loading `options.txt`, a value the option refuses is an
@@ -812,6 +873,10 @@ impl OptionsFile {
     pub fn set_text(&mut self, key: &str, text: &str) -> Result<(), String> {
         let i = Self::index(key).ok_or_else(|| format!("unknown option {key}"))?;
         let d = &TABLE[i];
+        // Plain fields are written verbatim as one options.txt line.
+        if matches!(d.kind, Kind::PlainStr) && text.contains(['\r', '\n']) {
+            return Err(format!("{key} requires a single-line value"));
+        }
         let refused = || format!("{key} refuses {text:?}; it accepts {}", accepts(d.kind));
         let candidate = if let Some(names) = choices(d.kind) {
             let x = names.iter().position(|n| *n == text).ok_or_else(refused)?;
@@ -865,6 +930,44 @@ mod control_tests {
     }
 
     #[test]
+    fn options_set_command_requires_a_value_and_preserves_internal_spaces() {
+        assert!(parse_set_command("options-set").is_err());
+        assert!(parse_set_command("options-set lastServer").is_err());
+        assert!(parse_set_command("options-set lastServer   ").is_err());
+        assert_eq!(
+            parse_set_command("  options-set   resourcePacks   [\"vanilla\", \"file/My Pack.zip\"]  ").unwrap(),
+            ("resourcePacks", r#"["vanilla", "file/My Pack.zip"]"#)
+        );
+    }
+
+    #[test]
+    fn listing_options_distinguishes_an_empty_query_from_a_subset() {
+        let file = OptionsFile::default();
+        let all = file.describe_options(&[]).unwrap();
+        assert_eq!(all.len(), keys().len());
+        let subset = file.describe_options(&["fov", "lastServer"]).unwrap();
+        assert_eq!(subset.len(), 2);
+        for (key, value) in subset {
+            assert_eq!(all.get(&key), Some(&value));
+        }
+        assert!(file.describe_options(&["fov", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn plain_string_option_rejects_a_value_it_cannot_round_trip() {
+        let mut file = OptionsFile::default();
+        file.set_text("lastServer", "example.org:25565").unwrap();
+        let original = file.serialize();
+        for value in ["two\nlines", "two\rlines", "two\r\nlines"] {
+            assert!(file.set_text("lastServer", value).is_err());
+            assert_eq!(file.serialize(), original);
+        }
+        assert_eq!(OptionsFile::parse(&original).string("lastServer"), "example.org:25565");
+        file.set_text("resourcePacks", "[\n\"vanilla\"\n]").unwrap();
+        assert_eq!(OptionsFile::parse(&file.serialize()).list("resourcePacks"), ["vanilla"]);
+    }
+
+    #[test]
     fn sets_valid_values_and_refuses_others() {
         let mut f = OptionsFile::default();
         f.set_text("fov", "90").unwrap();
@@ -894,6 +997,66 @@ mod control_tests {
                 .contains("unknown option")
         );
     }
+    #[test]
+    fn wheel_sensitivity_round_trips_each_slider_step() {
+        let mut options = OptionsFile::default();
+        for step in -200..=100 {
+            let sensitivity = log_mouse(step);
+            options.set_f32("mouseWheelSensitivity", sensitivity as f32);
+            let reloaded = OptionsFile::parse(&options.serialize());
+            assert_eq!(reloaded.double("mouseWheelSensitivity"), sensitivity);
+            assert_eq!(wheel_step(f64::from(sensitivity as f32)), f64::from(step));
+        }
+        options.set_text("mouseWheelSensitivity", "2.0").unwrap();
+        assert_eq!(options.double("mouseWheelSensitivity"), log_mouse(30));
+    }
+
+    #[test]
+    fn f32_slider_values_keep_their_steps_when_saved() {
+        let mut options = OptionsFile::default();
+        for step in 0..=40 {
+            options.set_f32("chunkSectionFadeInTime", step as f32 / 20.0);
+            let reloaded = OptionsFile::parse(&options.serialize());
+            assert_eq!(
+                reloaded.double("chunkSectionFadeInTime"),
+                f64::from(step) / 20.0
+            );
+        }
+        options.set_text("chunkSectionFadeInTime", "0.69").unwrap();
+        assert_eq!(options.double("chunkSectionFadeInTime"), 0.65);
+    }
+
+    #[test]
+    fn negative_zero_volume_remains_muted_after_reloading() {
+        let mut options = OptionsFile::default();
+        options.set_text("soundCategory_master", "-0.0").unwrap();
+        let reloaded = OptionsFile::parse(&options.serialize());
+        assert_eq!(reloaded.double("soundCategory_master"), 0.0);
+    }
+
+    #[test]
+    fn rejects_invalid_float_commands_without_resetting_the_previous_value() {
+        let mut options = OptionsFile::default();
+        options.set_text("chunkSectionFadeInTime", "1.25").unwrap();
+        options.set_text("mouseWheelSensitivity", "2.0").unwrap();
+        for (name, invalid) in [
+            ("chunkSectionFadeInTime", &["NaN", "inf", "-inf"][..]),
+            (
+                "mouseWheelSensitivity",
+                &["NaN", "inf", "-inf", "0", "-1"][..],
+            ),
+        ] {
+            let previous = options.get(name).cloned();
+            for value in invalid {
+                assert!(
+                    options.set_text(name, value).is_err(),
+                    "{name} accepted {value}"
+                );
+                assert_eq!(options.get(name).cloned(), previous);
+            }
+        }
+    }
+
     #[test]
     fn preserves_startup_compile_setting_without_adding_an_unset_value() {
         for value in ["120", "0", "not-numeric"] {

@@ -43,6 +43,9 @@ impl Output {
             Self::ScRgb => wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
         }
     }
+    pub(super) fn supported(self, caps: &wgpu::SurfaceCapabilities) -> bool {
+        caps.color_spaces(self.format()).contains(self.space())
+    }
 }
 
 /// `HORIZON_HDR_OUTPUT`'s names, in order of preference.
@@ -58,7 +61,7 @@ fn pick(caps: &wgpu::SurfaceCapabilities, only: Option<&str>) -> Option<Output> 
         .into_iter()
         .filter(|(_, name)| only.is_none_or(|o| o == *name))
         .map(|(output, _)| output)
-        .find(|o| caps.color_spaces(o.format()).contains(o.space()))
+        .find(|o| o.supported(caps))
 }
 /// The HDR output an offscreen renderer (`--offscreen`) offers: it has no display to ask, so
 /// only the one `HORIZON_HDR_OUTPUT` names, for HDR screenshots without an HDR display.
@@ -2016,6 +2019,20 @@ var<private> params: ReferenceParams;
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_surface_must_offer_both_the_format_and_hdr_color_space() {
+        let sdr = caps(&[(F::Rgb10a2Unorm, S::SRGB), (F::Rgba16Float, S::SRGB)]);
+        assert!(!Output::Pq.supported(&sdr));
+        assert!(!Output::ScRgb.supported(&sdr));
+
+        let both = caps(&[
+            (F::Rgb10a2Unorm, S::BT2100_PQ),
+            (F::Rgba16Float, S::EXTENDED_SRGB_LINEAR),
+        ]);
+        assert_eq!(pick(&both, None), Some(Output::Pq));
+        assert!(Output::ScRgb.supported(&both));
     }
 
     #[test]

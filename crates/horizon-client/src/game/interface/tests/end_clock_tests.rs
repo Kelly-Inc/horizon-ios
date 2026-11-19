@@ -105,7 +105,12 @@ fn time_moves_the_clock_the_end_runs_on() {
     assert_eq!(run(&mut game, "pause"), "Paused clock minecraft:the_end");
     game.sync_level();
     game.level.write(&world).unwrap();
-    game.save_world_state();
+    let clocks = world.join("data/minecraft/world_clocks.dat");
+    std::fs::create_dir_all(&clocks).unwrap();
+    let failure = game.save_game_metadata().unwrap_err();
+    assert!(failure.to_string().contains("world clocks"), "{failure}");
+    std::fs::remove_dir(&clocks).unwrap();
+    game.save_game_metadata().unwrap();
     let level = Level::read(&world).unwrap();
     assert_eq!(level.end_clock, Some(400));
     game.level = level;

@@ -17,6 +17,7 @@ final class SkinHead: ObservableObject {
 
     @MainActor
     func load(_ name: String?) async {
+        guard !Task.isCancelled else { return }
         revision = UUID()
         let requested = revision
         guard let name, !name.isEmpty else {

@@ -2237,6 +2237,9 @@ mod tests {
                 Ok(()) => panic!("an unknown dimension must refuse the load"),
             }
             assert!(game.admit_level_save().is_err());
+            let (reply, _) = std::sync::mpsc::channel();
+            assert!(game.begin_control_save(true, reply).is_err());
+            assert!(game.pending_save.is_none());
             // No level was touched: the game still holds the level it
             // opened in, with nothing parked.
             assert_eq!(game.dim, back);

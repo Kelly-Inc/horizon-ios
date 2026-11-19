@@ -79,6 +79,8 @@ pub(super) struct Loading {
     pub(super) title_drawn: bool,
     pub(super) menu: startup_menu::StartupMenu,
     pub(super) import: Option<import_screen::Import>,
+    /// Prevent an automatic download loop when the loader still rejects the files.
+    pub(super) file_download_attempted: bool,
     pub(super) brand: horizon_client::loading_overlay::Overlay,
     pub(super) error: Option<Box<dyn std::error::Error>>,
 }
@@ -195,7 +197,7 @@ impl Loading {
         ) {
             Ok(r) => {
                 self.renderer = Some(r);
-                self.airplay = None;
+                self.airplay = Default::default();
                 horizon_ios_launcher::present();
             }
             Err(e) => {
@@ -268,7 +270,7 @@ impl Loading {
         ) {
             Ok(r) => {
                 self.renderer = Some(r);
-                self.airplay = None;
+                self.airplay = Default::default();
                 // The GPU holds the atlas now: keep its copy compressed until the world
                 // renderer reads it at the handoff, as the game does after its first frame.
                 if let Some(gui) = &mut self.gui {
@@ -387,9 +389,52 @@ impl Loading {
         }
         event_loop.set_control_flow(ControlFlow::Poll);
     }
+    /// Draw recovery with its own atlas, including when the title renderer is gone.
+    pub(in crate::game) fn set_import_screen_renderer(&mut self, atlas: &HudAtlas) {
+        horizon_client::ui_theme::reset_atlas();
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if let Some(renderer) = &mut self.renderer {
+            renderer.release_surface();
+        }
+        let offscreen = self
+            .options
+            .as_ref()
+            .is_some_and(|options| options.offscreen);
+        match loading_renderer(
+            window,
+            offscreen,
+            Some(atlas),
+            None,
+            self.renderer.as_ref(),
+            self.settings.horizon.api,
+            false,
+        ) {
+            Ok(renderer) => self.renderer = Some(renderer),
+            Err(error) => {
+                log::warn!("Horizon: could not build the game-file recovery renderer: {error}");
+                if let Some(renderer) = &mut self.renderer
+                    && let Err(error) = renderer.recreate_surface()
+                {
+                    log::warn!("Horizon: could not restore the loading surface: {error}");
+                }
+            }
+        }
+    }
+
     pub(super) fn draw(&mut self) {
         if horizon_ios_launcher::covered() {
             return;
+        }
+        #[cfg(target_os = "ios")]
+        if self
+            .renderer
+            .as_mut()
+            .is_some_and(Renderer::sync_ios_window_size)
+        {
+            self.finish_menu_drags();
+            self.apply_menu_settings();
         }
         let Some(size) = self
             .renderer
@@ -481,9 +526,7 @@ impl Loading {
             Ok(renderer) => renderer,
             // The screen that says why (a phone's import screen) draws on the loading renderer.
             Err(e) => {
-                if let Some(renderer) = &mut self.renderer {
-                    let _ = renderer.recreate_surface();
-                }
+                self.renderer = previous;
                 self.gui = Some(gui);
                 return Err(e);
             }
@@ -529,9 +572,7 @@ impl Loading {
             Ok(game) => game,
             Err(error) => {
                 drop(renderer);
-                if let Some(renderer) = &mut self.renderer {
-                    let _ = renderer.recreate_surface();
-                }
+                self.renderer = previous;
                 return Err(error);
             }
         };
@@ -768,6 +809,7 @@ impl App {
                     // Poll expensive workers to completion without blocking UIKit.
                     horizon_client::mod_content::cancel_root_collectors();
                     let mut stopped = game.audio.shutdown_workers();
+                    stopped &= game.poll_screenshot_writes();
                     stopped &= horizon_client::audio::poll_retired_workers();
                     stopped &= horizon_client::mod_content::poll_root_collectors();
                     stopped &= shader_packs::shutdown_parser();
@@ -832,7 +874,7 @@ impl App {
                             }
                             horizon_airplay::screen(false, false);
                             if let Some(owner) = cancelled_start {
-                                launcher::acknowledge_cancelled_start(&owner);
+                                horizon_ios_launcher::acknowledge_cancelled_start(&owner);
                             }
                         }
                         Err(error) => {
@@ -920,7 +962,7 @@ impl App {
                                     "Horizon: old resource collection did not start: {error}"
                                 );
                             }
-                            launcher::acknowledge_cancelled_start(&owner);
+                            horizon_ios_launcher::acknowledge_cancelled_start(&owner);
                         }
                         Err(error) => {
                             loading.error = Some(error);
@@ -1032,7 +1074,7 @@ pub(super) fn launcher_loading(
     let loading = Loading {
         window: None,
         renderer: None,
-        airplay: None,
+        airplay: Default::default(),
         boot: horizon_client::hud::HudAtlas::boot(),
         gui: None,
         settings,
@@ -1054,6 +1096,7 @@ pub(super) fn launcher_loading(
         title_drawn: false,
         menu,
         import: None,
+        file_download_attempted: false,
         brand: Default::default(),
         error: None,
     };

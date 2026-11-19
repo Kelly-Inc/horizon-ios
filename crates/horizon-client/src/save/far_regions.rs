@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 /// How long a far read trusts a kept header that this process did not write
 /// under: what another program saved shows in the far view this long after.
 const HEADER_TTL: Duration = Duration::from_secs(10);
-/// The kept headers (8 KiB each) past which the ones too old to be used
-/// again are dropped.
+/// Maximum cached region headers (8 KiB each) and negative lookups.
 const KEPT_HEADERS: usize = 256;
 
 /// A region file's header, `None` without the file, as of `checked` and read
@@ -76,10 +75,27 @@ impl FarRegions {
                     kept.header.clone()
                 }
                 _ => {
+                    regions.remove(&region);
+                    let header = match RegionHeader::read(path()) {
+                        Ok(header) if !header.is_complete() => {
+                            drop(regions);
+                            return header.read_chunk(chunk).ok()?;
+                        }
+                        Ok(header) => Some(Arc::new(header)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(_) => return None,
+                    };
                     if regions.len() >= KEPT_HEADERS {
                         regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
+                        if regions.len() >= KEPT_HEADERS
+                            && let Some(oldest) = regions
+                                .iter()
+                                .min_by_key(|(_, kept)| kept.checked)
+                                .map(|(&region, _)| region)
+                        {
+                            regions.remove(&oldest);
+                        }
                     }
-                    let header = RegionHeader::read(path()).ok().map(Arc::new);
                     let kept = FarRegion {
                         checked: Instant::now(),
                         written,
@@ -105,10 +121,10 @@ impl SaveDir {
             .ok()?
             .get(&(Folder::Region, x, z))
             .map(|(_, record)| record.clone());
-        if let Some(record) = pending {
-            return record.tag().map(|tag| (*tag).clone());
-        }
-        let mut root = self.far_region_record(x, z)?;
+        let mut root = match pending {
+            Some(record) => record.tag().map(|tag| (*tag).clone())?,
+            None => self.far_region_record(x, z)?,
+        };
         self.upgrade_record(Folder::Region, &mut root).ok()?;
         Some(root)
     }
@@ -123,10 +139,18 @@ impl SaveDir {
         if before & 1 == 0 {
             let path = || self.region_path("region", region.0, region.1);
             let record = self.far_regions.read(ChunkPos::new(x, z), before, path);
-            // The same stamp after the read: no write began since the header
-            // was read, so the chunk was where the header says all along.
             if stamp()? == before {
-                return record?.nbt(Limits::default()).ok();
+                let root = record?.nbt(Limits::default()).ok()?;
+                let tag = root.tag.get("Level").unwrap_or(&root.tag);
+                // An external writer can reuse a sector without changing our stamp.
+                if [("xPos", x), ("zPos", z)]
+                    .into_iter()
+                    .any(|(key, pos)| number(tag.get(key)).is_some_and(|n| n != i64::from(pos)))
+                {
+                    self.far_regions.0.lock().ok()?.remove(&region);
+                    return None;
+                }
+                return Some(root);
             }
         }
         // The region is being written, or was a moment ago. The writer's own
@@ -189,6 +213,99 @@ mod tests {
         assert_eq!(far(&save, c), Some((5, 5, 1)));
         assert_eq!(far(&save, b), Some((4, 5, 1)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_far_read_upgrades_pending_records_like_records_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = SaveDir::new(dir.path().to_owned(), LevelShape::OVERWORLD);
+        assert!(
+            save.datafix_context
+                .set(Some(DatafixContext {
+                    dimension: "minecraft:overworld".into(),
+                    generator: None,
+                }))
+                .is_ok()
+        );
+        let mut older = (*record((3, 5), 1).tag().unwrap()).clone();
+        put(&mut older.tag, "DataVersion", Tag::Int(DATA_VERSION - 1));
+        let older = Record::Tag(Arc::new(older));
+        write(&save, &[((3, 5), &older)]);
+        let disk = save.far_record(3, 5).unwrap();
+        save.pending
+            .lock()
+            .unwrap()
+            .insert((Folder::Region, 3, 5), (0, older));
+        assert_eq!(save.far_record(3, 5).unwrap().tag, disk.tag);
+        save.pending
+            .lock()
+            .unwrap()
+            .insert((Folder::Region, 3, 5), (1, Record::Delete));
+        assert!(save.far_record(3, 5).is_none());
+    }
+
+    #[test]
+    fn a_failed_far_header_read_is_retried_after_external_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let save = SaveDir::new(dir.path().to_owned(), LevelShape::OVERWORLD);
+        let path = save.region_path("region", 0, 0);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A directory at the region path causes a header read error.
+        fs::create_dir(&path).unwrap();
+        assert_eq!(far(&save, (3, 5)), None);
+
+        // A short header reads as empty for now and must also be retried.
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, [0]).unwrap();
+        assert_eq!(far(&save, (3, 5)), None);
+
+        // A different save instance repairs it without changing our write stamp.
+        fs::remove_file(path).unwrap();
+        let other = SaveDir::new(dir.path().to_owned(), LevelShape::OVERWORLD);
+        write(&other, &[((3, 5), &record((3, 5), 7))]);
+        assert_eq!(far(&save, (3, 5)), Some((3, 5, 7)));
+    }
+
+    #[test]
+    fn a_burst_of_far_region_reads_keeps_the_header_cache_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let regions = FarRegions::default();
+        let checked = Instant::now();
+        // Preload fresh entries to avoid making the result depend on how long
+        // hundreds of file opens take on the machine running the test.
+        {
+            let mut cache = regions.0.lock().unwrap();
+            for x in 0..KEPT_HEADERS as i32 {
+                cache.insert(
+                    (x, 0),
+                    FarRegion {
+                        checked: if x == 0 {
+                            checked - Duration::from_secs(1)
+                        } else {
+                            checked
+                        },
+                        written: 0,
+                        header: None,
+                    },
+                );
+            }
+        }
+        // Refreshing a changed region replaces its entry without evicting another.
+        regions.read(ChunkPos::new(32, 0), 1, || dir.path().join("r.1.0.mca"));
+        assert!(regions.0.lock().unwrap().contains_key(&(0, 0)));
+
+        let last = KEPT_HEADERS as i32;
+        assert!(
+            regions
+                .read(ChunkPos::new(32 * last, 0), 0, || dir
+                    .path()
+                    .join(format!("r.{last}.0.mca")))
+                .is_none()
+        );
+        let cache = regions.0.lock().unwrap();
+        assert_eq!(cache.len(), KEPT_HEADERS);
+        assert!(!cache.contains_key(&(0, 0)));
+        assert!(cache.contains_key(&(last, 0)));
     }
 
     /// #6386: each far read opened the region file, and so read its 8 KiB

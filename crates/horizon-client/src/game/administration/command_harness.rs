@@ -922,7 +922,7 @@ impl Game<'_> {
                 "map_files" => {
                     let state = self.harness_owner(|g| {
                         use horizon_core::nbt::Tag;
-                        g.save_maps();
+                        g.save_maps()?;
                         let directory = g.world_root.join("data/minecraft/maps");
                         let maps: Vec<_> = op["ids"].as_array().ok_or("map IDs")?.iter().map(|id| {
                             let path = directory.join(format!("{}.dat", id.as_i64().unwrap()));
@@ -1001,7 +1001,7 @@ impl Game<'_> {
                     let (state, raw) = self.harness_owner(|g| {
                         g.load_stats();
                         if !g.stats.loaded { return Err("merchant stats not loaded".into()); }
-                        g.save_stats();
+                        g.save_stats()?;
                         let uuid = g.level.player_uuid.ok_or("merchant stats UUID")?;
                         let path = super::stats::player_json(&g.world_root, "stats", uuid);
                         let raw = std::fs::read_to_string(path)?;

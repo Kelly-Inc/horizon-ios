@@ -22,7 +22,7 @@ pub(super) fn change(
         }
         let name = canonical(&name);
         return Ok(match (enabled, selected == name) {
-            (true, false) => Some(name),
+            (true, _) => Some(name),
             (false, true) => Some(String::new()),
             _ => None,
         });
@@ -48,6 +48,12 @@ mod tests {
         let off = r#"{"name":"Example.hshader","enabled":false}"#;
         assert_eq!(
             change("shader-pack-set", on, "", canonical)
+                .unwrap()
+                .as_deref(),
+            Some("horizon:example")
+        );
+        assert_eq!(
+            change("shader-pack-set", on, "horizon:example", canonical)
                 .unwrap()
                 .as_deref(),
             Some("horizon:example")

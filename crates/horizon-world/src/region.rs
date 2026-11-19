@@ -65,6 +65,7 @@ impl ChunkRecord {
 
 pub struct RegionFile {
     file: File,
+    writable: bool,
     path: PathBuf,
     position: ChunkPos,
     offsets: [u32; 1024],
@@ -72,6 +73,7 @@ pub struct RegionFile {
     /// The sectors in use (`RegionBitmap`): the header's two and every
     /// chunk's.
     used: Vec<bool>,
+    overlapping_offsets: bool,
     /// The first free sector (`RegionBitmap`'s low watermark): allocation
     /// starts its first-fit search here instead of at sector 0.
     first_free: usize,
@@ -117,7 +119,7 @@ fn external_path(directory: &Path, chunk: ChunkPos) -> PathBuf {
 }
 /// The header of a region file, from its start: each chunk's place (sector
 /// and sector count) and timestamp.
-fn read_header(file: &mut File) -> io::Result<([u32; 1024], [u32; 1024])> {
+fn read_header(file: &mut File) -> io::Result<([u32; 1024], [u32; 1024], bool)> {
     let len = file.metadata()?.len();
     // RegionFile's constructor: a short header (an empty or truncated file)
     // reads as far as it goes, the rest stays zero (no chunks).
@@ -149,7 +151,7 @@ fn read_header(file: &mut File) -> io::Result<([u32; 1024], [u32; 1024])> {
             offsets[i] = 0;
         }
     }
-    Ok((offsets, timestamps))
+    Ok((offsets, timestamps, read == HEADER))
 }
 /// `RegionFile.getChunkDataInputStream` for the chunk the header puts at
 /// `offset`: a chunk the file cannot deliver is absent (`null`), not an
@@ -223,7 +225,7 @@ impl RegionFile {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_owned();
         let file = File::open(&path)?;
-        Self::from_file(path, file)
+        Self::from_file(path, file, false)
     }
 
     /// Open for reading and in-place writes (`write`, `clear`), creating an
@@ -236,24 +238,41 @@ impl RegionFile {
             .create(create)
             .truncate(false)
             .open(&path)?;
-        Self::from_file(path, file)
+        Self::from_file(path, file, true)
     }
 
-    fn from_file(path: PathBuf, mut file: File) -> io::Result<Self> {
+    /// Upgrade the shared read-only handle after access is restored.
+    /// On failure readers keep the original handle and cached index.
+    pub fn ensure_writable(&mut self) -> io::Result<()> {
+        if !self.writable {
+            *self = Self::open_writable(&self.path, false)?;
+        }
+        Ok(())
+    }
+
+    fn from_file(path: PathBuf, mut file: File, writable: bool) -> io::Result<Self> {
         let position = position_from_path(&path)?;
-        let (offsets, timestamps) = read_header(&mut file)?;
+        let (offsets, timestamps, _) = read_header(&mut file)?;
         let mut region = Self {
             file,
+            writable,
             path,
             position,
             offsets,
             timestamps,
             used: Vec::new(),
+            overlapping_offsets: false,
             first_free: 0,
         };
         region.force(0, 2);
         for offset in offsets.into_iter().filter(|&o| o != 0) {
-            region.force((offset >> 8) as usize, (offset & 255) as usize);
+            let start = (offset >> 8) as usize;
+            let count = (offset & 255) as usize;
+            region.overlapping_offsets |= region
+                .used
+                .get(start..(start + count).min(region.used.len()))
+                .is_some_and(|sectors| sectors.contains(&true));
+            region.force(start, count);
         }
         region.first_free = region
             .used
@@ -284,6 +303,23 @@ impl RegionFile {
             self.first_free = self.first_free.min(start);
         }
     }
+    /// Release an old index entry after it has been replaced or cleared.
+    fn free_old_chunk(&mut self, offset: u32) {
+        let start = (offset >> 8) as usize;
+        let count = (offset & 255) as usize;
+        self.free(start, count);
+        if self.overlapping_offsets {
+            // A damaged index may still have another readable chunk here.
+            for other in self.offsets.into_iter().filter(|&o| o != 0) {
+                let other_start = (other >> 8) as usize;
+                let shared_start = start.max(other_start);
+                let shared_end = (start + count).min(other_start + (other & 255) as usize);
+                if shared_start < shared_end {
+                    self.force(shared_start, shared_end - shared_start);
+                }
+            }
+        }
+    }
     /// `RegionBitmap.allocate`: the first run of free sectors long enough
     /// (the end of the file is free).
     fn allocate(&mut self, count: usize) -> usize {
@@ -307,6 +343,15 @@ impl RegionFile {
     /// and only then are its old sectors freed. The other chunks stay where
     /// they are. A chunk's last sector is padded with zeros.
     pub fn write(&mut self, chunk: ChunkPos, record: &ChunkRecord) -> io::Result<()> {
+        self.write_with_index(chunk, record, Self::update_header_entry)
+    }
+
+    fn write_with_index(
+        &mut self,
+        chunk: ChunkPos,
+        record: &ChunkRecord,
+        update_index: impl FnOnce(&mut Self, usize, u32, u32) -> io::Result<()>,
+    ) -> io::Result<()> {
         let i = slot(self.position, chunk)?;
         if record.compressed.len() > MAX_COMPRESSED {
             return Err(invalid("compressed chunk limit exceeded"));
@@ -323,19 +368,6 @@ impl RegionFile {
         let external_file = external_path(&directory, chunk);
         let mut data = Vec::with_capacity(sectors * SECTOR);
         if external {
-            let temporary = directory.join(format!(".c.{}.{}.mcc.tmp", chunk.x, chunk.z));
-            let written = File::create(&temporary)
-                .and_then(|mut f| {
-                    f.write_all(&record.compressed)?;
-                    // The region's sync only covers the stub, not this external payload.
-                    f.sync_all()
-                })
-                .and_then(|_| fs::rename(&temporary, &external_file));
-            if let Err(e) = written {
-                let _ = fs::remove_file(&temporary);
-                self.free(start, sectors);
-                return Err(e);
-            }
             data.extend_from_slice(&1u32.to_be_bytes());
             data.push(record.compression as u8 | 128);
         } else {
@@ -352,15 +384,52 @@ impl RegionFile {
             self.free(start, sectors);
             return Err(e);
         }
+        let backup = if external {
+            match replace_external(&external_file, &record.compressed) {
+                Ok(backup) => backup,
+                Err(error) => {
+                    self.free(start, sectors);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let old = self.offsets[i];
-        self.offsets[i] = (start as u32) << 8 | sectors as u32;
-        self.timestamps[i] = record.timestamp;
-        self.write_header()?;
+        if let Err(error) = update_index(
+            self,
+            i,
+            (start as u32) << 8 | sectors as u32,
+            record.timestamp,
+        ) {
+            if external {
+                let restored = match &backup {
+                    Some(path) => fs::rename(path, &external_file),
+                    None => remove_if_exists(&external_file),
+                };
+                if let Err(restore) = restored {
+                    let source = backup.as_deref().unwrap_or(&external_file);
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; external chunk rollback failed at {}: {restore}",
+                            source.display()
+                        ),
+                    ));
+                }
+            }
+            return Err(error);
+        }
+        if let Some(path) = backup {
+            let _ = fs::remove_file(path);
+        }
+        // The index no longer refers to the old sectors, even if removing the
+        // old external file later fails.
+        if old != 0 {
+            self.free_old_chunk(old);
+        }
         if !external {
             remove_if_exists(&external_file)?;
-        }
-        if old != 0 {
-            self.free((old >> 8) as usize, (old & 255) as usize);
         }
         Ok(())
     }
@@ -373,18 +442,32 @@ impl RegionFile {
         if old == 0 {
             return Ok(false);
         }
-        self.offsets[i] = 0;
-        self.timestamps[i] = timestamp;
-        self.write_header()?;
+        self.update_header_entry(i, 0, timestamp)?;
+        self.free_old_chunk(old);
         let directory = self.path.parent().unwrap_or(Path::new("."));
         remove_if_exists(&external_path(directory, chunk))?;
-        self.free((old >> 8) as usize, (old & 255) as usize);
         Ok(true)
     }
 
     /// Flush the writes to the disk.
     pub fn sync(&self) -> io::Result<()> {
         self.file.sync_data()
+    }
+
+    fn update_header_entry(&mut self, index: usize, offset: u32, timestamp: u32) -> io::Result<()> {
+        let previous = (self.offsets[index], self.timestamps[index]);
+        self.offsets[index] = offset;
+        self.timestamps[index] = timestamp;
+        if let Err(error) = self.write_header() {
+            (self.offsets[index], self.timestamps[index]) = previous;
+            // A failed write can have changed part of the header on disk.
+            // Keep both allocations until reopening if rollback also fails.
+            if self.write_header().is_ok() && offset != 0 {
+                self.free((offset >> 8) as usize, (offset & 255) as usize);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// `RegionFile.writeHeader`: both header sectors from memory, so the
@@ -469,19 +552,27 @@ pub struct RegionHeader {
     position: ChunkPos,
     offsets: [u32; 1024],
     timestamps: [u32; 1024],
+    complete: bool,
 }
 impl RegionHeader {
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_owned();
         let position = position_from_path(&path)?;
-        let (offsets, timestamps) = read_header(&mut File::open(&path)?)?;
+        let (offsets, timestamps, complete) = read_header(&mut File::open(&path)?)?;
         Ok(Self {
             path,
             position,
             offsets,
             timestamps,
+            complete,
         })
     }
+
+    /// A short header can be read, but may only be a snapshot of a file still being written.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
     /// `RegionFile::read` at the place this header gives the chunk, with the
     /// file opened for this one record.
     pub fn read_chunk(&self, chunk: ChunkPos) -> io::Result<Option<ChunkRecord>> {
@@ -501,6 +592,83 @@ impl RegionHeader {
 }
 
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
+
+fn temporary_path(directory: &Path) -> PathBuf {
+    directory.join(format!(
+        ".horizon-{}-{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn temporary_file(directory: &Path) -> io::Result<(PathBuf, File)> {
+    loop {
+        let path = temporary_path(directory);
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Keep the previous .mcc reachable until its replacement's index is written.
+fn backup_external(destination: &Path, directory: &Path) -> io::Result<Option<PathBuf>> {
+    let metadata = match fs::metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(invalid("external chunk is not a regular file"));
+    }
+    loop {
+        let backup = temporary_path(directory);
+        match fs::hard_link(destination, &backup) {
+            Ok(()) => return Ok(Some(backup)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                // Some filesystems used for worlds do not support hard links.
+                let mut previous = File::open(destination)?;
+                let (backup, mut file) = temporary_file(directory)?;
+                let copied = io::copy(&mut previous, &mut file).and_then(|_| file.sync_all());
+                if let Err(error) = copied {
+                    drop(file);
+                    let _ = fs::remove_file(&backup);
+                    return Err(error);
+                }
+                return Ok(Some(backup));
+            }
+        }
+    }
+}
+
+fn replace_external(destination: &Path, bytes: &[u8]) -> io::Result<Option<PathBuf>> {
+    let directory = destination.parent().unwrap_or(Path::new("."));
+    let (staged, mut file) = temporary_file(directory)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        let backup = backup_external(destination, directory)?;
+        if let Err(error) = fs::rename(&staged, destination) {
+            if let Some(path) = &backup {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+        Ok(backup)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(staged);
+    }
+    result
+}
 
 /// Writes a complete new region to a temporary sibling, then publishes it with
 /// an atomic, non-overwriting hard link. Drop rolls back unpublished files.
@@ -531,23 +699,7 @@ impl RegionWriter {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
-        let (temporary, file) = loop {
-            let path = parent.join(format!(
-                ".horizon-{}-{}.tmp",
-                std::process::id(),
-                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-            ));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => break (path, file),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        };
+        let (temporary, file) = temporary_file(parent)?;
         let mut writer = Self {
             file,
             temporary,
@@ -670,6 +822,64 @@ mod tests {
     }
 
     #[test]
+    fn removing_an_overlapping_entry_does_not_release_another_chunks_sectors() {
+        let record = |fill| ChunkRecord {
+            compression: Compression::None,
+            compressed: vec![fill; 8],
+            timestamp: u32::from(fill),
+        };
+        let first = ChunkPos::new(0, 0);
+        let neighbor = ChunkPos::new(1, 0);
+        let next = ChunkPos::new(2, 0);
+        let later = ChunkPos::new(3, 0);
+        for replace in [false, true] {
+            for alias in [false, true] {
+                let dir = std::env::temp_dir().join(format!(
+                    "horizon-region-overlap-{replace}-{alias}-{}",
+                    std::process::id()
+                ));
+                fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("r.0.0.mca");
+                let mut region = RegionFile::open_writable(&path, true).unwrap();
+                region.write(first, &record(1)).unwrap();
+                region.write(neighbor, &record(2)).unwrap();
+                let first_offset = region.offsets[0];
+                let neighbor_offset = region.offsets[1];
+                let overlapping = if alias {
+                    neighbor_offset
+                } else {
+                    // Claim one sector beyond the first chunk's own record.
+                    first_offset + 1
+                };
+                region.file.seek(SeekFrom::Start(0)).unwrap();
+                region.file.write_all(&overlapping.to_be_bytes()).unwrap();
+                drop(region);
+
+                let mut region = RegionFile::open_writable(&path, false).unwrap();
+                if replace {
+                    region.write(first, &record(3)).unwrap();
+                } else {
+                    assert!(region.clear(first, 3).unwrap());
+                }
+                region.write(next, &record(4)).unwrap();
+                region.write(later, &record(5)).unwrap();
+                if !alias {
+                    // The part of the range that no entry still owns is reusable.
+                    assert_eq!(region.offsets[2], first_offset);
+                }
+                drop(region);
+
+                let mut region = RegionFile::open(&path).unwrap();
+                let restored = region.read(neighbor).unwrap().unwrap();
+                assert_eq!(restored.compressed, record(2).compressed);
+                assert_eq!(restored.timestamp, 2);
+                drop(region);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn allocation_matches_first_fit_from_zero() {
         let dir =
             std::env::temp_dir().join(format!("horizon-region-first-free-{}", std::process::id()));
@@ -719,6 +929,223 @@ mod tests {
             assert_eq!(region.first_free, naive_first_fit(&naive, 1));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_header_write_preserves_the_chunk_index() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-region-clear-failure-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.0.0.mca");
+        let chunk = ChunkPos::new(0, 0);
+        let mut region = RegionFile::open_writable(&path, true).unwrap();
+        region
+            .write(
+                chunk,
+                &ChunkRecord {
+                    compression: Compression::None,
+                    compressed: vec![42; 10],
+                    timestamp: 7,
+                },
+            )
+            .unwrap();
+
+        region.file = File::open(&path).unwrap();
+        assert!(region.clear(chunk, 9).is_err());
+        assert_eq!(region.chunks().collect::<Vec<_>>(), [(chunk, 7)]);
+        assert_eq!(
+            RegionHeader::read(&path)
+                .unwrap()
+                .read_chunk(chunk)
+                .unwrap()
+                .unwrap()
+                .compressed,
+            vec![42; 10]
+        );
+
+        region.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(region.clear(chunk, 9).unwrap());
+        assert!(
+            RegionHeader::read(&path)
+                .unwrap()
+                .read_chunk(chunk)
+                .unwrap()
+                .is_none()
+        );
+        drop(region);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_error_does_not_keep_unreferenced_sectors_allocated() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-region-cleanup-failure-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.0.0.mca");
+        let chunk = ChunkPos::new(0, 0);
+        let mut region = RegionFile::open_writable(&path, true).unwrap();
+        region
+            .write(
+                chunk,
+                &ChunkRecord {
+                    compression: Compression::None,
+                    compressed: vec![0; 10],
+                    timestamp: 7,
+                },
+            )
+            .unwrap();
+        let offset = region.offsets[0];
+        // A directory can't be removed as a stale external chunk file.
+        fs::create_dir(external_path(&dir, chunk)).unwrap();
+        assert!(region.clear(chunk, 9).is_err());
+        assert!(region.chunks().next().is_none());
+        assert!(!region.used[(offset >> 8) as usize]);
+        drop(region);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_external_stub_write_does_not_replace_the_saved_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-region-external-stub-failure-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.0.0.mca");
+        let chunk = ChunkPos::new(0, 0);
+        let record = |fill, compression| ChunkRecord {
+            compression,
+            compressed: vec![fill; 256 * SECTOR],
+            timestamp: u32::from(fill),
+        };
+        let mut region = RegionFile::open_writable(&path, true).unwrap();
+        let previous = record(41, Compression::None);
+        region.write(chunk, &previous).unwrap();
+
+        region.file = File::open(&path).unwrap();
+        let replacement = record(42, Compression::Zlib);
+        assert!(region.write(chunk, &replacement).is_err());
+        let read = RegionHeader::read(&path)
+            .unwrap()
+            .read_chunk(chunk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.compressed, previous.compressed);
+        assert_eq!(read.compression, previous.compression);
+        assert_eq!(read.timestamp, previous.timestamp);
+
+        region.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        region.write(chunk, &replacement).unwrap();
+        let read = RegionHeader::read(&path)
+            .unwrap()
+            .read_chunk(chunk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.compressed, replacement.compressed);
+        assert_eq!(read.compression, replacement.compression);
+        assert_eq!(read.timestamp, replacement.timestamp);
+        drop(region);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_header_write_restores_the_previous_external_payload() {
+        for previous_external in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "horizon-region-external-header-failure-{previous_external}-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("r.0.0.mca");
+            let chunk = ChunkPos::new(0, 0);
+            let previous = ChunkRecord {
+                compression: Compression::None,
+                compressed: vec![41; if previous_external { 256 * SECTOR } else { 16 }],
+                timestamp: 41,
+            };
+            let replacement = ChunkRecord {
+                compression: Compression::Zlib,
+                compressed: vec![42; 256 * SECTOR],
+                timestamp: 42,
+            };
+            let mut region = RegionFile::open_writable(&path, true).unwrap();
+            region.write(chunk, &previous).unwrap();
+
+            // The new stub and payload have already been written. Fail only
+            // the subsequent header write, after the payload was replaced.
+            assert!(
+                region
+                    .write_with_index(chunk, &replacement, |region, slot, offset, timestamp| {
+                        region.file = File::open(&path).unwrap();
+                        region.update_header_entry(slot, offset, timestamp)
+                    })
+                    .is_err()
+            );
+            let read = RegionFile::open(&path)
+                .unwrap()
+                .read(chunk)
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.compressed, previous.compressed);
+            assert_eq!(read.compression, previous.compression);
+            assert_eq!(read.timestamp, previous.timestamp);
+            assert_eq!(external_path(&dir, chunk).is_file(), previous_external);
+            drop(region);
+
+            // Retrying must publish both files as one readable chunk.
+            let mut region = RegionFile::open_writable(&path, false).unwrap();
+            region.write(chunk, &replacement).unwrap();
+            let read = region.read(chunk).unwrap().unwrap();
+            assert_eq!(read.compressed, replacement.compressed);
+            assert_eq!(read.compression, replacement.compression);
+            assert_eq!(read.timestamp, replacement.timestamp);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+            drop(region);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_read_only_region_handle_can_be_upgraded_for_later_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-region-write-upgrade-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.0.0.mca");
+        let chunk = ChunkPos::new(0, 0);
+        let mut writer = RegionFile::open_writable(&path, true).unwrap();
+        writer
+            .write(
+                chunk,
+                &ChunkRecord {
+                    compression: Compression::None,
+                    compressed: vec![42],
+                    timestamp: 7,
+                },
+            )
+            .unwrap();
+        drop(writer);
+
+        let mut region = RegionFile::open(&path).unwrap();
+        assert_eq!(region.read(chunk).unwrap().unwrap().compressed, vec![42]);
+        region.ensure_writable().unwrap();
+        assert!(region.clear(chunk, 9).unwrap());
+        assert!(region.read(chunk).unwrap().is_none());
+        drop(region);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -1660,15 +1660,21 @@ impl Game<'_> {
         }
     }
     /// Writes changed maps and the id counter (`MapItemSavedData`, `MapIndex`).
-    pub(super) fn save_maps(&mut self) {
+    pub(super) fn save_maps(&mut self) -> horizon_client::Result<()> {
+        let mut result = Ok(());
         for (id, m) in &mut self.maps.data {
             if m.dirty {
                 let path = self
                     .world_root
                     .join("data/minecraft/maps")
                     .join(format!("{id}.dat"));
-                if horizon_client::save::write_dat(&path, m.to_nbt()).is_ok() {
-                    m.dirty = false;
+                match horizon_client::save::write_dat(&path, m.to_nbt()) {
+                    Ok(()) => m.dirty = false,
+                    Err(error) if result.is_ok() => {
+                        result =
+                            Err(format!("could not save map {}: {error}", path.display()).into());
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -1677,13 +1683,13 @@ impl Game<'_> {
                 ("data", Tag::compound([("map", Tag::Int(last))])),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]);
-            if let Err(e) = horizon_client::save::write_dat(
-                &self.world_root.join("data/minecraft/maps/last_id.dat"),
-                tag,
-            ) {
-                log::warn!("Horizon: the next map id is not saved: {e}");
-            }
+            let path = self.world_root.join("data/minecraft/maps/last_id.dat");
+            let saved = horizon_client::save::write_dat(&path, tag).map_err(|error| {
+                format!("could not save map counter {}: {error}", path.display()).into()
+            });
+            result = result.and(saved);
         }
+        result
     }
     /// The atlas slot showing map `id`, its texture uploaded when it changed.
     pub(super) fn map_texture(&mut self, id: i32) -> Option<Rect> {

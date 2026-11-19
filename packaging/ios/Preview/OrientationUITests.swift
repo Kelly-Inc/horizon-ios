@@ -1,6 +1,29 @@
 import XCTest
 
 final class OrientationPresentationTests: XCTestCase {
+    func testDownloadOverlayKeepsGameLandscapeAndRestoresTheIdleTimer() {
+        XCUIDevice.shared.orientation = .landscapeRight
+        let app = XCUIApplication()
+        app.launchEnvironment["PREVIEW_DOWNLOAD_PRESENTATION"] = "1"
+        app.launch()
+
+        let otherWays = app.buttons["Other ways to get them"]
+        XCTAssertTrue(otherWays.waitForExistence(timeout: 8))
+        XCTAssertGreaterThan(app.frame.width, app.frame.height)
+        let scroll = app.scrollViews.firstMatch
+        for _ in 0..<4 where !otherWays.isHittable || !scroll.frame.contains(otherWays.frame) {
+            scroll.swipeUp()
+        }
+        XCTAssertTrue(otherWays.isHittable)
+        XCTAssertTrue(scroll.frame.contains(otherWays.frame))
+        otherWays.tap()
+
+        let game = app.staticTexts["orientation-game-root"]
+        XCTAssertTrue(game.waitForExistence(timeout: 8))
+        XCTAssertGreaterThan(app.frame.width, app.frame.height)
+        XCTAssertEqual(game.value as? String, "Idle timer disabled")
+    }
+
     func testLauncherPortraitAndGameLandscapePresentationHandoff() {
         XCUIDevice.shared.orientation = .portrait
         let app = XCUIApplication()

@@ -11,6 +11,33 @@ struct CustomTouchButton: Codable, Equatable, Identifiable {
     var inGame = true
     var inMenu = true
     var toggle = false
+    enum CodingKeys: String, CodingKey {
+        case id, name, bindings, centre, size, opacity, inGame, inMenu, toggle
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        // Appearance damage must not erase a custom control's working bindings.
+        // Identity, bindings and activation settings still require valid data.
+        id = try values.decode(UUID.self, forKey: .id)
+        bindings = try values.decode([Int].self, forKey: .bindings)
+        inGame = try values.decode(Bool.self, forKey: .inGame)
+        inMenu = try values.decode(Bool.self, forKey: .inMenu)
+        toggle = try values.decode(Bool.self, forKey: .toggle)
+        name = (try? values.decode(String.self, forKey: .name)) ?? name
+        if let saved = try? values.decode(TouchCentre.self, forKey: .centre), saved.valid {
+            centre = saved
+        }
+        if let saved = try? values.decode(TouchSize.self, forKey: .size), saved.valid {
+            size = saved
+        }
+        if let saved = try? values.decode(Double.self, forKey: .opacity), saved.isFinite {
+            opacity = saved
+        }
+    }
+
     var effectiveOpacity: Double { opacity.isFinite ? min(1, max(0.1, opacity)) : 0.7 }
     func rect(in canvas: CGSize) -> CGRect {
         let unit = min(canvas.width, canvas.height)

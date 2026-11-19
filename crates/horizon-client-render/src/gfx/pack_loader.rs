@@ -105,7 +105,7 @@ impl Compiler {
                     Ok(post) => post,
                     Err(refused) => {
                         let mut notes = refused.notes;
-                        notes.push(refused.reason);
+                        notes.insert(0, refused.reason);
                         let _ = send.send(Finished {
                             generation,
                             dimension,
@@ -126,7 +126,8 @@ impl Compiler {
                 {
                     Some(Box::new(post))
                 } else {
-                    notes.push(
+                    notes.insert(
+                        0,
                         "Shader pipeline could not load completely. Using normal rendering.".into(),
                     );
                     None

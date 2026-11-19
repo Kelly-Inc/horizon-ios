@@ -129,7 +129,7 @@ struct StatusChips: View {
         case .needsFiles:
             Chip(tone: .bad, text: "No game files")
         case .waiting:
-            if GameFolder.hasGameFiles {
+            if link.hasGameFiles {
                 Chip(tone: .good, text: "Minecraft \(link.version)")
             } else {
                 Chip(tone: .bad, text: "No game files")

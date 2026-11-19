@@ -43,8 +43,7 @@ pub struct Source {
     encoder: ChunkEncoder,
 }
 
-/// Reads a saved chunk's body: the game's reads it with `SaveDir::load_far`, encoded by
-/// `ChunkEncoder::body_alone`.
+/// Reads and encodes a saved chunk for sending to a player.
 type Reader = Arc<dyn Fn(&Source, i32, i32) -> Option<Vec<u8>> + Send + Sync>;
 
 struct Level {
@@ -188,7 +187,10 @@ impl Far {
             return Saved::Waiting;
         }
         let source = self.levels[level].source.clone();
-        if source.save.pending_writes() <= WRITE_BACKLOG && self.jobs.send((key, source)).is_ok() {
+        if source.save.pending_writes() <= WRITE_BACKLOG {
+            if self.jobs.send((key, source)).is_err() {
+                return Saved::Missing;
+            }
             self.asked.insert(key, false);
         }
         Saved::Waiting
@@ -196,7 +198,15 @@ impl Far {
 
     /// Takes in what the readers have read.
     pub fn poll(&mut self) {
-        while let Ok((key, body)) = self.done.try_recv() {
+        loop {
+            let (key, body) = match self.done.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(_) => {
+                    self.asked.clear();
+                    return;
+                }
+            };
             match body {
                 _ if self.asked.remove(&key).is_none_or(|stale| stale) => {}
                 Some(body) => self.keep(key, body.into()),
@@ -265,6 +275,7 @@ impl Far {
         let Some(level) = self.here else {
             return;
         };
+        self.missing.retain(|(l, ..), _| *l != level);
         let bodies = &mut self.levels[level].bodies;
         if !bodies.is_empty() {
             self.bytes -= bodies.drain().map(|(_, (_, b))| b.len()).sum::<usize>();
@@ -407,6 +418,7 @@ mod tests {
         // Nobody left in the level: nothing kept.
         far.forget_level();
         assert!(matches!(far.saved(4, 1), Saved::Waiting));
+        assert!(matches!(far.saved(3, 1), Saved::Waiting));
         assert_eq!(far.bytes, 0);
     }
 

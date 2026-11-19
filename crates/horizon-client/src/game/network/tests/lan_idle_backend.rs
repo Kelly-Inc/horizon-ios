@@ -5,7 +5,7 @@ use horizon_client::lan::{
     data::SyncData,
     entity::{EntityState, States},
     guest::Guest,
-    hub::{HubConfig, TickCtx},
+    hub::{Hub, HubConfig, TickCtx},
 };
 use horizon_protocol::{
     buf::Reader,

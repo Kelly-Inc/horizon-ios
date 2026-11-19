@@ -11,11 +11,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{Installed, MAX_PACKED, Pack};
@@ -31,21 +31,27 @@ pub fn url(version: &str) -> Option<String> {
 }
 
 fn archive_url(version: &str, base: &str) -> String {
-    let base = if base.ends_with('/') {
-        base.to_owned()
-    } else {
-        format!("{base}/")
-    };
-    format!("{base}{version}.zip")
+    let base = base.split('#').next().unwrap_or_default();
+    let (path, query) = base.split_at(base.find('?').unwrap_or(base.len()));
+    format!("{}/{version}.zip{query}", path.trim_end_matches('/'))
 }
 
 /// What the download is doing now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// Bytes so far, and the whole size when the server said it (0 when it didn't).
     Downloading { received: u64, total: u64 },
     /// The archive is here and being unpacked.
     Installing,
+}
+
+impl Default for Stage {
+    fn default() -> Self {
+        Self::Downloading {
+            received: 0,
+            total: 0,
+        }
+    }
 }
 
 /// The cache files are shared by all sources in one home. Keep the lease on
@@ -81,16 +87,17 @@ impl Drop for DownloadLease {
 
 /// A download under way. Dropping it requests cancellation without waiting on network I/O.
 pub struct Download {
-    received: Arc<AtomicU64>,
-    total: Arc<AtomicU64>,
-    installing: Arc<AtomicU64>,
-    done: mpsc::Receiver<Result<Installed, String>>,
+    // A restart changes the received bytes and the total at the same time.
+    progress: Arc<Mutex<Stage>>,
+    done: mpsc::Receiver<Result<Option<Installed>, String>>,
     cancelled: Arc<AtomicBool>,
+    worker: thread::Thread,
 }
 
 impl Drop for Download {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+        self.worker.unpark();
     }
 }
 
@@ -102,14 +109,13 @@ impl Download {
         fs::create_dir_all(&home)?;
         let lease = DownloadLease::acquire(&home)?;
         let home = lease.0.clone();
-        let received = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(0));
-        let installing = Arc::new(AtomicU64::new(0));
+        let expected_marker = super::resource_marker(&home)?;
+        let progress = Arc::new(Mutex::new(Stage::default()));
         let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, done) = mpsc::channel();
-        let (r, t, i) = (received.clone(), total.clone(), installing.clone());
+        let worker_progress = progress.clone();
         let stop = cancelled.clone();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("horizon-download".into())
             .spawn(move || {
                 let archive = match local_archive(&url, &home) {
@@ -120,18 +126,36 @@ impl Download {
                         );
                         Ok(archive)
                     }
-                    None => fetch_cancellable(&url, &home, &r, &t, &stop),
+                    None => fetch_cancellable(&url, &home, &worker_progress, &stop),
                 };
-                let result = archive.and_then(|archive| {
+                let result = (|| {
                     if stop.load(Ordering::Acquire) {
                         return Err("the download was cancelled".into());
                     }
-                    i.store(1, Ordering::Relaxed);
+                    let access = super::acquire_home_access(&home).map_err(|e| e.to_string())?;
+                    if stop.load(Ordering::Acquire) {
+                        return Err("the download was cancelled".into());
+                    }
+                    if !super::game_files_are_current(&home, &expected_marker)
+                        .map_err(|e| e.to_string())?
+                    {
+                        if let Ok(archive) = archive
+                            && archive.file_name() == Some(DOWNLOADED.as_ref())
+                        {
+                            let _ = fs::remove_file(archive);
+                            let _ = fs::remove_file(home.join(DOWNLOADED_SOURCE));
+                        }
+                        return Ok(None);
+                    }
+                    let archive = archive?;
+                    *worker_progress
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Stage::Installing;
                     let downloaded = archive.file_name() == Some(DOWNLOADED.as_ref());
                     let opened = Pack::open(&archive).and_then(Pack::require_game_files);
                     let invalid_archive = opened.is_err();
                     let result = opened.and_then(|pack| {
-                        pack.install_guarded(&home, || !stop.load(Ordering::Acquire))
+                        pack.install_with_access(&home, &access, || !stop.load(Ordering::Acquire))
                     });
                     let invalid_contents = result.as_ref().err().is_some_and(|error| {
                         error
@@ -145,33 +169,25 @@ impl Download {
                     if downloaded && !archive.exists() {
                         let _ = fs::remove_file(home.join(DOWNLOADED_SOURCE));
                     }
-                    result.map_err(|e| e.to_string())
-                });
+                    result.map(Some).map_err(|e| e.to_string())
+                })();
                 drop(lease);
                 let _ = sender.send(result);
             })?;
         Ok(Self {
-            received,
-            total,
-            installing,
+            progress,
             done,
             cancelled,
+            worker: worker.thread().clone(),
         })
     }
 
     pub fn stage(&self) -> Stage {
-        if self.installing.load(Ordering::Relaxed) != 0 {
-            Stage::Installing
-        } else {
-            Stage::Downloading {
-                received: self.received.load(Ordering::Relaxed),
-                total: self.total.load(Ordering::Relaxed),
-            }
-        }
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The result, once there is one.
-    pub fn poll(&self) -> Option<Result<Installed, String>> {
+    /// The result, once there is one. `Ok(None)` means another setup finished first.
+    pub fn poll(&self) -> Option<Result<Option<Installed>, String>> {
         match self.done.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -240,10 +256,10 @@ fn source_hash(url: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(url.as_bytes()))
 }
 
-/// A whole archive of game files already in `home`: a download that finished but was not installed,
-/// or the archive itself (`26.3.zip`) put there by hand.
+/// Find a completed download for this URL or a manually copied version archive.
 fn local_archive(url: &str, home: &Path) -> Option<PathBuf> {
-    let name = url.rsplit('/').next().filter(|n| n.ends_with(".zip"));
+    let path = url.split(['?', '#']).next()?;
+    let name = path.rsplit('/').next().filter(|n| n.ends_with(".zip"));
     let cached = fs::read_to_string(home.join(DOWNLOADED_SOURCE))
         .is_ok_and(|source| source == source_hash(url))
         .then_some(DOWNLOADED);
@@ -258,18 +274,63 @@ fn local_archive(url: &str, home: &Path) -> Option<PathBuf> {
 
 /// How many times a download that broke off is picked up again, and the pause before each try.
 const RETRIES: u32 = 6;
+// Long waits should return control to the launcher, keeping resumable bytes.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 const PAUSE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const PAUSE: Duration = Duration::from_millis(10);
+
+fn wait_for_retry(delay: Duration, cancelled: &AtomicBool) {
+    let deadline = Instant::now() + delay;
+    while !cancelled.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // An unrelated wake must not skip the remaining backoff.
+        thread::park_timeout(remaining);
+    }
+}
+
+fn retry_after_delay(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let date = [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ]
+    .into_iter()
+    .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())?;
+    Some(
+        date.and_utc()
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default(),
+    )
+}
 
 /// What stopped one request.
 enum Stop {
     Cancelled,
     /// The connection broke: try again from where it stopped.
     Broke(String),
+    /// A temporary HTTP failure, with any delay requested by the server.
+    RetryHttp {
+        status: u16,
+        delay: Duration,
+    },
     /// The server refused, or the file can't be kept: trying again won't help.
     Failed(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FetchProgress {
+    Complete,
+    More,
 }
 
 /// Download `url` to `home/horizon-download.zip`, through a `.part` file so a cut download is
@@ -279,8 +340,7 @@ enum Stop {
 fn fetch_cancellable(
     url: &str,
     home: &Path,
-    received: &AtomicU64,
-    total: &AtomicU64,
+    progress: &Mutex<Stage>,
     cancelled: &AtomicBool,
 ) -> Result<PathBuf, String> {
     let agent = ureq::AgentBuilder::new()
@@ -292,15 +352,33 @@ fn fetch_cancellable(
     let archive = home.join(DOWNLOADED);
     let mut tries = 0;
     loop {
-        match fetch_once_cancellable(&agent, url, &part, received, total, cancelled) {
-            Ok(()) => break,
+        match fetch_once_cancellable(&agent, url, &part, progress, cancelled) {
+            Ok(FetchProgress::Complete) => break,
+            // A server can cap the size of each range response. A complete
+            // range advances the file and does not spend a failure retry.
+            Ok(FetchProgress::More) => continue,
             Err(Stop::Cancelled) => return Err("the download was cancelled".into()),
             Err(Stop::Failed(e)) => {
                 let _ = fs::remove_file(&part);
                 let _ = fs::remove_file(home.join(PARTIAL_TAG));
                 return Err(e);
             }
-            Err(Stop::Broke(e)) => {
+            Err(stop) => {
+                let (e, delay) = match stop {
+                    Stop::Broke(error) => (error, Duration::ZERO),
+                    Stop::RetryHttp { status, delay } => {
+                        if delay > MAX_RETRY_WAIT {
+                            return Err(format!(
+                                "the download server answered HTTP {status}; retry in {} seconds",
+                                delay
+                                    .as_secs()
+                                    .saturating_add(u64::from(delay.subsec_nanos() != 0))
+                            ));
+                        }
+                        (format!("the download server answered HTTP {status}"), delay)
+                    }
+                    Stop::Cancelled | Stop::Failed(_) => unreachable!("handled above"),
+                };
                 tries += 1;
                 if tries > RETRIES {
                     return Err(format!("the download was cut: {e}"));
@@ -308,7 +386,7 @@ fn fetch_cancellable(
                 log::warn!(
                     "Horizon: the download broke off ({e}); picking it up again ({tries}/{RETRIES})"
                 );
-                thread::sleep(PAUSE * tries);
+                wait_for_retry((PAUSE * tries).max(delay), cancelled);
             }
         }
     }
@@ -334,10 +412,9 @@ fn fetch_once_cancellable(
     agent: &ureq::Agent,
     url: &str,
     part: &Path,
-    received: &AtomicU64,
-    total: &AtomicU64,
+    progress: &Mutex<Stage>,
     cancelled: &AtomicBool,
-) -> Result<(), Stop> {
+) -> Result<FetchProgress, Stop> {
     if cancelled.load(Ordering::Acquire) {
         return Err(Stop::Cancelled);
     }
@@ -359,8 +436,7 @@ fn fetch_once_cancellable(
             .set("Range", &format!("bytes={have}-"))
             .set("If-Range", tag);
     }
-    // Never splice an unverified range onto a previous archive. Clearing the
-    // validator also makes the bounded retry loop request the whole file.
+    // Rejected ranges must restart from byte zero.
     let restart = || {
         let _ = fs::remove_file(&tag_file);
         let _ = fs::remove_file(part);
@@ -371,19 +447,38 @@ fn fetch_once_cancellable(
         return Err(Stop::Cancelled);
     }
     let response = match response {
-        Ok(response) => response,
-        // A 416 can also mean the remote file shrank or the local part is stale.
-        // It is not proof that our partial archive is complete.
+        Ok(response) if matches!(response.status(), 204 | 205) => {
+            return Err(Stop::Failed(
+                "the download server did not send an archive".into(),
+            ));
+        }
+        Ok(response) if (200..300).contains(&response.status()) => response,
+        // A 416 may mean the remote file shrank.
         Err(ureq::Error::Status(416, _)) if have > 0 => return Err(restart()),
-        Err(ureq::Error::Status(status, _)) => {
+        Err(ureq::Error::Status(status @ (408 | 429 | 500 | 502 | 503 | 504), response)) => {
+            // Keep saved bytes after a transient server failure.
+            let delay = response
+                .header("Retry-After")
+                .and_then(|value| retry_after_delay(value, chrono::Utc::now()))
+                .unwrap_or_default();
+            return Err(Stop::RetryHttp { status, delay });
+        }
+        Ok(response) | Err(ureq::Error::Status(_, response)) => {
             return Err(Stop::Failed(format!(
-                "the server answered {status} for {url}"
+                "the download server answered HTTP {}",
+                response.status()
             )));
         }
-        Err(other) => return Err(Stop::Broke(format!("could not reach {url}: {other}"))),
+        // Transport's Display can include the full request or redirect URL.
+        Err(ureq::Error::Transport(error)) => {
+            return Err(Stop::Broke(format!(
+                "could not reach the download server ({:?})",
+                error.kind()
+            )));
+        }
     };
     let target = source_hash(response.get_url());
-    // 206: the rest of the same file. 200: all of it, the file having changed or the server not doing ranges.
+    // A range must be explicit and independently verified.
     let resumed = have > 0 && response.status() == 206;
     let range = if response.status() == 206 {
         let parsed = response.header("Content-Range").and_then(|header| {
@@ -410,6 +505,9 @@ fn fetch_once_cancellable(
             return Err(restart());
         }
         Some((last + 1, length, last - first + 1))
+    } else if response.header("Content-Range").is_some() {
+        // A response marked as complete can still describe a slice of the file.
+        return Err(restart());
     } else {
         None
     };
@@ -431,7 +529,6 @@ fn fetch_once_cancellable(
             "the archive is larger than this will unpack".into(),
         ));
     }
-    total.store(whole, Ordering::Relaxed);
     let file = if resumed {
         fs::OpenOptions::new().append(true).open(part)
     } else {
@@ -448,7 +545,23 @@ fn fetch_once_cancellable(
         File::create(part)
     };
     let mut file = file.map_err(|e| Stop::Failed(format!("could not save the download: {e}")))?;
-    if !resumed {
+    if resumed {
+        if let Some(mut saved) = saved
+            && saved.length.is_none()
+        {
+            // The initial response did not say how long the archive was.
+            // Pin its first validated range total before appending any bytes.
+            saved.length = Some(whole);
+            let bytes = serde_json::to_vec(&saved)
+                .map_err(|e| Stop::Failed(format!("could not encode saved download state: {e}")))?;
+            File::create(&tag_file)
+                .and_then(|mut tag| {
+                    tag.write_all(&bytes)?;
+                    tag.sync_all()
+                })
+                .map_err(|e| Stop::Failed(format!("could not save download state: {e}")))?;
+        }
+    } else {
         // Never persist URL secrets, or a validator that cannot be used by If-Range.
         if let Some(etag) = response.header("ETag").filter(|tag| strong_etag(tag))
             && let Ok(saved) = serde_json::to_vec(&ResumeTag {
@@ -464,7 +577,10 @@ fn fetch_once_cancellable(
     let mut reader = response.into_reader();
     let mut buffer = vec![0; 1 << 16];
     let mut so_far = start;
-    received.store(so_far, Ordering::Relaxed);
+    *progress.lock().unwrap_or_else(PoisonError::into_inner) = Stage::Downloading {
+        received: so_far,
+        total: whole,
+    };
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(Stop::Cancelled);
@@ -490,7 +606,10 @@ fn fetch_once_cancellable(
             Err(e) => {
                 // Keep what arrived for the next request.
                 let _ = file.sync_all();
-                return Err(Stop::Broke(e.to_string()));
+                return Err(Stop::Broke(format!(
+                    "could not read the download response ({:?})",
+                    e.kind()
+                )));
             }
         };
         so_far += n as u64;
@@ -501,39 +620,45 @@ fn fetch_once_cancellable(
         }
         file.write_all(&buffer[..n])
             .map_err(|e| Stop::Failed(format!("could not save the download: {e}")))?;
-        received.store(so_far, Ordering::Relaxed);
+        *progress.lock().unwrap_or_else(PoisonError::into_inner) = Stage::Downloading {
+            received: so_far,
+            total: whole,
+        };
     }
     file.sync_all()
         .map_err(|e| Stop::Failed(format!("could not save the download: {e}")))?;
-    if whole != 0 && so_far < whole {
+    if size != 0 && so_far < size {
         return Err(Stop::Broke(format!(
-            "the connection closed at {so_far} of {whole} bytes"
+            "the connection closed at {so_far} of {size} bytes"
         )));
     }
-    Ok(())
+    if so_far == 0 {
+        return Err(Stop::Failed(
+            "the download server did not send an archive".into(),
+        ));
+    }
+    if so_far < whole {
+        Ok(FetchProgress::More)
+    } else {
+        Ok(FetchProgress::Complete)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fetch(
-        url: &str,
-        home: &Path,
-        received: &AtomicU64,
-        total: &AtomicU64,
-    ) -> Result<PathBuf, String> {
-        fetch_cancellable(url, home, received, total, &AtomicBool::new(false))
+    fn fetch(url: &str, home: &Path, progress: &Mutex<Stage>) -> Result<PathBuf, String> {
+        fetch_cancellable(url, home, progress, &AtomicBool::new(false))
     }
 
     fn fetch_once(
         agent: &ureq::Agent,
         url: &str,
         part: &Path,
-        received: &AtomicU64,
-        total: &AtomicU64,
-    ) -> Result<(), Stop> {
-        fetch_once_cancellable(agent, url, part, received, total, &AtomicBool::new(false))
+        progress: &Mutex<Stage>,
+    ) -> Result<FetchProgress, Stop> {
+        fetch_once_cancellable(agent, url, part, progress, &AtomicBool::new(false))
     }
 
     #[test]
@@ -544,6 +669,10 @@ mod tests {
                 "https://example.org/game/26.3.zip"
             );
         }
+        assert_eq!(
+            archive_url("26.3", "https://example.org/game/?key=A%2FB#note"),
+            "https://example.org/game/26.3.zip?key=A%2FB"
+        );
     }
 
     #[test]
@@ -553,6 +682,136 @@ mod tests {
             .ok()
             .filter(|base| !base.is_empty());
         assert_eq!(url("26.3"), explicit.map(|base| archive_url("26.3", &base)));
+    }
+
+    #[test]
+    fn download_failures_preserve_diagnostics_without_the_source_url() {
+        let agent = ureq::AgentBuilder::new().build();
+        let part = home("download-private-errors").join(PARTIAL);
+        let progress = Mutex::default();
+        for status in ["403 Forbidden", "302 Found"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 1024];
+                stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nBODY"
+                )
+                .unwrap();
+            });
+            let url = format!("http://{address}/private-game.zip?key=private-download-token");
+            let result = fetch_once(&agent, &url, &part, &progress);
+            server.join().unwrap();
+            assert!(matches!(result, Err(Stop::Failed(message))
+                if message.contains(&status[..3]) && !message.contains("private") && !message.contains(&address.to_string())));
+            assert!(!part.exists());
+        }
+
+        let malformed = "http://[invalid]/private-game.zip?key=private-download-token";
+        let connection = fetch_once(&agent, malformed, &part, &progress);
+        assert!(matches!(connection, Err(Stop::Broke(message))
+            if message.contains("download server") && !message.contains("private") && !message.contains("invalid")));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2015-10-21T07:28:00Z")
+            .unwrap()
+            .to_utc();
+        for value in [
+            "3",
+            "Wed, 21 Oct 2015 07:28:03 GMT",
+            "Wed Oct 21 07:28:03 2015",
+        ] {
+            assert_eq!(retry_after_delay(value, now), Some(Duration::from_secs(3)));
+        }
+        assert_eq!(
+            retry_after_delay("Wed, 21 Oct 2015 07:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(retry_after_delay("soon", now), None);
+    }
+
+    #[test]
+    fn temporary_failures_retry_and_complete_ranges_do_not_spend_the_retry_budget() {
+        use std::{
+            io::{BufRead, BufReader},
+            net::{TcpListener, TcpStream},
+            time::Instant,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/archive.zip", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            fn accept(listener: &TcpListener) -> TcpStream {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => return stream,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("expected a download request: {error}"),
+                    }
+                }
+            }
+            for (start, response) in ["503 Service Unavailable", "429 Too Many Requests"]
+            .into_iter()
+            .map(|status| (4, format!(
+                "HTTP/1.1 {status}\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )))
+            .chain("efghijklm".chars().enumerate().map(|(offset, byte)| {
+                let start = 4 + offset;
+                (start, format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes {start}-{start}/13\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n{byte}"
+                ))
+            }))
+            {
+                let mut socket = accept(&listener);
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut request = String::new();
+                let mut reader = BufReader::new(&socket);
+                loop {
+                    let mut line = String::new();
+                    let bytes = reader.read_line(&mut line).unwrap();
+                    if bytes == 0 || line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line.to_ascii_lowercase());
+                }
+                assert!(request.contains(&format!("range: bytes={start}-\r\n")), "{request}");
+                assert!(request.contains("if-range: \"fixture\"\r\n"), "{request}");
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let home = home("temporary-server-failure");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(PARTIAL), b"abcd").unwrap();
+        fs::write(
+            home.join(PARTIAL_TAG),
+            serde_json::to_vec(&ResumeTag {
+                source: source_hash(&url),
+                target: source_hash(&url),
+                etag: "\"fixture\"".into(),
+                length: Some(13),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let result = fetch(&url, &home, &Mutex::default());
+        let contents = result.and_then(|path| fs::read(path).map_err(|e| e.to_string()));
+        fs::remove_dir_all(home).unwrap();
+        assert_eq!(contents.unwrap(), b"abcdefghijklm");
+        server.join().unwrap();
     }
 
     #[test]
@@ -566,6 +825,13 @@ mod tests {
                 false,
             ),
             ("missing-range", "206 Partial Content", "", false, false),
+            (
+                "false-full",
+                "200 OK",
+                "Content-Range: bytes 4-5/6\r\n",
+                false,
+                false,
+            ),
             (
                 "false-complete",
                 "416 Range Not Satisfiable",
@@ -645,11 +911,18 @@ mod tests {
                 &ureq::AgentBuilder::new().build(),
                 &format!("http://{address}/game.zip"),
                 &part,
-                &AtomicU64::new(0),
-                &AtomicU64::new(0),
+                &Mutex::default(),
             );
             server.join().unwrap();
-            assert_eq!(result.is_ok(), complete, "{name}: incorrect completion");
+            assert_eq!(
+                result.ok(),
+                match (complete, retained) {
+                    (true, _) => Some(FetchProgress::Complete),
+                    (false, true) => Some(FetchProgress::More),
+                    (false, false) => None,
+                },
+                "{name}: incorrect completion"
+            );
             if retained {
                 assert_eq!(fs::read(&part).unwrap(), b"abcdef", "{name}");
                 assert!(home.join(PARTIAL_TAG).exists());
@@ -659,6 +932,52 @@ mod tests {
             }
             fs::remove_dir_all(home).unwrap();
         }
+    }
+
+    #[test]
+    fn a_first_resumed_range_pins_the_archive_length_for_later_ranges() {
+        let home = home("pin-range-total");
+        fs::create_dir_all(&home).unwrap();
+        let part = home.join(PARTIAL);
+        let validator = home.join(PARTIAL_TAG);
+        fs::write(&part, b"ab").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/game.zip", listener.local_addr().unwrap());
+        fs::write(
+            &validator,
+            serde_json::to_vec(&ResumeTag {
+                source: source_hash(&url),
+                target: source_hash(&url),
+                etag: "\"unchanged\"".into(),
+                length: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || {
+            for (range, body) in [("2-3/8", "cd"), ("4-5/6", "ef")] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).unwrap() > 0);
+                write!(
+                    socket,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes {range}\r\nETag: \"unchanged\"\r\nConnection: close\r\n\r\n{body}"
+                )
+                .unwrap();
+            }
+        });
+        let agent = ureq::AgentBuilder::new().build();
+        let progress = Mutex::default();
+        let first = fetch_once(&agent, &url, &part, &progress);
+        let pinned: ResumeTag = serde_json::from_slice(&fs::read(&validator).unwrap()).unwrap();
+        let second = fetch_once(&agent, &url, &part, &progress);
+        server.join().unwrap();
+        assert!(matches!(first, Ok(FetchProgress::More)));
+        assert_eq!(pinned.length, Some(8));
+        assert!(matches!(second, Err(Stop::Broke(_))));
+        assert!(!part.exists());
+        assert!(!validator.exists());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -684,17 +1003,17 @@ mod tests {
         fs::write(&part, b"old").unwrap();
         fs::create_dir(home.join(PARTIAL_TAG)).unwrap();
         let url = serve(b"new".to_vec(), 3);
-        let result = fetch_once(
-            &ureq::AgentBuilder::new().build(),
-            &url,
-            &part,
-            &AtomicU64::new(0),
-            &AtomicU64::new(0),
-        );
+        let prior = Stage::Downloading {
+            received: 3,
+            total: 5,
+        };
+        let progress = Mutex::new(prior);
+        let result = fetch_once(&ureq::AgentBuilder::new().build(), &url, &part, &progress);
         assert!(
             matches!(result, Err(Stop::Failed(message)) if message.contains("clear saved download state"))
         );
         assert_eq!(fs::read(part).unwrap(), b"old");
+        assert_eq!(*progress.lock().unwrap(), prior);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -712,6 +1031,23 @@ mod tests {
             let _ = stream.write_all(&body);
         });
         format!("http://{address}/26.3.zip")
+    }
+
+    #[test]
+    fn an_empty_success_response_is_not_cached_as_an_archive() {
+        let home = home("empty-success");
+        let error = fetch_cancellable(
+            &serve(Vec::new(), 0),
+            &home,
+            &Mutex::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert_eq!(error, "the download server did not send an archive");
+        for name in [DOWNLOADED, DOWNLOADED_SOURCE, PARTIAL, PARTIAL_TAG] {
+            assert!(!home.join(name).exists(), "{name}");
+        }
+        fs::remove_dir_all(home).unwrap();
     }
 
     fn prepared() -> Vec<u8> {
@@ -766,7 +1102,7 @@ mod tests {
         let size = body.len();
         let url = format!("{}?token=fixture-secret", serve(body, size));
         let home = home("completed-source");
-        let archive = fetch(&url, &home, &AtomicU64::new(0), &AtomicU64::new(0)).unwrap();
+        let archive = fetch(&url, &home, &Mutex::default()).unwrap();
         assert_eq!(local_archive(&url, &home), Some(archive));
         assert_eq!(
             fs::read_to_string(home.join(DOWNLOADED_SOURCE)).unwrap(),
@@ -791,16 +1127,63 @@ mod tests {
     }
 
     #[test]
+    fn a_download_keeps_the_game_files_another_import_published_first() {
+        check_concurrent_install(true);
+        check_concurrent_install(false);
+    }
+
+    fn check_concurrent_install(transfer_succeeds: bool) {
+        let home = home(&format!("concurrent-install-{transfer_succeeds}"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requested, request) = mpsc::channel();
+        let (send_archive, release) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut headers = [0; 2048];
+            assert!(stream.read(&mut headers).unwrap() > 0);
+            requested.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+            if !transfer_succeeds {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                return;
+            }
+            let body = prepared_with_facts(r#"{"source":"download"}"#);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let download = Download::start(format!("http://{address}/game.zip"), home.clone()).unwrap();
+        request.recv_timeout(Duration::from_secs(5)).unwrap();
+        let archive = home.join("manual.zip");
+        let facts = r#"{"source":"manual"}"#;
+        fs::write(&archive, prepared_with_facts(facts)).unwrap();
+        Pack::open(&archive).unwrap().install(&home).unwrap();
+        send_archive.send(()).unwrap();
+        assert!(wait_result(&download).unwrap().is_none());
+        server.join().unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join("resources/facts.json")).unwrap(),
+            facts
+        );
+        assert!(!home.join(DOWNLOADED).exists());
+        assert!(!home.join(DOWNLOADED_SOURCE).exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn switching_sources_after_a_completed_download_installs_the_new_archive() {
         let home = home("completed-switch");
         let old = prepared_with_facts(r#"{"source":"old"}"#);
-        fetch(
-            &serve(old.clone(), old.len()),
-            &home,
-            &AtomicU64::new(0),
-            &AtomicU64::new(0),
-        )
-        .unwrap();
+        fetch(&serve(old.clone(), old.len()), &home, &Mutex::default()).unwrap();
         let new = prepared_with_facts(r#"{"source":"new"}"#);
         wait(&Download::start(serve(new.clone(), new.len()), home.clone()).unwrap()).unwrap();
         assert_eq!(
@@ -816,7 +1199,7 @@ mod tests {
         let home = home("unidentified-cache");
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join(DOWNLOADED), prepared()).unwrap();
-        let url = "https://example.org/26.3.zip";
+        let url = "https://example.org/26.3.zip?key=A%2FB";
         assert_eq!(local_archive(url, &home), None);
         let manual = home.join("26.3.zip");
         fs::write(&manual, prepared()).unwrap();
@@ -834,6 +1217,10 @@ mod tests {
     }
 
     fn wait(download: &Download) -> Result<Installed, String> {
+        wait_result(download)?.ok_or_else(|| "another setup installed the game files".into())
+    }
+
+    fn wait_result(download: &Download) -> Result<Option<Installed>, String> {
         for _ in 0..500 {
             if let Some(result) = download.poll() {
                 return result;
@@ -930,6 +1317,35 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_download_wakes_a_worker_waiting_to_retry() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = cancelled.clone();
+        let (ready, waiting) = mpsc::channel();
+        let (finished, exited) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            ready.send(()).unwrap();
+            wait_for_retry(Duration::from_secs(10), &stop);
+            finished.send(stop.load(Ordering::Acquire)).unwrap();
+        });
+        waiting.recv().unwrap();
+        assert_eq!(
+            exited.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let (_sender, done) = mpsc::channel();
+        let download = Download {
+            progress: Default::default(),
+            done,
+            cancelled,
+            worker: worker.thread().clone(),
+        };
+
+        drop(download);
+        assert_eq!(exited.recv_timeout(Duration::from_secs(2)), Ok(true));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn dropping_a_download_keeps_its_partial_and_blocks_retry_until_the_worker_stops() {
         let body = prepared();
         let half = body.len() / 2;
@@ -1009,16 +1425,9 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let part = home.join(PARTIAL);
         let agent = ureq::AgentBuilder::new().build();
-        let received = AtomicU64::new(0);
-        let total = AtomicU64::new(0);
+        let progress = Mutex::default();
         assert!(matches!(
-            fetch_once(
-                &agent,
-                &format!("http://{address}/a.zip"),
-                &part,
-                &received,
-                &total
-            ),
+            fetch_once(&agent, &format!("http://{address}/a.zip"), &part, &progress),
             Err(Stop::Broke(_))
         ));
         assert!(
@@ -1026,8 +1435,7 @@ mod tests {
                 &agent,
                 &format!("http://{address}/b.zip?access=fixture-secret"),
                 &part,
-                &received,
-                &total
+                &progress
             )
             .is_ok()
         );
@@ -1073,13 +1481,12 @@ mod tests {
         let part = home.join(PARTIAL);
         let agent = ureq::AgentBuilder::new().build();
         let url = format!("http://{address}/start");
-        let received = AtomicU64::new(0);
-        let total = AtomicU64::new(0);
+        let progress = Mutex::default();
         assert!(matches!(
-            fetch_once(&agent, &url, &part, &received, &total),
+            fetch_once(&agent, &url, &part, &progress),
             Err(Stop::Broke(_))
         ));
-        let result = fetch_once(&agent, &url, &part, &received, &total);
+        let result = fetch_once(&agent, &url, &part, &progress);
         server.join().unwrap();
         assert!(
             matches!(result, Err(Stop::Broke(_))),

@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 
 /// The C entry point `horizon-ios-launcher` looks up when a phone with no game files starts downloading them
-/// (crates/horizon-client/src/game/import_screen.rs): an upright SwiftUI screen over the game with the download's
+/// (crates/horizon-client/src/game/interface/import_screen.rs): a SwiftUI screen over the game with the download's
 /// progress, speed and time left, read from the game with `download-state`. It goes away by itself once the game
 /// files are in and the game loads. Shown even while the launcher is switched off: it only needs this framework.
 @_cdecl("horizon_download_present")
@@ -15,7 +15,10 @@ public func horizonDownloadPresent(_ submit: HorizonSubmit?) -> Bool {
 
 @MainActor
 private func presentDownload(attempts: Int) {
-    guard let root = gameViewController(), root.view.window != nil else {
+    let stack = gamePresentationStack()
+    guard !stack.contains(where: { $0 is DownloadHostingController }) else { return }
+    guard let root = stack.last, let scene = root.viewIfLoaded?.window?.windowScene,
+          !root.isBeingPresented, !root.isBeingDismissed else {
         // Not on screen yet: try again shortly, for a couple of seconds at most.
         if attempts > 0 {
             Task { @MainActor in
@@ -25,32 +28,43 @@ private func presentDownload(attempts: Int) {
         }
         return
     }
-    if root is DownloadHostingController {
-        return
-    }
     let model = DownloadModel()
     let host = DownloadHostingController(rootView: AnyView(DownloadView(model: model)))
-    model.close = { [weak host] in
-        // The screen may sleep again, and the game turns back to its landscape.
-        UIApplication.shared.isIdleTimerDisabled = false
-        guard let host else { return }
-        let scene = host.view.window?.windowScene
-        host.dismiss(animated: true) { turn(scene, to: .landscape) }
-    }
+    host.orientationMask = root.supportedInterfaceOrientations
+    host.currentOrientation = scene.interfaceOrientation
+    model.close = { [weak host] in host?.dismiss(animated: true) }
     host.modalPresentationStyle = .fullScreen
     host.modalTransitionStyle = .crossDissolve
-    // A locked phone drops the connection: keep the screen on while the files come in.
-    UIApplication.shared.isIdleTimerDisabled = true
-    root.present(host, animated: false) {
-        turn(host.view.window?.windowScene, to: .portrait)
-    }
+    root.present(host, animated: false)
 }
 
-/// The download screen stands upright, whatever the game under it does.
+/// Keep the presenting scene's orientation and idle policy when the overlay closes.
 private final class DownloadHostingController: UIHostingController<AnyView> {
-    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
-    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .portrait }
+    var orientationMask: UIInterfaceOrientationMask = .allButUpsideDown
+    var currentOrientation: UIInterfaceOrientation = .unknown
+    private var previousIdleTimerDisabled: Bool?
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { orientationMask }
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
+        currentOrientation == .unknown ? super.preferredInterfaceOrientationForPresentation : currentOrientation
+    }
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        if previousIdleTimerDisabled == nil {
+            previousIdleTimerDisabled = UIApplication.shared.isIdleTimerDisabled
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        if let previousIdleTimerDisabled {
+            UIApplication.shared.isIdleTimerDisabled = previousIdleTimerDisabled
+            self.previousIdleTimerDisabled = nil
+        }
+    }
 }
 
 /// What the game says about the download, asked four times a second, and the speed worked out from it.
@@ -76,17 +90,21 @@ final class DownloadModel: ObservableObject {
 
     /// Dismiss the screen (Present: the download is over, or the player chose another way).
     var close: () -> Void = {}
-    private var samples: [(at: Date, bytes: Int64)] = []
+    private var samples: [(at: TimeInterval, bytes: Int64)] = []
     /// A retry is on its way to the game.
     private var retrying = false
     private var retryGeneration = 0
+    private var retryFailure: String?
     private let request: @MainActor (String) async -> [String: Any]
     private let diagnostic: @MainActor (String) -> Void
+    private let uptime: @MainActor () -> TimeInterval
 
     init(request: @escaping @MainActor (String) async -> [String: Any] = { await Bridge.send($0) },
-         diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) }) {
+         diagnostic: @escaping @MainActor (String) -> Void = { Diagnostics.record($0) },
+         uptime: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.request = request
         self.diagnostic = diagnostic
+        self.uptime = uptime
     }
 
     var fraction: Double {
@@ -117,6 +135,7 @@ final class DownloadModel: ObservableObject {
         guard !retrying, case .failed = phase else { return }
         retryGeneration += 1
         retrying = true
+        retryFailure = nil
         phase = .starting
         received = 0
         total = 0
@@ -125,8 +144,11 @@ final class DownloadModel: ObservableObject {
         let answer = await request("download-retry")
         retrying = false
         if let error = answer.error {
-            fail(error)
+            retryFailure = error
+        } else if !answer.acknowledged {
+            retryFailure = "Horizon could not confirm that the download restarted."
         }
+        if let retryFailure { fail(retryFailure) }
     }
 
     func refresh() async {
@@ -145,8 +167,17 @@ final class DownloadModel: ObservableObject {
     private func apply(_ state: [String: Any]) {
         switch state["phase"] as? String {
         case "downloading":
-            let bytes = (state["received"] as? NSNumber)?.int64Value ?? 0
-            total = (state["total"] as? NSNumber)?.int64Value ?? 0
+            let bytes = max(0, (state["received"] as? NSNumber)?.int64Value ?? 0)
+            let reportedTotal = max(0, (state["total"] as? NSNumber)?.int64Value ?? 0)
+            // A restarted engine transfer can publish its counters separately.
+            // Keep the last coherent sample until both counters agree.
+            guard reportedTotal == 0 || bytes <= reportedTotal else { return }
+            retryFailure = nil
+            if total > 0, reportedTotal != total {
+                samples = []
+                speed = 0
+            }
+            total = reportedTotal
             if let version = state["version"] as? String {
                 self.version = version
             }
@@ -154,14 +185,17 @@ final class DownloadModel: ObservableObject {
             received = bytes
             phase = .downloading
         case "installing":
+            retryFailure = nil
             phase = .installing
             speed = 0
         case "failed":
-            fail(state.error ?? "The download stopped.")
+            // The previous transfer can still be marked failed after a rejected retry.
+            fail(retryFailure ?? state.error ?? "The download stopped.")
         case "done":
+            retryFailure = nil
             phase = .done
         default:
-            if let error = state.error { fail(error) }
+            fail(retryFailure ?? state.error ?? "Horizon could not read the download status.")
         }
     }
 
@@ -176,79 +210,86 @@ final class DownloadModel: ObservableObject {
 
     /// The speed over the last four seconds, eased so the number doesn't jump with every read.
     private func measure(_ bytes: Int64) {
-        let now = Date()
-        if let last = samples.last, bytes < last.bytes {
-            // Started again from the beginning.
+        let now = uptime()
+        let sampleWindow = 4.0
+        if let last = samples.last, bytes < last.bytes || now - last.at > sampleWindow {
+            // Restarted the transfer, or resumed polling after a pause.
             samples = []
             speed = 0
         }
         samples.append((now, bytes))
-        samples.removeAll { now.timeIntervalSince($0.at) > 4 }
+        samples.removeAll { now - $0.at > sampleWindow }
         guard let first = samples.first, let last = samples.last else { return }
-        let span = last.at.timeIntervalSince(first.at)
+        let span = last.at - first.at
         guard span > 0.5 else { return }
+        if last.bytes == first.bytes {
+            speed = 0
+            return
+        }
         let rate = Double(last.bytes - first.bytes) / span
         speed = speed == 0 ? rate : speed * 0.7 + rate * 0.3
     }
 }
 
-/// The download, upright: what is happening, the bar with a spinner beside it, and the numbers under it.
+/// The download status, progress and available recovery actions.
 struct DownloadView: View {
     @ObservedObject var model: DownloadModel
 
     var body: some View {
         ZStack {
             Theme.background.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 22) {
-                Spacer()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("HORIZON")
-                        .font(Theme.pixel(14, .bold))
-                        .foregroundStyle(Theme.accentText)
-                        .tracking(2)
-                    Text(title)
-                        .font(Theme.pixel(28, .bold))
-                        .foregroundStyle(Theme.text)
-                    Text(subtitle)
-                        .font(Theme.sans(15))
-                        .foregroundStyle(Theme.textMuted)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("HORIZON")
+                            .font(Theme.pixel(14, .bold))
+                            .foregroundStyle(Theme.accentText)
+                            .tracking(2)
+                        Text(title)
+                            .font(Theme.pixel(28, .bold))
+                            .foregroundStyle(Theme.text)
+                        Text(subtitle)
+                            .font(Theme.sans(15))
+                            .foregroundStyle(Theme.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 14) {
+                        ProgressView(value: model.fraction)
+                            .progressViewStyle(.linear)
+                            .tint(failed ? Theme.danger : Theme.accent)
+                            .scaleEffect(x: 1, y: 2, anchor: .center)
+                            .animation(.easeOut(duration: 0.25), value: model.fraction)
+                        if !failed {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(Theme.accentText)
+                        } else {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Theme.danger)
+                        }
+                    }
+                    .frame(minHeight: 28)
+                    if case .failed = model.phase {
+                        VStack(spacing: 10) {
+                            PrimaryButton(title: "Try again", icon: "arrow.clockwise") {
+                                Task { await model.retry() }
+                            }
+                            SecondaryButton(title: "Other ways to get them", icon: "wifi") {
+                                model.otherWays()
+                            }
+                        }
+                    }
+                    stats
+                    Text(footnote)
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.textFaint)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(spacing: 14) {
-                    ProgressView(value: model.fraction)
-                        .progressViewStyle(.linear)
-                        .tint(failed ? Theme.danger : Theme.accent)
-                        .scaleEffect(x: 1, y: 2, anchor: .center)
-                        .animation(.easeOut(duration: 0.25), value: model.fraction)
-                    if !failed {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                            .tint(Theme.accentText)
-                    } else {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(Theme.danger)
-                    }
-                }
-                .frame(minHeight: 28)
-                stats
-                if case .failed = model.phase {
-                    VStack(spacing: 10) {
-                        PrimaryButton(title: "Try again", icon: "arrow.clockwise") {
-                            Task { await model.retry() }
-                        }
-                        SecondaryButton(title: "Other ways to get them", icon: "wifi") {
-                            model.otherWays()
-                        }
-                    }
-                }
-                Spacer()
-                Text(footnote)
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textFaint)
-                    .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 24)
+                .frame(maxWidth: 620)
+                .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 24)
         }
         .task { await model.run() }
     }

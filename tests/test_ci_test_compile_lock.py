@@ -1,4 +1,5 @@
 """Selective compiler locking preserves parallelism and the configured cache wrapper."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -92,6 +93,21 @@ class TestCompileLockTests(unittest.TestCase):
                 with self.subTest(pair=pair):
                     self.check_invalid_jobserver(directory, pair, ())
 
+    def test_malformed_jobserver_flags_cannot_bypass_the_serial_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for advertised in ("broken", "fifo:", "3,4,5", ""):
+                with self.subTest(advertised=advertised):
+                    flags = f"-j --jobserver-auth=-2,-2 --jobserver-auth={advertised} --verbose"
+                    result = subprocess.run(
+                        [sys.executable, str(WRAPPER.with_name("test_compile_lock.py")),
+                         str(Path(directory) / "compile.lock"), sys.executable, "-c",
+                         "import os; print(os.environ['CARGO_MAKEFLAGS'])"],
+                        env=dict(os.environ, CARGO_MAKEFLAGS=flags),
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.split(), ["-j1", "--verbose"])
+
     def test_python_fallback_preserves_named_fifo_advertisements(self):
         with tempfile.TemporaryDirectory() as directory:
             flags = "-j --jobserver-auth=fifo:/private/make-pipe --verbose"
@@ -107,7 +123,12 @@ class TestCompileLockTests(unittest.TestCase):
     def test_python_fallback_preserves_read_write_fifo_descriptors(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "jobserver"
-            os.mkfifo(path)
+            try:
+                os.mkfifo(path)
+            except OSError as error:
+                if error.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                    self.skipTest("temporary filesystem does not support named pipes")
+                raise
             first = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             second = os.dup(first)
             try:

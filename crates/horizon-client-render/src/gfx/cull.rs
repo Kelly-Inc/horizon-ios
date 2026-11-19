@@ -300,157 +300,173 @@ impl Cull {
     pub fn early(&self) -> bool {
         self.depth_test == DepthTest::Early
     }
-    /// `color` is the world pass's colour format.
-    pub fn new(device: &wgpu::Device, color: wgpu::TextureFormat, depth_test: DepthTest) -> Self {
-        let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility,
-            ty,
-            count: None,
-        };
-        let storage = |read_only| wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        };
-        let uniform = wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        };
-        let both = wgpu::ShaderStages::VERTEX_FRAGMENT;
-        let vertex = wgpu::ShaderStages::VERTEX;
-        let fragment = wgpu::ShaderStages::FRAGMENT;
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Section culling"),
-            entries: &[
-                entry(0, both, storage(true)),
-                entry(1, fragment, storage(false)),
-                entry(2, fragment, storage(false)),
-                entry(3, vertex, storage(true)),
-                entry(4, vertex, uniform),
-                entry(5, both, uniform),
-            ],
-        });
-        let module = crate::gfx::shader_module(
-            device,
-            wgpu::ShaderModuleDescriptor {
+    /// `color` is the world pass's colour format. `None` where the device will not
+    /// make the pass, the error caught rather than raised (a raised error is
+    /// fatal): a driver can refuse it while `wgpu::Limits` promise the storage
+    /// blocks it binds, as Mesa's r600 OpenGL driver reports no vertex shader
+    /// storage blocks at all (#17994).
+    pub fn new(
+        device: &wgpu::Device,
+        color: wgpu::TextureFormat,
+        depth_test: DepthTest,
+    ) -> Option<Self> {
+        crate::gfx::deep_stack(|| {
+            let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility,
+                ty,
+                count: None,
+            };
+            let storage = |read_only| wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            };
+            let uniform = wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            };
+            let both = wgpu::ShaderStages::VERTEX_FRAGMENT;
+            let vertex = wgpu::ShaderStages::VERTEX;
+            let fragment = wgpu::ShaderStages::FRAGMENT;
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Section culling"),
-                source: wgpu::ShaderSource::Wgsl(source(depth_test).into()),
-            },
-        );
-        let depth_layout = (depth_test == DepthTest::InShader).then(|| {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Section culling depth"),
-                entries: &[entry(
-                    0,
-                    fragment,
-                    wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                )],
-            })
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Section culling"),
-            bind_group_layouts: &[Some(&layout), depth_layout.as_ref()],
-            ..Default::default()
-        });
-        // In the shader (`InShader`): no colour target, and the depth
-        // attached read only (a pass needs an attachment), its test left to
-        // the shader.
-        let color_target = [Some(wgpu::ColorTargetState {
-            format: color,
-            blend: None,
-            write_mask: wgpu::ColorWrites::empty(),
-        })];
-        let (fragment_entry, targets, depth_compare) = match depth_test {
-            DepthTest::Early => (
-                "fs_box_early",
-                &color_target[..],
-                wgpu::CompareFunction::GreaterEqual,
-            ),
-            DepthTest::InShader => ("fs_box", &[][..], wgpu::CompareFunction::Always),
-        };
-        let pipeline = crate::gfx::render_pipeline(
-            device,
-            &wgpu::RenderPipelineDescriptor {
-                label: Some("Section culling"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs_box"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
+                entries: &[
+                    entry(0, both, storage(true)),
+                    entry(1, fragment, storage(false)),
+                    entry(2, fragment, storage(false)),
+                    entry(3, vertex, storage(true)),
+                    entry(4, vertex, uniform),
+                    entry(5, both, uniform),
+                ],
+            });
+            let module = device.create_shader_module(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("Section culling"),
+                    source: wgpu::ShaderSource::Wgsl(source(depth_test).into()),
                 },
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: Some(wgpu::Face::Back),
-                    ..Default::default()
-                },
-                // The world pass's reversed depth test, without writes.
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(depth_compare),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(fragment_entry),
-                    compilation_options: Default::default(),
-                    targets,
-                }),
-                multiview_mask: None,
-                cache: None,
-            },
-        );
-        Self {
-            pipeline,
-            layout,
-            group: None,
-            depth_test,
-            depth_layout,
-            depth_group: None,
-            params: buffer(
-                device,
-                "Section culling parameters",
-                std::mem::size_of::<Params>() as u64,
-                wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            ),
-            phase2: buffer(device, "Section draws, phase 2", WORDS, PHASE2_USAGE),
-            phase2_capacity: 1,
-            tests: buffer(device, "Section tests", TEST_BYTES, TESTS_USAGE),
-            tests_capacity: 1,
-            test_data: Vec::new(),
-            test_slots: Vec::new(),
-            test_indices: Vec::new(),
-            total: 0,
-            probe: false,
-            results: buffer(device, "Section test results", 4, RESULTS_USAGE),
-            readbacks: (0..READBACKS)
-                .map(|_| Readback {
-                    buffer: buffer(device, "Section test readback", 4, READBACK_USAGE),
-                    capacity: 1,
-                    state: Arc::new(AtomicU8::new(FREE)),
-                    stamp: 0,
-                    slots: Vec::new(),
-                    indices: Vec::new(),
-                    total: 0,
+            );
+            let depth_layout = (depth_test == DepthTest::InShader).then(|| {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Section culling depth"),
+                    entries: &[entry(
+                        0,
+                        fragment,
+                        wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                    )],
                 })
-                .collect(),
-            next: 0,
-            current: None,
-            seen: Vec::new(),
-            seen_tiles: Vec::new(),
-            stamp: 0,
-            hidden: ([0; 2], 1.0),
-            always: false,
-            min_sections: 0,
-        }
+            });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Section culling"),
+                bind_group_layouts: &[Some(&layout), depth_layout.as_ref()],
+                ..Default::default()
+            });
+            // In the shader (`InShader`): no colour target, and the depth
+            // attached read only (a pass needs an attachment), its test left to
+            // the shader.
+            let color_target = [Some(wgpu::ColorTargetState {
+                format: color,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })];
+            let (fragment_entry, targets, depth_compare) = match depth_test {
+                DepthTest::Early => (
+                    "fs_box_early",
+                    &color_target[..],
+                    wgpu::CompareFunction::GreaterEqual,
+                ),
+                DepthTest::InShader => ("fs_box", &[][..], wgpu::CompareFunction::Always),
+            };
+            let pipeline = device.create_render_pipeline(
+                &wgpu::RenderPipelineDescriptor {
+                    label: Some("Section culling"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_box"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    // The world pass's reversed depth test, without writes.
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(depth_compare),
+                        stencil: Default::default(),
+                        bias: Default::default(),
+                    }),
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some(fragment_entry),
+                        compilation_options: Default::default(),
+                        targets,
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                },
+            );
+            let internal = pollster::block_on(internal.pop());
+            let validation = pollster::block_on(validation.pop());
+            if let Some(e) = internal.or(validation) {
+                log::warn!("Horizon renderer: occlusion culling unavailable ({e})");
+                return None;
+            }
+            Some(Self {
+                pipeline,
+                layout,
+                group: None,
+                depth_test,
+                depth_layout,
+                depth_group: None,
+                params: buffer(
+                    device,
+                    "Section culling parameters",
+                    std::mem::size_of::<Params>() as u64,
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                ),
+                phase2: buffer(device, "Section draws, phase 2", WORDS, PHASE2_USAGE),
+                phase2_capacity: 1,
+                tests: buffer(device, "Section tests", TEST_BYTES, TESTS_USAGE),
+                tests_capacity: 1,
+                test_data: Vec::new(),
+                test_slots: Vec::new(),
+                test_indices: Vec::new(),
+                total: 0,
+                probe: false,
+                results: buffer(device, "Section test results", 4, RESULTS_USAGE),
+                readbacks: (0..READBACKS)
+                    .map(|_| Readback {
+                        buffer: buffer(device, "Section test readback", 4, READBACK_USAGE),
+                        capacity: 1,
+                        state: Arc::new(AtomicU8::new(FREE)),
+                        stamp: 0,
+                        slots: Vec::new(),
+                        indices: Vec::new(),
+                        total: 0,
+                    })
+                    .collect(),
+                next: 0,
+                current: None,
+                seen: Vec::new(),
+                seen_tiles: Vec::new(),
+                stamp: 0,
+                hidden: ([0; 2], 1.0),
+                always: false,
+                min_sections: 0,
+            })
+        })
     }
 
     /// Start a frame: take in the results that came back, and tell whether
@@ -889,5 +905,56 @@ mod tests {
         info.driver_info = "Mesa 26.2.3-arch1.1".into();
         info.backend = wgpu::Backend::Vulkan;
         assert!(!is_nouveau(&info));
+    }
+
+    /// A device whose storage buffers cannot hold the pass's bindings gets no pass
+    /// rather than a panic (#17994). What it proves is the caught refusal and the
+    /// `None`, not the way r600 refused: the driver there links no pipeline at all
+    /// while its limits promise the bindings, which only a driver that refuses
+    /// reproduces.
+    #[test]
+    fn a_device_short_of_storage_buffers_gets_no_culling_pass() {
+        let _gpu = crate::gfx::test_gpu::lock();
+        let Some(adapter) = crate::gfx::test_gpu::adapter() else {
+            return;
+        };
+        // Where the device has the storage buffers the pass is made, so the
+        // refusal below is the shortfall and not something else on this machine.
+        // An adapter that refuses the pass with its own limits (the r600 case)
+        // leaves that half unproven instead of failing the test.
+        let (device, _queue) = crate::gfx::test_gpu::device(&adapter);
+        if Cull::new(
+            &device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            DepthTest::InShader,
+        )
+        .is_none()
+        {
+            eprintln!("skipped: the adapter does not make the pass with its own limits");
+            return;
+        }
+        drop(device);
+        // The device is asked for two storage buffers per stage: the pass binds
+        // three to its fragment stage and two to its vertex stage, so its layout
+        // cannot be made.
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 2,
+            ..Default::default()
+        };
+        let (device, _queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: limits,
+                ..Default::default()
+            }))
+            .expect("the device with two storage buffers per stage");
+        assert!(
+            Cull::new(
+                &device,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                DepthTest::InShader
+            )
+            .is_none(),
+            "the pass is sidelined where the device is short of storage buffers"
+        );
     }
 }

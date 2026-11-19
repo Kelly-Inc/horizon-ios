@@ -59,6 +59,7 @@ impl Game<'_> {
                 seed,
                 creative,
                 create,
+                world_folder,
                 from_title,
             }) => {
                 if from_title {
@@ -70,7 +71,19 @@ impl Game<'_> {
                         create.as_deref(),
                     )?;
                 } else {
-                    self.open_world(&folder, name.as_deref(), seed, creative, create.as_deref())?;
+                    let result = self.open_world_request(
+                        &folder,
+                        name.as_deref(),
+                        seed,
+                        creative,
+                        create.as_deref(),
+                        world_folder,
+                    );
+                    if let Err(error) = result
+                        && !self.show_world_preparation_error(error.as_ref())
+                    {
+                        return Err(error);
+                    }
                 }
             }
             Some(PendingWorldEntry::Server {

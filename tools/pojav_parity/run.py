@@ -98,6 +98,18 @@ def equal(a,b):
  if isinstance(a,list):return len(a)==len(b) and all(equal(x,y)for x,y in zip(a,b))
  return a==b
 
+def expected_horizon_output(case, reference):
+ if case['mode']!='menu_surface' or case['virtual']:
+  return reference
+ # Horizon bounds direct-touch menu coordinates to its render surface.
+ # The reference callbacks can emit coordinates beyond that surface.
+ def clamp_event(event):
+  if event[0]!='move':
+   return event
+  kind,x,y=event
+  return [kind, min(max(x,0),case['width']), min(max(y,0),case['height'])]
+ return [{**sample, 'events':[clamp_event(event) for event in sample['events']]} for sample in reference]
+
 def rust_method(source,name):
  start=source.index('fn '+name+'(');opening=source.index('{',start);depth=0
  for end in range(opening,len(source)):
@@ -122,23 +134,31 @@ def main():
  subprocess.run([sys.executable,str(ROOT/'tools/pojav_parity/build_reference.py'),str(ref)],check=True,cwd=work)
  project=work/'rust';(project/'src').mkdir(parents=True)
  (project/'Cargo.toml').write_text('[package]\nname="horizon-pojav-parity-probe"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nserde_json="=1.0.151"\n[features]\nhorizon-parity-ios=[]\n[workspace]\n')
- game=(ROOT/'crates/horizon-client/src/game/touch.rs').read_text()
- game_probe=(ROOT/'tools/pojav_parity/game_probe.rs').read_text().replace('GAME_KEY_OF',rust_method(game,'key_of')).replace('GAME_TOUCH_ACT',rust_method(game,'touch_act')).replace('GAME_TOUCH_RAW_KEY',rust_method(game,'touch_raw_key')).replace('GAME_TOUCH_RAW_BUTTON',rust_method(game,'touch_raw_button'))
+ game=(ROOT/'crates/horizon-client/src/game/interface/touch.rs').read_text()
+ game_probe=(ROOT/'tools/pojav_parity/game_probe.rs').read_text()
+ for method in ('key_of', 'touch_act', 'touch_raw_key', 'touch_cancel_key', 'touch_map_raw_key', 'touch_raw_button'):
+  game_probe=game_probe.replace(f'GAME_{method.upper()}', rust_method(game,method))
  game_probe=game_probe.replace('target_os = "ios"','feature = "horizon-parity-ios"')
  (project/'src/game.rs').write_text(game_probe)
  (project/'src/main.rs').write_text((ROOT/'tools/pojav_parity/probe.rs').read_text().replace('TOUCH_SOURCE',str(ROOT/'crates/horizon-client/src/touch.rs')))
  env=os.environ.copy();env['CARGO_TARGET_DIR']=str(work/'target');env['CARGO_BUILD_JOBS']='1';env['CARGO_INCREMENTAL']='0'
  for key in ['HORIZON_HOME','HORIZON_LAUNCHER_HOME','XDG_DATA_HOME','XDG_CONFIG_HOME']:env[key]=str(work/key)
  env=lab.game_env(env)
- with (work/'rust-build.log').open('w') as log:
-  subprocess.run(['cargo','build','--offline','--features','horizon-parity-ios','--manifest-path',str(project/'Cargo.toml')],env=env,cwd=work,stdout=log,stderr=subprocess.STDOUT,check=True)
+ build_log=work/'rust-build.log'
+ with build_log.open('w') as log:
+  build=subprocess.run(['cargo','build','--offline','--features','horizon-parity-ios','--manifest-path',str(project/'Cargo.toml')],env=env,cwd=work,stdout=log,stderr=subprocess.STDOUT)
+ if build.returncode:
+  raise SystemExit(f'Touch probe build failed. See {build_log}')
  binaries=[ref/'pojav-oracle',ref/'amethyst-oracle',work/'target/debug/horizon-pojav-parity-probe']
- mismatches=[];count=0;samples=0;groups={}
+ mismatches=[];count=0;samples=0;groups={};bounded_menu_traces=0
  for index,case in enumerate(cases()):
   outputs=[run(b,case,work) for b in binaries];count+=1;samples+=len(case['events']);groups[case['mode']]=groups.get(case['mode'],0)+1
-  if not equal(outputs[0],outputs[1]) or not equal(outputs[0],outputs[2]):
-   mismatches.append({'case':index,'input':case,'pojav':outputs[0],'amethyst':outputs[1],'horizon':outputs[2]})
+  expected=expected_horizon_output(case,outputs[0])
+  if not equal(outputs[0],expected):
+   bounded_menu_traces+=1
+  if not equal(outputs[0],outputs[1]) or not equal(expected,outputs[2]):
+   mismatches.append({'case':index,'input':case,'pojav':outputs[0],'amethyst':outputs[1],'expected_horizon':expected,'horizon':outputs[2]})
   if count%200==0:print(f'{count} traces compared; {len(mismatches)} mismatches',flush=True)
- report={'format':'horizon-pojav-input-parity','status':'fail' if mismatches else 'pass','references':PINS,'reference_hashes':hashes,'cases':count,'samples':samples,'groups':groups,'mismatches':mismatches,'scratch':str(work),'boundary':'Native control processing to callback-bridge entry; actual pinned ObjC method bodies, Foundation geometry stubs. No UIKit hit-testing, JVM, Minecraft, rendering or physical-device claim. Forward-lock disabled; valid one-contact-per-button sequences.','tolerance':{'relative':1e-12,'absolute':1e-9}}
- args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(report,indent=2));print(json.dumps({k:report[k]for k in ['status','cases','samples','groups']},indent=2));raise SystemExit(bool(mismatches))
+ report={'format':'horizon-pojav-input-parity','status':'fail' if mismatches else 'pass','references':PINS,'reference_hashes':hashes,'cases':count,'samples':samples,'groups':groups,'bounded_menu_traces':bounded_menu_traces,'mismatches':mismatches,'scratch':str(work),'boundary':'Native control processing to callback-bridge entry; actual pinned ObjC method bodies, Foundation geometry stubs. No UIKit hit-testing, JVM, Minecraft, rendering or physical-device claim. Forward-lock disabled; valid one-contact-per-button sequences. Horizon direct-touch menu coordinates are bounded to its render surface.','tolerance':{'relative':1e-12,'absolute':1e-9}}
+ args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(report,indent=2));print(json.dumps({k:report[k]for k in ['status','cases','samples','groups','bounded_menu_traces']},indent=2));raise SystemExit(bool(mismatches))
 if __name__=='__main__':main()

@@ -1,7 +1,6 @@
-//! Original touch control layout and per-finger input state. Directional keys,
-//! explicit mouse buttons and an optional joystick share the rectangles used by
-//! drawing and hit tests. Legacy tap/hold outputs remain available to frontends;
-//! the iOS desktop-style frontend uses explicit attack/use buttons instead.
+//! Touch input layout and per-contact state. Drawing and hit tests share the same
+//! control rectangles. The iOS desktop-style frontend uses explicit attack
+//! and use buttons.
 
 #[path = "touch/desktop.rs"]
 pub mod desktop;
@@ -122,8 +121,14 @@ fn default_layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
             [w - 69.6 * unit, 0.0, 69.6 * unit, 40.0 * unit],
         ),
     ]);
-    let d = button_size(h);
-    let (cx, cy) = (MARGIN + d, h - MARGIN - 2.0 * d - 16.0);
+    // Preserve all four directions on a short or narrow window. Clamping
+    // their origins independently would stack them at the same edge.
+    let margin = MARGIN.min(w.min(h) / 4.0);
+    let bottom = 16.0_f32.min(h / 4.0);
+    let d = button_size(h)
+        .min((w - margin) / 3.0)
+        .min((h - margin - bottom) / 3.0);
+    let (cx, cy) = (margin + d, h - margin - 2.0 * d - bottom);
     v.extend([
         (Control::Forward, [cx, cy - d, d, d]),
         (Control::Back, [cx, cy + d, d, d]),
@@ -154,7 +159,7 @@ fn default_layout(w: f32, h: f32) -> Vec<(Control, Rect)> {
         }
         // Keep the native hotbar reachable when the landscape preset is rotated.
         if let Some((_, r)) = v.iter_mut().find(|(c, _)| *c == Control::Joystick) {
-            r[1] = r[1].min(h - 34.0 - r[3]);
+            r[1] = r[1].min(h - 34.0_f32.min(h / 2.0) - r[3]);
         }
     }
     v
@@ -395,7 +400,7 @@ impl Touches {
                     .iter()
                     .any(|f| matches!(f.kind, Kind::Stick { .. }))
                 {
-                    Kind::Button(Control::Joystick)
+                    Kind::Ignored
                 } else {
                     let r = layout
                         .iter()
@@ -478,6 +483,25 @@ impl Touches {
             }
         }
         f.last = at;
+        out
+    }
+
+    /// Account for any motion reported only at lift-off.
+    pub fn end_at(&mut self, id: u64, at: (f32, f32)) -> Vec<Out> {
+        if !at.0.is_finite() || !at.1.is_finite() {
+            return self.cancel(id);
+        }
+        let camera = !self.direct_look || self.look_primary == Some(id);
+        let mut out = Vec::new();
+        if let Some(finger) = self.fingers.iter_mut().find(|finger| finger.id == id) {
+            match finger.kind {
+                Kind::World { .. } if camera && finger.last != at => out = self.moved(id, at, &[]),
+                // Check the lock without pressing a new direction.
+                Kind::Stick { .. } => finger.last = at,
+                _ => {}
+            }
+        }
+        out.extend(self.end(id));
         out
     }
 
@@ -670,6 +694,18 @@ mod tests {
     }
 
     #[test]
+    fn final_world_motion_is_not_mistaken_for_a_tap() {
+        let mut touches = Touches::default();
+        touches.start(1, (300.0, 100.0), 0.0, &[]);
+        assert_eq!(touches.end_at(1, (350.0, 100.0)), [Out::Look(50.0, 0.0)]);
+        touches.start(2, (300.0, 100.0), 0.0, &[]);
+        assert_eq!(touches.end_at(2, (303.0, 100.0)), [Out::Tap]);
+        touches.start(3, (300.0, 100.0), 0.0, &[]);
+        assert!(touches.end_at(3, (f32::NAN, 100.0)).is_empty());
+        assert!(!touches.has_contact());
+    }
+
+    #[test]
     fn a_dragging_finger_turns_the_view_and_does_not_tap() {
         let l = layout(633.0, 292.0);
         let mut t = Touches::default();
@@ -754,6 +790,20 @@ mod custom_layout_tests {
     }
 
     #[test]
+    fn factory_movement_controls_fit_compact_surfaces() {
+        for (w, h) in [(75.0, 64.0), (30.0, 40.0)] {
+            let layout = default_layout(w, h);
+            for (control, [x, y, width, height]) in layout {
+                if control.moves() || control == Control::Joystick {
+                    assert!(width > 0.0 && height > 0.0);
+                    assert!(x >= -0.0001 && y >= -0.0001, "{control:?}");
+                    assert!(x + width <= w + 0.0001 && y + height <= h + 0.0001);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn offscreen_centres_clamp_without_moving_hotbar_or_other_buttons() {
         let mut positions = [f32::NAN; 20];
         positions[10] = -20.0;
@@ -818,7 +868,8 @@ mod stick_gesture_tests {
                 Out::Release(Control::Right)
             ]
         );
-        assert!(!fingers.held(Control::Forward) && !fingers.held(Control::Back));
+        assert!(!fingers.held(Control::Joystick));
+        assert!(fingers.end(2).is_empty());
     }
     #[test]
     fn desktop_camera_uses_only_primary_finger_and_hands_off_on_release() {
@@ -828,9 +879,11 @@ mod stick_gesture_tests {
         };
         fingers.start(1, (10., 10.), 0., &[]);
         fingers.start(2, (20., 20.), 0., &[]);
+        fingers.start(3, (30., 30.), 0., &[]);
         assert!(fingers.moved(2, (21., 22.), &[]).is_empty());
         assert_eq!(fingers.moved(1, (12., 13.), &[]), [Out::Look(2., 3.)]);
         fingers.end(1);
+        assert_eq!(fingers.end_at(3, (33., 34.)), [Out::Tap]);
         assert_eq!(fingers.moved(2, (24., 26.), &[]), [Out::Look(3., 4.)]);
         fingers.cancel(2);
         assert!(fingers.moved(2, (28., 30.), &[]).is_empty());
@@ -891,6 +944,12 @@ mod amethyst_port_tests {
         t.cancel(2);
         assert!(!t.locked);
         assert!(!t.held(Control::Forward));
+
+        t.start(3, (50.01, 110.0), 0.0, &layout);
+        t.moved(3, (50.01, 50.0), &layout);
+        let released = t.end_at(3, (50.01, 120.0));
+        assert!(released.contains(&Out::Release(Control::Forward)));
+        assert!(!t.locked);
     }
     #[test]
     fn sizing_preserves_default_center_and_opacity_ids() {

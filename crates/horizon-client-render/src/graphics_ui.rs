@@ -1218,6 +1218,9 @@ impl Item {
             Item::Vanilla(Opt::MaxAnisotropy) if s.file.int("textureFiltering") != 2 => {
                 Some("Only with Anisotropic texture filtering.")
             }
+            Item::Horizon(H::LeafCulling) if !s.horizon.vanilla_models(&s.resource_packs) => {
+                Some("Only with the default resource pack.")
+            }
             _ => None,
         }
     }
@@ -1290,9 +1293,10 @@ impl Item {
         }
     }
     pub fn set_slider(self, s: &mut Settings, v: f32, out: &EffectiveOutput) {
-        if !self.available() || self.blocked(s, out).is_some() {
+        if !v.is_finite() || !self.available() || self.blocked(s, out).is_some() {
             return;
         }
+        let v = v.clamp(0.0, 1.0);
         match self {
             // Options.applyGraphicsPreset, as Video Settings' slider does it.
             Item::Vanilla(o) => crate::options_ui::set_slider(o, s, v),
@@ -1302,7 +1306,7 @@ impl Item {
         self.touched(s);
     }
     pub fn cycle(self, s: &mut Settings, back: bool, framebuffer: [i32; 2], out: &EffectiveOutput) {
-        if !self.available() {
+        if !self.available() || self.blocked(s, out).is_some() {
             return;
         }
         match self {
@@ -1622,6 +1626,29 @@ mod tests {
     pub(super) const DRAGGED: Output = Output::Event(Event::SliderDrag);
     /// A renderer whose destination offers nothing and whose display reports nothing.
     pub(super) const NONE: EffectiveOutput = EffectiveOutput::NONE;
+
+    #[test]
+    fn graphics_sliders_ignore_non_finite_positions_and_clamp_finite_ones() {
+        let mut settings = Settings::default();
+        let upload = Item::Horizon(H::UploadBudget);
+        let original = settings.horizon.upload_budget_kib;
+        let preset = settings.horizon.preset;
+        for position in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            upload.set_slider(&mut settings, position, &NONE);
+        }
+        assert_eq!(settings.horizon.upload_budget_kib, original);
+        assert_eq!(settings.horizon.preset, preset);
+        upload.set_slider(&mut settings, 2.0, &NONE);
+        assert_eq!(
+            settings.horizon.upload_budget_kib,
+            *UPLOAD_STEPS.last().unwrap()
+        );
+        upload.set_slider(&mut settings, -2.0, &NONE);
+        assert_eq!(settings.horizon.upload_budget_kib, UPLOAD_STEPS[0]);
+        let resolution = Item::Horizon(H::ResolutionScale);
+        resolution.set_slider(&mut settings, 2.0, &NONE);
+        assert_eq!(settings.horizon.resolution_scale, 200);
+    }
 
     pub(super) type Ui = Shell<GraphicsScreen>;
     pub(super) fn ui() -> Ui {
@@ -2759,6 +2786,31 @@ mod tests {
         );
         assert_eq!(s.horizon.leaf_culling, LeafCullingMode::Hidden);
         assert_eq!(s.horizon.preset, Preset::Custom);
+
+        // A custom resource pack blocks leaf culling and explains why.
+        s.resource_packs = vec!["vanilla".into(), "faithful.zip".into()];
+        assert_eq!(
+            item.blocked(&s, &NONE),
+            Some("Only with the default resource pack.")
+        );
+        let before_mode = s.horizon.leaf_culling;
+        item.cycle(&mut s, false, FB, &NONE);
+        assert_eq!(s.horizon.leaf_culling, before_mode);
+        let screen_row = GraphicsScreen::default()
+            .sheets(&s)
+            .into_iter()
+            .flat_map(|sh| sh.groups)
+            .flat_map(|g| g.rows)
+            .find(|row| row.id == item)
+            .unwrap();
+        assert!(!screen_row.live);
+        assert_eq!(
+            screen_row.why.as_deref(),
+            Some("Only with the default resource pack.")
+        );
+
+        s.resource_packs = vec!["vanilla".into()];
+        assert_eq!(item.blocked(&s, &NONE), None);
     }
 
     #[test]
@@ -2925,6 +2977,7 @@ mod tests {
                 "No settings match.",
                 "Undo",
                 "Done",
+                "Only with the default resource pack.",
             ] {
                 lang::get(text);
             }

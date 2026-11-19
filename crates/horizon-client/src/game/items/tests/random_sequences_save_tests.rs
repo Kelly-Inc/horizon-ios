@@ -36,19 +36,19 @@ fn a_reset_after_a_draw_survives_the_reopening() {
     let root = world("reset");
     let mut data = RandomSequences::default();
     let first = draw(&mut data);
-    write_random_sequences(&root, &mut data);
+    write_random_sequences(&root, &mut data).unwrap();
     draw(&mut data);
     assert_eq!(data.clear(), 1);
-    write_random_sequences(&root, &mut data);
+    write_random_sequences(&root, &mut data).unwrap();
     let mut reopened = read_random_sequences(&root);
     assert!(reopened.ids().is_empty(), "the reset emptied the file");
     assert_eq!(draw(&mut reopened), first, "the sequence starts over");
     // `/random reset * 42` after a draw: the salt is written too.
-    write_random_sequences(&root, &mut reopened);
+    write_random_sequences(&root, &mut reopened).unwrap();
     draw(&mut reopened);
     reopened.set_defaults(42, true, true);
     reopened.clear();
-    write_random_sequences(&root, &mut reopened);
+    write_random_sequences(&root, &mut reopened).unwrap();
     assert_eq!(salt_on_disk(&root), Some(Tag::Int(42)));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -58,7 +58,7 @@ fn a_reset_with_no_draw_since_the_save_is_not_written() {
     let root = world("undrawn");
     let mut data = RandomSequences::default();
     let first = draw(&mut data);
-    write_random_sequences(&root, &mut data);
+    write_random_sequences(&root, &mut data).unwrap();
     // Handing a sequence out (a trade screen borrowing it, a `get` nothing draws from)
     // is no draw.
     let lent = data.lend(TEST, SEED);
@@ -66,7 +66,7 @@ fn a_reset_with_no_draw_since_the_save_is_not_written() {
     data.get(TEST, SEED);
     data.set_defaults(42, true, true);
     data.clear();
-    write_random_sequences(&root, &mut data);
+    write_random_sequences(&root, &mut data).unwrap();
     let mut reopened = read_random_sequences(&root);
     assert_eq!(salt_on_disk(&root), Some(Tag::Int(0)), "the old file stays");
     assert_eq!(reopened.ids(), [TEST]);
@@ -80,7 +80,7 @@ fn a_lent_sequence_stays_in_the_file() {
     let mut data = RandomSequences::default();
     draw(&mut data);
     let lent = data.lend(TEST, SEED);
-    write_random_sequences(&root, &mut data);
+    write_random_sequences(&root, &mut data).unwrap();
     assert_eq!(read_random_sequences(&root).ids(), [TEST]);
     data.give_back(TEST.to_owned(), lent);
     let _ = std::fs::remove_dir_all(&root);
@@ -92,7 +92,11 @@ fn a_new_world_writes_its_first_save() {
     let mut data = read_random_sequences(&root);
     data.set_defaults(42, true, true);
     assert_eq!(data.clear(), 0);
-    write_random_sequences(&root, &mut data);
+    let path = super::random_sequences_file(&root);
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(write_random_sequences(&root, &mut data).is_err());
+    std::fs::remove_dir(&path).unwrap();
+    write_random_sequences(&root, &mut data).unwrap();
     assert_eq!(salt_on_disk(&root), Some(Tag::Int(42)));
     assert!(read_random_sequences(&root).ids().is_empty());
     let _ = std::fs::remove_dir_all(&root);

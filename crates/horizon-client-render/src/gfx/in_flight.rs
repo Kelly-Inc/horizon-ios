@@ -44,9 +44,8 @@ impl Renderer {
             return;
         };
         let submission = self.queue.landed();
-        if submission.is_some()
-            && self.deferred_presentation_generation.take() == Some(self.presentation_generation)
-        {
+        let generation = self.deferred_presentation_generation.take();
+        if submission.is_some() && generation == Some(self.presentation_generation) {
             self.presented_generation = Some(self.presentation_generation);
         }
         if let Some(timer) = &mut self.gpu_timer {
@@ -120,7 +119,11 @@ impl Renderer {
                 "screenshots need a 32-bit surface format, not {:?}",
                 self.config.format
             );
-            self.screenshot_result = Some(Err(error));
+            self.screenshot_halvings = 0;
+            self.screenshot_result = Some(Err(super::ScreenshotFailure {
+                path: request.path,
+                message: error,
+            }));
             None
         }
     }

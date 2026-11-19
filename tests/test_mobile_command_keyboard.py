@@ -55,7 +55,7 @@ def program(pad_source=None, command_source=None):
     helper = title_owner + 'mod chat_input { use super::*; pub(crate) ' + method(chat_input, 'text_without_physical_key') + ' }\n'
     uikit = (ROOT / 'third_party/winit/src/platform_impl/ios/hardware_keyboard.rs').read_text()
     callbacks = '\n'.join('pub(crate) ' + method(uikit, n) for n in
-                          ['key_text', 'insert_text_keys', 'text_key_code', 'logical_key'])
+                          ['key_text', 'insert_text_keys', 'multiline_commit', 'text_key_code', 'logical_key'])
     codes = sorted(set(re.findall(r'KeyCode::(\w+)', callbacks)) | {'KeyA'})
     named = sorted(set(re.findall(r'NamedKey::(\w+)', callbacks)))
     types = '#[derive(Clone, Copy, PartialEq)] enum KeyCode {' + ','.join(codes) + '}\n'
@@ -71,7 +71,8 @@ use std::cell::RefCell;
 #[macro_export] macro_rules! warn { ($($arg:tt)*) => {{ let _ = format_args!($($arg)*); }}; }
 mod log { pub(crate) use crate::warn; }
 mod key_focus { pub struct Context{pub slider_edit:bool,pub typing:bool,pub rows_take_enter:bool,pub gui:(f32,f32)} }
-mod preedit { pub fn set_preedit(_: Option<()>) {} pub fn mark_committed() {} }
+mod mod_api {pub enum HookId{ScreenCharTypedPre} pub mod __private {pub fn listened(_:super::HookId)->bool{false}}}
+mod preedit { pub fn composing() -> bool { false } pub fn set_preedit(_: Option<()>) {} pub fn mark_committed() {} }
 mod books { pub enum BookScreen { Edit { signing:bool }, View } }
 mod osk { pub enum Output { Text(String), Backspace, Enter, Done, Complete, Previous, Next, Close } }
 #[derive(Default, PartialEq)] enum Screen { #[default] Playing, Chat, CommandBlock, WorldOptions, Creative, Inventory, Options, Social, DebugOptions, BlockEditor, Win }
@@ -110,6 +111,10 @@ struct Renderer{current:bool} impl Renderer{fn presentation_current(&self)->bool
  dialog: bool, dialog_text: bool, dialog_lines: bool, recipe: bool, station: bool, command: String, submitted: bool, block_typing: bool, key_code_calls: usize, title_text: String,
 }
 impl Game {
+ fn owns_window_ime(&self)->bool{true}
+ fn set_window_ime(&mut self, allowed:bool){if let Some(window)=&self.window{window.set_ime_allowed(allowed);}}
+ fn key_screen(&self)->(std::mem::Discriminant<Screen>,bool){(std::mem::discriminant(&self.screen),self.dialog)}
+ fn dialog_text(&mut self,t:&str){self.dialog_type(t);}
  fn close_sign_editor(&mut self){self.sign_edit=None;}
  fn book_control(&mut self,_:Option<&str>)->Result<(),String>{self.book=None;Ok(())}
  fn prompt_open(&self)->bool{self.dialog_open()}
@@ -247,6 +252,10 @@ CASES = r'''
 }
 
 fn deliver_uikit_text(g:&mut Game,text:&str) {
+ if let Some(text)=uikit::multiline_commit(text) {
+  if g.system_keyboard_up() {g.ime_commit(&text);}
+  return;
+ }
  for (physical_key,logical) in uikit::insert_text_keys(text) {
   let text=match logical {Key::Character(t)=>Some(t),_=>None};
   g.command_block_key(&KeyEvent{physical_key,state:ElementState::Pressed,text:text.clone()});
@@ -265,6 +274,14 @@ fn deliver_uikit_text(g:&mut Game,text:&str) {
  deliver_uikit_text(&mut g,"\u{8}");assert_eq!(g.command,"say h");
  deliver_uikit_text(&mut g,"\n");assert!(g.submitted);
  assert_eq!(g.key_code_calls,3);
+}
+#[test] fn multiline_paste_does_not_submit_the_command_or_lose_dialog_line_breaks() {
+ let mut g=Game::new();g.screen=Screen::CommandBlock;g.sync_system_keyboard();
+ deliver_uikit_text(&mut g,"say hello \r\nworld\t");
+ assert_eq!(g.command,"say hello world");assert!(!g.submitted);assert_eq!(g.key_code_calls,0);
+ g.dialog=true;g.dialog_text=true;g.dialog_lines=true;g.command.clear();
+ deliver_uikit_text(&mut g,"first\r\nsecond\rthird");
+ assert_eq!(g.command,"first\nsecond\nthird");
 }
 #[test] fn unidentified_text_respects_modifiers_and_ignores_releases() {
  let mut g=Game::new();g.screen=Screen::CommandBlock;g.block_typing=true;

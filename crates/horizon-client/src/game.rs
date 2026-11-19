@@ -64,6 +64,8 @@ fn pack_files(world_tables: &Option<WorldTables>) -> horizon_world::loot::PackOv
     }
 }
 include!(concat!(env!("OUT_DIR"), "/game_modules.rs"));
+#[cfg(feature = "test-support")]
+pub use presentation::probe::run as presentation_input_probe;
 /// Installs the dispatcher of each injection point a mod listens at as its function's entry,
 /// once the points are sealed. The prebuilt game's staging pass writes the call; a build without
 /// points has none to arm.
@@ -125,8 +127,8 @@ use loading_window::{
 #[cfg(test)]
 use resource_loader::retired_rest_loaders;
 use resource_loader::{
-    EntityModels, GameCpuResources, Loaded, LoaderMsg, PendingWorldEntry, WorldRestLoader,
-    poll_retired_rest_loaders, run_loading, write_report,
+    EntityModels, GameCpuResources, Loaded, LoaderMsg, PendingWorldEntry, WorldFolder,
+    WorldRestLoader, poll_retired_rest_loaders, run_loading, write_report,
 };
 // `Action` here is the title screen's buttons (`title::Action`).
 use self::api_values::TryIntoApi;
@@ -686,6 +688,8 @@ fn falling_block_visible(state: BlockStateId, cell: BlockStateId) -> bool {
 pub struct Resources {
     core: WorldCore,
     rest: std::sync::OnceLock<WorldRest>,
+    /// Immutable reach flags share the lifetime of these facts, including across a resource reload.
+    block_entity_reach: std::sync::OnceLock<Arc<[u8]>>,
 }
 
 struct WorldCore {
@@ -1097,6 +1101,7 @@ struct Game<'a> {
     rejected_keys: HashSet<KeyCode>,
     physical_buttons: HashSet<MouseButton>,
     drag_button: Option<MouseButton>,
+    touch_drag_button: Option<MouseButton>,
     /// Control + left click as a right click (macOS).
     right_click_emulation: horizon_client::mouse::RightClickEmulation,
     left: bool,
@@ -1730,6 +1735,7 @@ struct Game<'a> {
     panel: native_panel::Panel,
     /// Horizon's own shader pack, while one is picked (`game/modding/native_shaders.rs`).
     native_shaders: native_shaders::NativeShaders,
+    shader_parser: shader_packs::ParserInbox,
     /// Native client mods' claimed items, unpolled events and key mappings (game/modding/native_claimed_items.rs).
     native_input: native_claimed_items::ModInput,
     /// The native lifecycle bookkeeping.
@@ -1752,18 +1758,8 @@ struct Game<'a> {
     upload_pace: upload_pace::UploadPace,
     /// This frame's view frustum, for culling entities and block entities.
     view_frustum: Option<horizon_client::gfx::JoinedFrusta>,
-    /// Whether the renderer's section-occlusion graph is active for this view.
-    entity_section_visibility_valid: bool,
-    /// The camera section in the current world layout.
-    entity_section_camera: Option<(i32, i32, i32)>,
-    sync_occlusion_culler: Option<horizon_client::voxel_occlusion::Culler>,
-    async_occlusion_culler: Option<Box<occlusion_culling::AsyncOcclusionCuller>>,
-    retired_occlusion_cullers: Vec<Box<occlusion_culling::AsyncOcclusionCuller>>,
-    async_occlusion_culling_failed: bool,
+    occlusion: entity_culling::EntityOcclusion,
     async_particle_culler: RefCell<particle_culling::ParticleAsyncState>,
-    /// `Renderer::pack_shadow_casters` for this frame's entities: (keep what the culler hides,
-    /// build the player's model in first person); (false, false) without a shader pack.
-    pack_shadow_casters: (bool, bool),
     /// A scripted flight from the control socket (`fly`).
     flight: Option<control::Flight>,
     /// The running agent action from the control socket (game/runtime/agent/mod.rs).
@@ -1974,6 +1970,14 @@ struct Game<'a> {
     save_after_guest_turn: bool,
     /// Guests whose records are displaced by nested player swaps, outer first.
     lan_guest_swaps: Vec<u32>,
+    /// Guests whose last turn a panic ended after their state was written back and the outer
+    /// player restored (`as_guest_at`, `as_guest_messaged`, `leave_guest`), which hides the turn
+    /// from `lan_acting`: crash teardown keeps their last saved file (`keep_interrupted_players`).
+    /// Cleared as each server tick starts: a panic something caught leaves a game that carried on.
+    lan_interrupted_turns: Vec<u32>,
+    /// Crash teardown left the integrated server's owner unplaced, or lost the hub: the save keeps
+    /// the owner's player file, stats and advancements as last saved (`save_game_metadata`).
+    keep_owner_files: bool,
     /// Live attachments and original snapshots retained during player replacement.
     player_state: original_player::PlayerState,
     /// The block the acting player is breaking (`break_block`): its destroy
@@ -5775,18 +5779,13 @@ impl Game<'_> {
             let view = self.view_frustum;
             // Beams and structure outlines reach far outside their block
             // (BlockEntityRenderer.shouldRenderOffScreen): never culled.
+            // Both flags are one byte per state, worked out once (`block_entity_reach`): a frame
+            // asks them of every block entity within 256 blocks.
+            let reach = block_entity_reach(&self.res);
             let off_screen = |state: u32| {
-                let name = &*self.res.facts().get(BlockStateId(state)).name;
-                matches!(
-                    name,
-                    "minecraft:beacon"
-                        | "minecraft:end_gateway"
-                        | "minecraft:structure_block"
-                        | "minecraft:test_instance_block"
-                )
-            };
-            let long_range = |state: u32| {
-                &*self.res.facts().get(BlockStateId(state)).name == "minecraft:end_gateway"
+                reach
+                    .get(state as usize)
+                    .is_some_and(|flags| flags & 1 != 0)
             };
             let in_view = |p: &[i32; 3]| {
                 view.is_none_or(|v| {
@@ -5801,8 +5800,7 @@ impl Game<'_> {
                     self.settings.chunk_fade,
                     camera,
                     view,
-                    &off_screen,
-                    long_range,
+                    Some(&reach),
                 )
                 .filter(|(block, section_inside)| {
                     let (pos, state) = **block;
@@ -5815,7 +5813,7 @@ impl Game<'_> {
             // in the view or not (`Renderer::shadow_pass_block_entities`, #8464): those the
             // view leaves out go in hidden from the camera.
             let shadow_only: Vec<&([i32; 3], u32)> =
-                if self.pack_ids.is_some() && self.pack_shadow_casters.0 {
+                if self.pack_ids.is_some() && self.occlusion.shadow_casters.0 {
                     let listed: HashSet<[i32; 3]> = camera_list.iter().map(|b| b.0).collect();
                     r.shadow_pass_block_entities(camera)
                         .filter(|(pos, state)| {
@@ -5840,7 +5838,7 @@ impl Game<'_> {
                 }
                 let name = &*self.res.facts().get(BlockStateId(state)).name;
                 if self.settings.horizon.entity_culling == EntityCullingMode::Off
-                    || self.pack_shadow_casters.0
+                    || self.occlusion.shadow_casters.0
                     || name == "minecraft:end_portal"
                     || name == "minecraft:end_gateway"
                     || hi.y - lo.y > 2.0
@@ -5923,13 +5921,7 @@ impl Game<'_> {
                     );
             } else {
                 let cache_candidates = r
-                    .visible_block_entities_in_frustum(
-                        self.settings.chunk_fade,
-                        camera,
-                        None,
-                        |_| false,
-                        |_| false,
-                    )
+                    .visible_block_entities_in_frustum(self.settings.chunk_fade, camera, None, None)
                     .filter(|(block, _)| self.live_block_entity_render(block.0, block.1))
                     .map(|(block, _)| block);
                 (
@@ -6574,6 +6566,7 @@ impl Game<'_> {
         self.selected = level.selected_slot.clamp(0, 8) as usize;
         self.streaming = streaming;
         self.world = world;
+        self.reset_frame_autotune();
         self.inventory = inventory;
         self.save = self.with_profession_save_snapshot(save);
         // MinecraftServer.prepareLevels: the saved tickets come back.
@@ -6625,7 +6618,7 @@ impl Game<'_> {
         self.spawn_spiral = Default::default();
         self.player_spawn = None;
         self.creatures.reset_trader();
-        self.creatures.cat_tick = 0;
+        self.creatures.cat = Default::default();
         self.creatures.custom_spawners.clear();
         self.portals = Default::default();
         self.experience = Experience {
@@ -6688,6 +6681,7 @@ impl Game<'_> {
         self.bosses = Default::default();
         self.streaming.paused = true;
         self.world = Game::world_for_mods(self.res.facts().air, 0);
+        self.reset_frame_autotune();
         self.player = None;
         // `LocalPlayer`'s constructor: `KeyMapping.resetToggleKeys`, so a sneak or sprint toggled
         // in this world is not still on in the next one.
@@ -7515,7 +7509,7 @@ impl Game<'_> {
             );
             horizon_client::graphics::lose_gpu_culling();
         }
-        let (screenshot, screenshot_result) = (old.screenshot.take(), old.screenshot_result.take());
+        let screenshots = old.take_screenshot_state();
         let display = old.display_reading();
         drop(old);
         let mut renderer = build_renderer(
@@ -7536,7 +7530,7 @@ impl Game<'_> {
                 self.settings.file.int("maxAnisotropyBit"),
             ),
         )?;
-        (renderer.screenshot, renderer.screenshot_result) = (screenshot, screenshot_result);
+        renderer.restore_screenshot_state(screenshots);
         self.adopt_renderer(renderer);
         log::info!("Horizon: graphics device recovered; rebuilding world meshes");
         Ok(())
@@ -9134,9 +9128,12 @@ impl Game<'_> {
         if let WindowEvent::Focused(false) = &event {
             self.modifiers = winit::keyboard::ModifiersState::empty();
             self.physical_keys.clear();
-            self.modifiers = winit::keyboard::ModifiersState::empty();
             self.physical_buttons.clear();
-            self.drag_button = None;
+            // Losing focus can interrupt input without a release event.
+            // End active UI drags and retire touch holds before dispatching the
+            // focus change, even when a save screen is blocking ordinary input.
+            self.cancel_pointer_drags();
+            self.cancel_touch_and_release_mouse();
         }
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.update_modifiers(m.state());
@@ -9167,6 +9164,28 @@ impl Game<'_> {
                 let _ = self.screen_key_released(code);
                 if let Err(error) = self.mapped_key_event(code, false, false) {
                     log::warn!("Horizon: releasing key during resize: {error}");
+                }
+            } else if let WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } = &event
+                && !self.pad_synthetic_input()
+                && !self.touch_synthetic_input()
+            {
+                self.extras_mouse(*button, false);
+                for mapped in self.settings.keys.translate_mouse_all(*button) {
+                    match mapped {
+                        Ok(key) => {
+                            self.keys.release(&key, Source::Keyboard);
+                        }
+                        Err(button) => {
+                            if let Err(error) = self.mouse_mapping(button, false, Source::Keyboard)
+                            {
+                                log::warn!("Horizon: releasing mouse during resize: {error}");
+                            }
+                        }
+                    }
                 }
             }
             return;
@@ -9220,12 +9239,13 @@ impl Game<'_> {
         {
             self.pad.keyboard_took_over = true;
         }
+        let capturing_key = self.screen == Screen::Options && self.options_waiting_for_key();
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && event.state == ElementState::Pressed
             && let PhysicalKey::Code(key) = event.physical_key
             && horizon_client::keybinds::key_name(key)
                 == Some(self.settings.keys.get("key.fullscreen"))
-            && !(self.screen == Screen::Options && self.options_waiting_for_key())
+            && !capturing_key
         {
             self.last_input = Instant::now();
             if !event.repeat {
@@ -9235,8 +9255,9 @@ impl Game<'_> {
         }
         // A screenshot is a window shortcut too: vanilla takes it before a
         // screen or a text box consumes the key (`handleGlobalKeyPress`), so
-        // it works with chat, a sign or a book open.
-        if let WindowEvent::KeyboardInput { event, .. } = &event
+        // it works with chat, a sign or a book open. Key binding takes precedence.
+        if !capturing_key
+            && let WindowEvent::KeyboardInput { event, .. } = &event
             && event.state == ElementState::Pressed
             && let PhysicalKey::Code(key) = event.physical_key
         {
@@ -9567,7 +9588,8 @@ impl Game<'_> {
                     self.ime_preedit(&text, cursor)
                 }
                 WindowEvent::Ime(winit::event::Ime::Disabled) => {
-                    horizon_client::preedit::set_preedit(None)
+                    // Closing the input session should not suppress the next key.
+                    horizon_client::preedit::reset();
                 }
                 WindowEvent::Resized(size) => {
                     // On AirPlay the surface is the display's, sized by it.
@@ -9975,13 +9997,19 @@ impl Game<'_> {
                     }
                     match self.screen {
                         Screen::Playing => {
+                            // A menu click can close its screen before the synthetic release arrives.
+                            if self.touch_synthetic_input() || self.pad_synthetic_input() {
+                                return Ok(());
+                            }
                             if pressed && !self.captured {
                                 self.capture(true);
                                 return Ok(());
                             }
                             let input = horizon_client::keybinds::mouse_name(button);
                             if self.key_mapping_canceled(Some(input.as_str()), pressed) {
-                                self.physical_buttons.remove(&button);
+                                if let Some(buttons) = self.pointer_buttons_mut() {
+                                    buttons.remove(&button);
+                                }
                                 return Ok(());
                             }
                             self.extras_mouse(button, pressed);
@@ -9997,11 +10025,11 @@ impl Game<'_> {
                                         if !self.shared_default_acts(b, Some(input.as_str())) => {}
                                     Err(b) => self.mouse_mapping(b, pressed, Source::Keyboard)?,
                                     Ok(k) if pressed => {
-                                        self.keys.insert(k);
+                                        self.keys.press(k, Source::Keyboard);
                                         self.key_pressed(k, k)?;
                                     }
                                     Ok(k) => {
-                                        self.keys.remove(&k);
+                                        self.keys.release(&k, Source::Keyboard);
                                     }
                                 }
                             }
@@ -10451,6 +10479,11 @@ impl Game<'_> {
                         return Ok(());
                     }
                     horizon_client::spans::time("recover_device", || self.recover_device())?;
+                    #[cfg(target_os = "ios")]
+                    if self.renderer.as_mut().is_some_and(Renderer::sync_ios_window_size) {
+                        self.notify_window_resize();
+                        self.sync_presentation_input(event_loop);
+                    }
                     self.observe_fullscreen();
                     self.sync_ime();
                     let now = Instant::now();
@@ -10509,6 +10542,10 @@ impl Game<'_> {
                         Vec::new()
                     };
                     let mut perf_times = None;
+                    let settled = rendered && self.frame_autotune_settled();
+                    if !settled && self.settings.horizon.dynamic_resolution {
+                        self.dynamic_resolution.skip_frame(elapsed.as_secs_f32() * 1000.0);
+                    }
                     if let Some(r) = self.renderer.as_mut() {
                         let cpu = now.elapsed().saturating_sub(r.last_wait);
                         horizon_threads::work::tick_end(cpu.as_nanos() as u64);
@@ -10524,8 +10561,6 @@ impl Game<'_> {
                                 self.gpu_utilization =
                                     f64::from(gpu) * 100.0 / f64::from(ms(cpu).max(0.001));
                             }
-                            let settled =
-                                self.screen == Screen::Playing && !self.streaming.terrain_loading();
                             frame_autotune::observe(
                                 &self.settings.horizon,
                                 settled,
@@ -10571,47 +10606,8 @@ impl Game<'_> {
                         server.set_legacy_rules(self.settings.extras.pvp.combat.rules);
                     }
                     self.clock.end_frame(self.pause);
-                    self.poll_screenshot_writes();
-                    let mut consumed = !self.ui.screenshot_messages.is_empty();
-                    let finished = self
-                        .renderer
-                        .as_mut()
-                        .and_then(|r| r.screenshot_result.take())
-                        .and_then(|result| match result {
-                            Ok(pending) => self.save_screenshot(pending),
-                            Err(error) => {
-                                let result = Err(error);
-                                self.finish_screenshot(&result, None);
-                                Some(result)
-                            }
-                        });
-                    if let Some(result) = &finished
-                        && let Some(reply) = self.pending_screenshot.take()
-                    {
-                        let _ = reply.send(
-                            match result {
-                                Ok([w, h]) => {
-                                    serde_json::json!({ "ok": true, "width": w, "height": h })
-                                }
-                                Err(e) => serde_json::json!({ "error": e }),
-                            }
-                            .to_string(),
-                        );
-                        consumed = true;
-                    }
-                    if let Some(result) =
-                        self.renderer.as_mut().and_then(|r| r.capture_result.take())
-                        && let Some(reply) = self.pending_render_capture.take()
-                    {
-                        let value = result.unwrap_or_else(|e| serde_json::json!({ "error": e }));
-                        let _ = reply.send(value.to_string());
-                    }
-                    // A result nobody asked for was the world icon's
-                    // (`tick_world_icon`): a failure tries again a second
-                    // later, as `tryTakeScreenshotIfNeeded` does.
-                    if !consumed && let Some(Err(error)) = finished {
-                        log::warn!("Horizon: couldn't save the world icon: {error}");
-                    }
+                    self.poll_screenshot_capture();
+                    self.poll_render_capture();
                     if rendered {
                         self.frame_stats.record(elapsed.as_secs_f32() * 1000.0);
                         if let Some((cpu, gpu)) = perf_times {
@@ -10884,6 +10880,7 @@ impl<'a> Game<'a> {
             rejected_keys: HashSet::new(),
             physical_buttons: HashSet::new(),
             drag_button: None,
+            touch_drag_button: None,
             right_click_emulation: Default::default(),
             left: false,
             right: false,
@@ -10944,7 +10941,7 @@ impl<'a> Game<'a> {
             last_input: now,
             pad: Default::default(),
             touch: Default::default(),
-            airplay: None,
+            airplay: Default::default(),
             splitscreen: Default::default(),
             splitscreen_guest: None,
             loading_overlay: None,
@@ -11240,14 +11237,8 @@ impl<'a> Game<'a> {
             tick_script: tick_script::TickScript::from_env(),
             agent: agent::Agent::default(),
             view_frustum: None,
-            entity_section_visibility_valid: false,
-            entity_section_camera: None,
-            sync_occlusion_culler: None,
-            async_occlusion_culler: None,
-            retired_occlusion_cullers: Vec::new(),
-            async_occlusion_culling_failed: false,
+            occlusion: Default::default(),
             async_particle_culler: RefCell::new(Default::default()),
-            pack_shadow_casters: (false, false),
             pending_uploads: Vec::new(),
             upload_pace: Default::default(),
             frame_graph: Default::default(),
@@ -11260,6 +11251,7 @@ impl<'a> Game<'a> {
             recipe_tables: Default::default(),
             panel: Default::default(),
             native_shaders: Default::default(),
+            shader_parser: Default::default(),
             native_input: Default::default(),
             native_lifecycle: Default::default(),
             resident_entities: Default::default(),
@@ -11362,6 +11354,8 @@ impl<'a> Game<'a> {
             lan_building_boxes: Default::default(),
             save_after_guest_turn: false,
             lan_guest_swaps: Vec::new(),
+            lan_interrupted_turns: Vec::new(),
+            keep_owner_files: false,
             player_state: Default::default(),
             lan_break_pos: None,
             break_collect: None,
@@ -12026,3 +12020,26 @@ mod sign_chain_tests;
 #[cfg(test)]
 #[path = "game/interface/tests/sign_use_tests.rs"]
 mod sign_use_tests;
+
+/// For each block state, whether its block entity draws off screen (1: beacons, end gateways,
+/// structure and test instance blocks, `BlockEntityRenderer.shouldRenderOffScreen`) and far
+/// (2: end gateways), by its name. Worked out once for these facts and reused while they live.
+fn block_entity_reach(resources: &Resources) -> Arc<[u8]> {
+    resources
+        .block_entity_reach
+        .get_or_init(|| {
+            resources
+                .facts()
+                .states
+                .iter()
+                .map(|state| match &*state.name {
+                    "minecraft:end_gateway" => 3,
+                    "minecraft:beacon"
+                    | "minecraft:structure_block"
+                    | "minecraft:test_instance_block" => 1,
+                    _ => 0,
+                })
+                .collect()
+        })
+        .clone()
+}

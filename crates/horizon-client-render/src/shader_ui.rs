@@ -456,19 +456,40 @@ fn ray_note(s: &Settings, rays: Option<RayStatus>, sheets: &mut [Sheet<Tab, Item
 #[derive(Default)]
 pub(crate) struct ShaderScreen {
     /// The Horizon pack whose slider a drag moved: saved once, when it lets go.
-    drag_changed: Option<usize>,
+    drag_changed: Option<(usize, Vec<f64>)>,
     /// The values this screen saved to a `shaders/` pack's file (picking another pack, Apply),
     /// by pack: Undo puts back the ones the screen opened with over them.
     written: BTreeMap<String, BTreeMap<String, String>>,
+    save_error: Option<(String, String)>,
     /// What the renderer's ray tracing is to a pack that asks for it (`OptionsUi::draw`).
     pub(crate) rays: Option<RayStatus>,
 }
 
 impl ShaderScreen {
-    /// The picked `shaders/` pack's options are saved: what Undo has to put back over.
-    fn saving(&mut self, s: &Settings) {
-        if let Some(o) = s.shader_options.as_ref() {
-            self.written.insert(o.pack.clone(), o.chosen.clone());
+    /// Undo records only the values the engine actually wrote.
+    pub(crate) fn save_result(
+        &mut self,
+        options: &crate::shader_options::ShaderOptions,
+        error: Option<&std::io::Error>,
+    ) {
+        self.set_save_error(&options.pack, error);
+        if error.is_none() {
+            self.written
+                .insert(options.pack.clone(), options.chosen.clone());
+        }
+    }
+    pub(crate) fn set_save_error(&mut self, pack: &str, error: Option<&std::io::Error>) {
+        if let Some(error) = error {
+            self.save_error = Some((
+                pack.to_owned(),
+                lang::tr("horizon.shader_options.save_error", &[&pack, error]),
+            ));
+        } else if self
+            .save_error
+            .as_ref()
+            .is_some_and(|(name, _)| name == pack)
+        {
+            self.save_error = None;
         }
     }
 }
@@ -489,7 +510,14 @@ impl shell::Screen for ShaderScreen {
             .collect();
         let options = (s.shader_options.as_ref()).map(|o| (&o.pack, &o.chosen, o.changed));
         let h = &s.horizon;
-        shell::stamp_of(&(&h.shader_pack, h.shadow_cache, packs, options, self.rays))
+        shell::stamp_of(&(
+            &h.shader_pack,
+            h.shadow_cache,
+            packs,
+            options,
+            self.rays,
+            &self.save_error,
+        ))
     }
     /// The pack list, then the picked pack's screens under its name: those the main screen links
     /// to in the page list, the ones farther in opened by their links.
@@ -516,6 +544,11 @@ impl shell::Screen for ShaderScreen {
             sheets.push(sheet);
         }
         ray_note(s, self.rays, &mut sheets);
+        if let Some((_, error)) = &self.save_error {
+            for sheet in &mut sheets {
+                sheet.about = error.clone();
+            }
+        }
         sheets
     }
     fn link(&self, item: Item) -> Option<Tab> {
@@ -543,7 +576,6 @@ impl shell::Screen for ShaderScreen {
                 let mut outputs = Vec::new();
                 // The last pack's changed options are kept before the next one's are read.
                 if s.shader_options.as_ref().is_some_and(|o| o.changed) {
-                    self.saving(s);
                     outputs.push(Output::Event(Event::ShaderOptions));
                 }
                 outputs.push(Output::Event(Event::ShaderPack));
@@ -566,8 +598,9 @@ impl shell::Screen for ShaderScreen {
             },
             Item::Reset => match native {
                 Some(p) => {
+                    let previous = s.shader_packs[p].values.clone();
                     s.shader_packs[p].reset_options();
-                    vec![Output::Event(Event::NativePackOptions(p))]
+                    vec![Output::Event(Event::NativePackOptions(p, previous))]
                 }
                 None => match s.shader_options.as_mut().filter(|o| o.pack == pack) {
                     Some(o) => {
@@ -578,10 +611,14 @@ impl shell::Screen for ShaderScreen {
                 },
             },
             Item::Option(i) => match native {
-                Some(p) if s.shader_packs[p].step_option(usize::from(i), back, false) => {
-                    vec![Output::Event(Event::NativePackOptions(p))]
+                Some(p) => {
+                    let previous = s.shader_packs[p].values.clone();
+                    if s.shader_packs[p].step_option(usize::from(i), back, false) {
+                        vec![Output::Event(Event::NativePackOptions(p, previous))]
+                    } else {
+                        Vec::new()
+                    }
                 }
-                Some(_) => Vec::new(),
                 None => {
                     let options = s.shader_options.as_mut().filter(|o| o.pack == pack);
                     match options.and_then(|o| Some((option_name(o, i)?.to_owned(), o))) {
@@ -601,8 +638,12 @@ impl shell::Screen for ShaderScreen {
             return;
         };
         if let Some((p, _)) = native(s) {
-            if s.shader_packs[p].set_slider_position(usize::from(i), position) {
-                self.drag_changed = Some(p);
+            let pack = &mut s.shader_packs[p];
+            let previous = self.drag_changed.is_none().then(|| pack.values.clone());
+            if pack.set_slider_position(usize::from(i), position)
+                && let Some(previous) = previous
+            {
+                self.drag_changed = Some((p, previous));
             }
             return;
         }
@@ -616,8 +657,8 @@ impl shell::Screen for ShaderScreen {
     /// A Horizon pack's options are saved, and the pack rebuilt, once a drag.
     fn slider_released(&mut self) -> Vec<Output> {
         let changed = self.drag_changed.take();
-        changed.map_or_else(Vec::new, |p| {
-            vec![Output::Event(Event::NativePackOptions(p))]
+        changed.map_or_else(Vec::new, |(p, previous)| {
+            vec![Output::Event(Event::NativePackOptions(p, previous))]
         })
     }
     /// With the "Scroll wheel changes settings" extra, the wheel steps an option between `<` `>`
@@ -647,8 +688,8 @@ impl shell::Screen for ShaderScreen {
         for (i, pack) in s.shader_packs.iter_mut().enumerate() {
             let was = before.shader_packs.iter().find(|p| p.key == pack.key);
             if let Some(was) = was.filter(|was| was.values != pack.values) {
-                pack.values = was.values.clone();
-                outputs.push(Output::Event(Event::NativePackOptions(i)));
+                let previous = std::mem::replace(&mut pack.values, was.values.clone());
+                outputs.push(Output::Event(Event::NativePackOptions(i, previous)));
             }
         }
         if s.horizon.shader_pack != before.horizon.shader_pack {
@@ -692,8 +733,7 @@ impl shell::Screen for ShaderScreen {
         classic(s).is_some_and(|o| o.changed)
     }
     /// The options are saved, and the pack loads again with them.
-    fn apply(&mut self, s: &mut Settings) -> Vec<Output> {
-        self.saving(s);
+    fn apply(&mut self, _s: &mut Settings) -> Vec<Output> {
         vec![
             Output::Event(Event::ShaderOptions),
             Output::Event(Event::OpenShaderOptions),
@@ -1073,16 +1113,36 @@ mod tests {
         assert_eq!(start, [Output::Event(Event::SliderDrag)]);
         shell.click(&mut s, (track + width, y), SIZE, true, false, false);
         assert_eq!(s.shader_packs[0].values[0], 1.0);
-        let saved = vec![Output::Event(Event::NativePackOptions(0))];
-        assert_eq!(shell.release(), Some(saved.clone()));
+        let saved = vec![Output::Event(Event::NativePackOptions(0, vec![0.5]))];
+        assert_eq!(shell.release(), Some(saved));
         assert_eq!(shell.release(), None);
         // Left steps it one of its steps, saved as it goes.
         let stepped = shell.key(&mut s, K::ArrowLeft, None, false, SIZE);
         assert_eq!(
             stepped,
-            [&[Output::Event(Event::SliderDrag)][..], &saved].concat()
+            [
+                Output::Event(Event::SliderDrag),
+                Output::Event(Event::NativePackOptions(0, vec![1.0])),
+            ]
         );
         assert!((s.shader_packs[0].values[0] - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shader_undo_records_only_confirmed_writes() {
+        let s = settings();
+        let options = s.shader_options.as_ref().unwrap();
+        let mut screen = ShaderScreen::default();
+        let failure = std::io::Error::other("fixture write failure");
+
+        screen.save_result(options, Some(&failure));
+        assert!(screen.written.is_empty());
+        assert!(screen.save_error.is_some());
+        screen.set_save_error("other.hshader", None);
+        assert!(screen.save_error.is_some());
+        screen.save_result(options, None);
+        assert_eq!(screen.written.get(&options.pack), Some(&options.chosen));
+        assert!(screen.save_error.is_none());
     }
 
     #[test]
@@ -1106,6 +1166,9 @@ mod tests {
             picked.contains(&Output::Event(Event::ShaderOptions)),
             "{picked:?}"
         );
+        shell
+            .screen
+            .save_result(s.shader_options.as_ref().unwrap(), None);
         // The game reads the next pack's options: a Horizon pack has none of these.
         s.shader_options = None;
         // Its slider, a step on from the keyboard.
@@ -1114,6 +1177,7 @@ mod tests {
         shell.key(&mut s, K::Enter, None, false, SIZE);
         shell.key(&mut s, K::ArrowRight, None, false, SIZE);
         assert_ne!(s.shader_packs[2].values[0], 0.5);
+        let native_previous = s.shader_packs[2].values.clone();
         let undo = shell
             .foot_at(&s, SIZE)
             .into_iter()
@@ -1131,7 +1195,10 @@ mod tests {
         // are back as it opened, to be saved over what picking away saved.
         assert_eq!(s.horizon.shader_pack, "A.zip");
         assert_eq!(s.shader_packs[2].values[0], 0.5);
-        for event in [Event::NativePackOptions(2), Event::ShaderPack] {
+        for event in [
+            Event::NativePackOptions(2, native_previous),
+            Event::ShaderPack,
+        ] {
             assert!(
                 outputs.contains(&Output::Event(event.clone())),
                 "{outputs:?}"

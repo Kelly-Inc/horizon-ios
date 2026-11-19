@@ -34,7 +34,7 @@ impl std::fmt::Debug for AuthSession {
 /// A UUID with or without dashes.
 pub fn parse_uuid(text: &str) -> Option<u128> {
     let hex: String = text.chars().filter(|c| *c != '-').collect();
-    (hex.len() == 32)
+    (hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then(|| u128::from_str_radix(&hex, 16).ok())
         .flatten()
 }
@@ -798,6 +798,16 @@ mod tests {
             assert!(!path.exists());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uuid_contains_only_hexadecimal_digits() {
+        assert_eq!(
+            parse_uuid("069A79F4-44E9-4726-A5BE-FCA90E38AAF5"),
+            Some(0x069a79f444e94726a5befca90e38aaf5)
+        );
+        assert_eq!(parse_uuid("+123456789abcdef0123456789abcdef"), None);
+        assert_eq!(parse_uuid(&"ａ".repeat(32)), None);
     }
 
     #[test]

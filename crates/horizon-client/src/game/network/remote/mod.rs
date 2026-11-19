@@ -607,6 +607,7 @@ impl MannequinProfile {
     fn textures(&mut self) -> horizon_client::skins::Textures {
         if let Some(lookup) = &self.lookup
             && let horizon_client::skins::Resolve::Done(profile) = lookup.state()
+            && lookup.retry_at().is_none()
         {
             self.resolved_id = profile.as_ref().map(|profile| profile.id);
             self.textures = profile
@@ -621,6 +622,7 @@ impl MannequinProfile {
                 .unwrap_or_default();
             self.lookup = None;
         }
+        // A transient failure retains the captured future until its retry is due.
         self.textures.clone()
     }
 }
@@ -1212,6 +1214,7 @@ impl Game<'_> {
         streaming.radius = self.settings.render_distance;
         self.streaming = streaming;
         self.world = Game::world_for_mods(self.res.facts().air, 0);
+        self.reset_frame_autotune();
         self.save = Arc::new(SaveDir::new(
             std::env::temp_dir().join("horizon-remote-unused"),
             horizon_client::save::LevelShape::OVERWORLD,
@@ -1484,6 +1487,7 @@ impl Game<'_> {
         streaming.radius = self.settings.render_distance;
         self.streaming = streaming;
         self.world = Game::world_for_mods(self.res.facts().air, 0);
+        self.reset_frame_autotune();
         self.save = Arc::new(SaveDir::new(
             std::env::temp_dir().join("horizon-replay-unused"),
             horizon_client::save::LevelShape::OVERWORLD,
@@ -1771,6 +1775,7 @@ impl Game<'_> {
         self.streaming = Streaming::new(Arc::new(NoTerrain), self.worker_context(), 1);
         self.streaming.paused = true;
         self.reset_client_world(0);
+        self.reset_frame_autotune();
         self.remove_local_player_body();
         // The vehicle went with the level: an id kept here would seat the
         // next login on an entity that is not there.
@@ -2546,6 +2551,7 @@ impl Game<'_> {
                 self.world.weather,
             );
             self.reset_client_world(spawn.seed);
+            self.reset_frame_autotune();
             // Entity IDs belong to this ClientLevel, not the connection. A
             // same-level respawn keeps it; a replacement invalidates handles.
             self.native_lifecycle_open_started();
@@ -5744,7 +5750,13 @@ impl Game<'_> {
         let entry = held.entry(entity).or_insert_with(|| {
             MannequinProfile::new(profile, &mut self.skin_profiles.borrow_mut())
         });
-        if entry.profile != *profile {
+        if entry.profile != *profile
+            || entry
+                .lookup
+                .as_ref()
+                .and_then(|lookup| lookup.retry_at())
+                .is_some_and(|at| Instant::now() >= at)
+        {
             *entry = MannequinProfile::new(profile, &mut self.skin_profiles.borrow_mut());
         }
         entry.textures()
@@ -10302,8 +10314,8 @@ fn look_at_rotation(from: [f64; 3], to: [f64; 3]) -> (f32, f32) {
     use horizon_core::geometry::trig::atan2;
     let (dx, dy, dz) = (to[0] - from[0], to[1] - from[1], to[2] - from[2]);
     let horizontal = (dx * dx + dz * dz).sqrt();
-    // `* 180.0F / (float)Math.PI` on the double.
-    let degrees = |r: f64| r * 180.0 / f64::from(std::f32::consts::PI);
+    // `* 57.2957763671875` (`Mth.RAD_TO_DEG` widened) on the double.
+    let degrees = |r: f64| r * f64::from(horizon_core::geometry::trig::RAD_TO_DEG);
     let pitch = wrap_degrees((-degrees(atan2(dy, horizontal))) as f32);
     let yaw = wrap_degrees(degrees(atan2(dz, dx)) as f32 - 90.0);
     (yaw, pitch)
@@ -15479,6 +15491,51 @@ pub(crate) mod tests {
         let (_, threw) =
             super::predict_clicks(&mut menu, &env, &[(-999, 1, Input::Pickup)]).unwrap();
         assert!(threw, "one of the carried stack outside the window");
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn frame_autotune_resets_when_the_remote_level_is_replaced() {
+        use super::super::native_entity_refs::tests::with_client_game;
+        use horizon_client::{dynamic_resolution::Pace, level_loading::Reason};
+        use horizon_protocol::{connection::Pipe, packets::play::SpawnInfo};
+
+        with_client_game(|game| {
+            let (client, _server) = Pipe::pair();
+            game.connect_local(client, "FrameAutotune").unwrap();
+            let mut spawn = SpawnInfo {
+                dimension_type: 0,
+                dimension: "minecraft:overworld".into(),
+                seed: 0,
+                game_type: 1,
+                previous_game_type: None,
+                debug: false,
+                flat: false,
+                last_death: None,
+                portal_cooldown: 0,
+                sea_level: 63,
+            };
+            game.enter_remote_dimension(&spawn, false, Reason::Other);
+            assert!(
+                !game.frame_autotune_settled(),
+                "a loading screen cannot tune rendering"
+            );
+
+            let floor = 70;
+            for _ in 0..500 {
+                game.dynamic_resolution
+                    .observe(Some(5.0), 16.0, floor, 60, Pace::Quick);
+            }
+            let learned = game.dynamic_resolution.scale(floor);
+            assert!(learned > floor);
+
+            game.enter_remote_dimension(&spawn, true, Reason::Other);
+            assert_eq!(game.dynamic_resolution.scale(floor), learned);
+
+            spawn.dimension = "server:other_world".into();
+            game.enter_remote_dimension(&spawn, true, Reason::Other);
+            assert_eq!(game.dynamic_resolution.scale(floor), floor);
+        });
     }
 
     #[test]

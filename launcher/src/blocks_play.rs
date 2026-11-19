@@ -109,7 +109,7 @@ impl Launcher {
         };
         let prepared = backend::is_prepared(&tag);
         // Prepared without sounds (arismoko/horizon#1035): Prepare again is the fix, so it stands out.
-        let silent = prepared && !backend::has_sounds(&tag);
+        let silent = prepared && !backend::has_sounds_cached(&tag);
         let version = java
             .as_ref()
             .map_or_else(|| backend::game_version(&tag), |j| j.minecraft.clone());

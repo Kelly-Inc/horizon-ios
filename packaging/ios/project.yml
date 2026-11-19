@@ -13,10 +13,8 @@ name: HorizonIOS
 options:
   pathBase: project
   createIntermediateGroups: true
-  # Pinned, because the current XcodeGen default writes a project file a older Xcode cannot open: the
-  # iOS workflow's runner is Xcode 15.4 and its default gave format 77, which 15.4 refuses with
-  # "Unable to read project". Any newer Xcode reads a 15.3 project happily, so this is the format
-  # that costs nothing and works everywhere; raise it when the workflow's runner moves.
+  # Keep the generated project format stable across XcodeGen versions.
+  # The iOS workflow checks the actual Xcode and SDK versions separately.
   projectFormat: xcode15_3
   xcodeVersion: "15.4"
   deploymentTarget:
@@ -108,9 +106,12 @@ targets:
           }
           cd "$SRCROOT/../.."
           # CI builds the game in its own step first and sets this, so the bundle step does not compile it twice.
-          if [ -n "${HORIZON_GAME_PREBUILT:-}" ] && [ -x "target/$IOS_TARGET/release/horizon-official" ]; then
-            echo "Horizon: using the game Cargo already built (HORIZON_GAME_PREBUILT)."
-            exit 0
+          if [ -n "${HORIZON_GAME_PREBUILT:-}" ]; then
+            game=$(bash tools/ci/ios-game-artifact.sh "$IOS_TARGET")
+            if [ -x "$game" ]; then
+              echo "Horizon: using the game Cargo already built (HORIZON_GAME_PREBUILT)."
+              exit 0
+            fi
           fi
           # The profile and flags the workflow builds with, so what a player runs from Xcode is what CI measured.
           # `audio` is cpal, whose CoreAudio backend plays through RemoteIO on a phone; `controllers` stays off
@@ -122,14 +123,22 @@ targets:
         showEnvVarsInLog: false
         script: |
           set -euo pipefail
-          game="$SRCROOT/../../target/$IOS_TARGET/release/horizon-official"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd "$SRCROOT/../.."
+          game=$(bash tools/ci/ios-game-artifact.sh "$IOS_TARGET")
           test -x "$game" || {
             echo "error: the Cargo phase reported success and left no $game" >&2
             exit 1
           }
           dest="$BUILT_PRODUCTS_DIR/$EXECUTABLE_PATH"
-          cp "$game" "$dest"
-          chmod +x "$dest"
+          # Stage on the same volume, outside the app. A partial copy cannot
+          # replace the executable or become another file in a signed bundle.
+          staged=$(mktemp "$BUILT_PRODUCTS_DIR/.horizon-game.XXXXXXXX")
+          trap 'rm -- "$staged"' EXIT
+          cp "$game" "$staged"
+          chmod 755 "$staged"
+          mv -f "$staged" "$dest"
+          trap - EXIT
           # Named in the log because a bundle whose executable was replaced is the thing a reader of a later
           # build log cannot tell from one that wasn't: both are called Horizon.
           echo "Horizon: $dest is now the Rust game, $(stat -f %z "$dest") bytes."

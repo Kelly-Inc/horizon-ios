@@ -199,13 +199,15 @@ mod multiplayer_parent_navigation {
             },
             Screen::Edit {
                 index: None,
+                save_failed: false,
                 name: String::new(),
                 address: String::new(),
                 focus: 0,
                 packs: None,
             },
             Screen::Edit {
-                index: Some(0),
+                index: Some((0, horizon_protocol::servers::ServerEntry::new("Saved", "localhost"))),
+                save_failed: false,
                 name: String::new(),
                 address: String::new(),
                 focus: 0,
@@ -1148,6 +1150,26 @@ fn playing_a_world_rejects_lock_links_before_touching_the_target() {
 }
 
 #[test]
+fn a_locked_corrupted_world_offers_recovery_only_after_its_lock_is_released() {
+    let mut f = Fixture::new();
+    f.world("World", "World");
+    f.world("World", "World");
+    let world = f.title.saves.join("World");
+    fs::write(world.join("level.dat"), b"truncated").unwrap();
+    let lock = crate::save::SessionLock::acquire(&world).unwrap();
+    let entry = list_worlds(&f.title.saves).remove(0);
+    assert!(entry.corrupted && entry.locked);
+    assert!(!entry.can_play());
+
+    drop(lock);
+    let entry = list_worlds(&f.title.saves).remove(0);
+    assert!(entry.corrupted && !entry.locked);
+    assert!(entry.can_play());
+    assert!(matches!(f.title.play(entry), Action::None));
+    assert!(matches!(f.title.mode, Mode::Recover { .. }));
+}
+
+#[test]
 fn recovery_does_not_replace_data_of_a_locked_world() {
     let mut f = Fixture::new();
     f.world("World", "World");
@@ -1162,6 +1184,31 @@ fn recovery_does_not_replace_data_of_a_locked_world() {
         f.title.pending_toast,
         Some(WorldToast::AccessFailure(_))
     ));
+}
+
+#[test]
+fn backup_follow_up_returns_to_the_list_when_the_world_becomes_locked() {
+    for restore in [true, false] {
+        let mut f = Fixture::new();
+        f.world("World", "World");
+        let world = list_worlds(&f.title.saves).remove(0);
+        let _lock = crate::save::SessionLock::acquire(&f.title.saves.join("World")).unwrap();
+
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(Ok((f.root.join("backup.zip"), 42))).unwrap();
+        f.title.backup = Some(receive);
+        f.title.backup_shown.set(true);
+        f.title.restore_after_backup = restore;
+        f.title.optimize_after_backup = (!restore).then_some(false);
+        f.title.set_mode(Mode::Backup { world });
+        f.title.poll_backup();
+
+        assert!(matches!(&f.title.mode, Mode::Select { .. }));
+        assert!(f.title.backup.is_none() && f.title.optimize.is_none());
+        assert!(
+            matches!(&f.title.pending_toast, Some(WorldToast::AccessFailure(folder)) if folder == "World")
+        );
+    }
 }
 
 #[test]
@@ -1296,6 +1343,23 @@ fn failed_world_operation_back_button_plays_the_click_sound() {
     assert!(matches!(f.title.mode, Mode::Error { .. }));
     assert_eq!(f.click_with_sound("Back"), (Action::None, true));
     assert!(matches!(f.title.mode, Mode::Edit { .. }));
+}
+
+#[test]
+fn locking_an_existing_world_does_not_recreate_a_removed_folder() {
+    let directory = tempfile::tempdir().unwrap();
+    let world = directory.path().join("Deleted World");
+    fs::create_dir(&world).unwrap();
+    fs::remove_dir(&world).unwrap();
+    assert!(crate::save::SessionLock::acquire_existing(&world, None).is_err());
+    assert!(!world.exists());
+
+    // New worlds still create their own folder and lock.
+    let lock = crate::save::SessionLock::acquire(&world).unwrap();
+    assert!(world.join("session.lock").is_file());
+    assert!(crate::save::SessionLock::acquire_existing(&world, None).is_err());
+    drop(lock);
+    assert!(crate::save::SessionLock::acquire_existing(&world, None).is_ok());
 }
 
 #[test]
@@ -1818,6 +1882,7 @@ fn tab_walks_the_edit_server_screen_through_its_buttons() {
     let mut f = Fixture::new();
     f.title.mode = Mode::Multiplayer(Screen::Edit {
         index: None,
+        save_failed: false,
         name: "Minecraft Server".into(),
         address: "localhost".into(),
         focus: 0,
@@ -1862,6 +1927,7 @@ fn server_fields_edit_at_their_cursor() {
     let mut f = Fixture::new();
     f.title.mode = Mode::Multiplayer(crate::multiplayer::Screen::Edit {
         index: None,
+        save_failed: false,
         name: "Minecraft Server".into(),
         address: String::new(),
         focus: 1,
@@ -1946,6 +2012,21 @@ fn world_list_names_every_game_mode_and_hardcore_in_red() {
     let creative = info("Creative");
     assert_eq!(creative.plain(), "Creative Mode, Commands, Version: 26.3");
     assert!(creative.spans.iter().all(|s| s.style.color.is_none()));
+}
+
+#[test]
+fn invalid_last_played_falls_back_to_file_time() {
+    let f = Fixture::new();
+    f.world("Broken date", "Broken date");
+    let path = f.title.saves.join("Broken date/level.dat");
+    let mut root = crate::save::read_dat(&path).unwrap();
+    let Some(Tag::Compound(data)) = root.get_mut("Data") else {
+        panic!("missing world data");
+    };
+    data.insert("LastPlayed".into(), Tag::Long(i64::MAX));
+    crate::save::write_dat(&path, root).unwrap();
+    let expected = fs::metadata(path).unwrap().modified().unwrap();
+    assert_eq!(list_worlds(&f.title.saves)[0].modified, expected);
 }
 
 #[test]

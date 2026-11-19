@@ -1,5 +1,5 @@
 //! The folder a new world gets: `WorldCreationUiState.findResultFolder` through
-//! `FileUtil.findAvailableName`. Lengths are Java's, in UTF-16 units.
+//! `FileUtil.findAvailableName`. Start with Java's UTF-16 limit, then honor the filesystem.
 
 /// `SharedConstants.ILLEGAL_FILE_CHARACTERS`, in its order.
 const ILLEGAL_FILE_CHARACTERS: [char; 15] = [
@@ -7,7 +7,7 @@ const ILLEGAL_FILE_CHARACTERS: [char; 15] = [
 ];
 
 /// `FileUtil.MAX_FILE_NAME`.
-const MAX_FILE_NAME: usize = 255;
+pub(super) const MAX_FILE_NAME: usize = 255;
 
 /// The names `FileUtil.RESERVED_WINDOWS_FILENAMES` refuses once `sanitizeName` has turned every
 /// dot into `_` (its `.*\.` and `(?:\..*)?` parts can no longer match).
@@ -16,14 +16,47 @@ const RESERVED: [&str; 24] = [
     "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// `findResultFolder(name)`: the name trimmed as `String.trim` does, `new_world` (the translated
-/// `selectWorld.newWorld`) when that leaves nothing, made free of the folders `taken` says exist.
-/// A name whose count can't be read (`Mine ()`) falls back to `World`, as the method's catch does.
-pub(super) fn result_folder(name: &str, new_world: &str, taken: impl Fn(&str) -> bool) -> String {
+enum Candidate {
+    Available,
+    Occupied,
+    TooLong,
+}
+
+pub(super) fn result_folder(saves: &std::path::Path, name: &str, new_world: &str) -> String {
+    result_folder_with(name, new_world, |name| {
+        match std::fs::symlink_metadata(saves.join(name)) {
+            Ok(_) => Candidate::Occupied,
+            Err(error) if name_too_long(&error) => Candidate::TooLong,
+            // The actual creation reports other filesystem errors.
+            Err(_) => Candidate::Available,
+        }
+    })
+}
+
+fn name_too_long(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        rustix::io::Errno::from_io_error(error) == Some(rustix::io::Errno::NAMETOOLONG)
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_FILENAME_EXCED_RANGE: i32 = 206;
+        error.raw_os_error() == Some(ERROR_FILENAME_EXCED_RANGE)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// `findResultFolder(name)`: trim as Java does, use `new_world` if blank, and avoid occupied paths.
+/// An invalid copy counter (`Mine ()`) falls back to `World`.
+fn result_folder_with(name: &str, new_world: &str, probe: impl Fn(&str) -> Candidate) -> String {
     let name = name.trim_matches(|c: char| c <= ' ');
     let name = if name.is_empty() { new_world } else { name };
-    available_name(name, &taken)
-        .or_else(|| available_name("World", &taken))
+    available_name(name, &probe)
+        .or_else(|| available_name("World", &probe))
         .unwrap_or_else(|| "World".to_owned())
 }
 
@@ -56,13 +89,13 @@ fn java_len(s: &str) -> usize {
 }
 
 /// `String.substring(0, n)` in UTF-16 units (a pair cut in two becomes U+FFFD).
-fn java_prefix(s: &str, n: usize) -> String {
+pub(super) fn java_prefix(s: &str, n: usize) -> String {
     String::from_utf16_lossy(&s.encode_utf16().take(n).collect::<Vec<_>>())
 }
 
 /// `FileUtil.findAvailableName(folder, name, "")`: None where Java's `Integer.parseInt` of the
 /// count throws.
-fn available_name(name: &str, taken: &impl Fn(&str) -> bool) -> Option<String> {
+fn available_name(name: &str, probe: &impl Fn(&str) -> Candidate) -> Option<String> {
     let mut name = sanitize_name(name);
     if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(&name)) {
         name = format!("_{name}_");
@@ -72,32 +105,76 @@ fn available_name(name: &str, taken: &impl Fn(&str) -> bool) -> Option<String> {
         count = digits.parse().ok()?;
         name = base.to_owned();
     }
-    if java_len(&name) > MAX_FILE_NAME {
-        name = java_prefix(&name, MAX_FILE_NAME);
-    }
+    let mut byte_limit = false;
     loop {
-        let mut candidate = name.clone();
-        if count != 0 {
-            let counter = format!(" ({count})");
-            let room = MAX_FILE_NAME - counter.len();
-            if java_len(&candidate) > room {
-                candidate = java_prefix(&candidate, room);
+        let counter = if count == 0 {
+            String::new()
+        } else {
+            format!(" ({count})")
+        };
+        let room = MAX_FILE_NAME - counter.len();
+        let mut candidate = if java_len(&name) > room {
+            java_prefix(&name, room)
+        } else {
+            name.clone()
+        };
+        if byte_limit {
+            candidate.truncate(candidate.floor_char_boundary(room));
+        }
+        candidate.push_str(&counter);
+        match probe(&candidate) {
+            Candidate::Available => return Some(candidate),
+            Candidate::Occupied => count = count.wrapping_add(1),
+            Candidate::TooLong if !byte_limit && candidate.len() > MAX_FILE_NAME => {
+                byte_limit = true;
             }
-            candidate.push_str(&counter);
+            Candidate::TooLong => return None,
         }
-        if !taken(&candidate) {
-            return Some(candidate);
-        }
-        count = count.wrapping_add(1);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::result_folder;
+    use super::{Candidate, MAX_FILE_NAME, result_folder_with};
 
     fn folder(name: &str, taken: &[&str]) -> String {
-        result_folder(name, "New World", |f| taken.contains(&f))
+        result_folder_with(name, "New World", |f| {
+            if taken.contains(&f) {
+                Candidate::Occupied
+            } else {
+                Candidate::Available
+            }
+        })
+    }
+
+    #[test]
+    fn multibyte_world_names_retry_within_the_filesystem_limit() {
+        let name = "界".repeat(140);
+        let first = "界".repeat(85);
+        let second = result_folder_with(&name, "New World", |candidate| {
+            if candidate.len() > MAX_FILE_NAME {
+                Candidate::TooLong
+            } else if candidate == first {
+                Candidate::Occupied
+            } else {
+                Candidate::Available
+            }
+        });
+        assert_eq!(second, format!("{} (1)", "界".repeat(83)));
+        assert_eq!(folder(&name, &[]), name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_folder_selection_skips_dangling_links() {
+        let saves = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(saves.path().join("missing"), saves.path().join("World"))
+            .unwrap();
+
+        let folder = super::result_folder(saves.path(), "World", "New World");
+        assert_eq!(folder, "World (1)");
+        std::fs::create_dir(saves.path().join(folder)).unwrap();
+        assert!(!saves.path().join("missing").exists());
     }
 
     #[test]

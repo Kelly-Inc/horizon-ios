@@ -1481,22 +1481,25 @@ impl Game<'_> {
         }
         // A proxy released this record to another server, which now owns saving it.
         if guest.placed && !guest.released {
-            let _ = self.finish_player_autosaves(true);
-            if self
+            // Deliver queued receipts before logout and leave failures for the save barrier.
+            let queued = self.player_autosaves.completed(true);
+            self.notify_saved_players(queued);
+            let is_owner = self
                 .lan
                 .as_ref()
                 .and_then(|host| host.owner.as_ref())
-                .is_some_and(|o| o.uuid == guest.uuid)
-            {
-                playerdata::save_owner(guest, &mut self.level, &self.world_root);
-            } else {
-                self.player_autosaves.save_after(guest, &self.world_root);
-            }
-            let directory = playerdata::directory(&self.world_root);
-            self.native_player_save_to_file(guest.uuid, &guest.name, &directory);
+                .is_some_and(|o| o.uuid == guest.uuid);
+            let saved = self.player_autosaves.save_after(
+                guest,
+                &self.world_root,
+                is_owner.then_some(&mut self.level),
+            );
+            self.notify_saved_players(saved);
         }
-        if let Some(host) = self.lan.as_ref() {
-            self.save_guest_records(host, guest);
+        if let Some(host) = self.lan.as_ref()
+            && let Err(error) = self.save_guest_records(host, guest)
+        {
+            log::warn!("Horizon: {error}");
         }
     }
     /// The vehicles the other players in level `dim` ride, all but the
@@ -1641,7 +1644,8 @@ impl Game<'_> {
     }
     /// `PlayerList.saveAll`: statistics belong to each connected player's
     /// live record, independently of the dirty entries sent to their client.
-    pub(super) fn save_connected_guest_statistics(&self, host: &LanHost) {
+    pub(super) fn save_connected_guest_statistics(&self, host: &LanHost) -> Result<()> {
+        let mut result = Ok(());
         for guest in &host.hub.guests {
             if !guest.placed || guest.released {
                 continue;
@@ -1650,10 +1654,11 @@ impl Game<'_> {
                 continue;
             };
             if let Some(play) = host.play.get(&guest.conn) {
-                play.stats
-                    .write(&super::stats::player_json(&self.world_root, "stats", uuid));
+                let path = super::stats::player_json(&self.world_root, "stats", uuid);
+                result = result.and(super::stats::write_player_json(&path, &play.stats.to_json()));
             }
         }
+        result
     }
 
     /// The advancements and statistics files of a held arrival, before it is placed
@@ -1669,9 +1674,7 @@ impl Game<'_> {
         };
         let write = |dir: &str, json: &serde_json::Value| {
             let path = super::stats::player_json(&self.world_root, dir, uuid);
-            let text = serde_json::to_string_pretty(json).map_err(|e| e.to_string())?;
-            horizon_client::save::write_durable(&path, text.as_bytes())
-                .map_err(|e| format!("{} is not saved: {e}", path.display()))
+            super::stats::write_player_json(&path, json).map_err(|error| error.to_string())
         };
         if !self.adv.tree.list.is_empty() {
             write(
@@ -1731,19 +1734,26 @@ impl Game<'_> {
     }
     /// The integrated server's owner into the world's player, for `Level::write`.
     /// Returns the owner's uuid and name when they were stored.
-    pub(super) fn store_owner(&mut self) -> Option<(u128, String)> {
-        let uuid = self.lan.as_ref().and_then(|h| h.owner.as_ref())?.uuid;
-        let (riding, dim, others) = self.lan.as_ref().and_then(|h| {
+    pub(super) fn store_owner(&mut self) -> Result<Option<(u128, String)>> {
+        let Some(uuid) = self.lan.as_ref().and_then(|h| h.owner.as_ref()).map(|o| o.uuid) else {
+            return Ok(None);
+        };
+        let Some((riding, dim, others)) = self.lan.as_ref().and_then(|h| {
             let g = h.hub.online_players().find(|g| g.uuid == uuid)?;
             let others = self.ridden_by_others(&h.hub.guests, &g.dimension, Some(uuid), true);
             Some((g.vehicle, g.dimension.clone(), others))
-        })?;
+        }) else {
+            return Ok(None);
+        };
         // The vehicle the owner rides (`ServerPlayer.saveParentVehicle`).
         let vehicle = self
             .parent_vehicle_in(&dim, riding, &others, false)
             .map(|(tag, _)| tag);
-        let mut host = self.lan.take()?;
+        let Some(mut host) = self.lan.take() else {
+            return Ok(None);
+        };
         let mut stored = None;
+        let mut records = Ok(());
         if let Some(i) = host
             .hub
             .guests
@@ -1762,13 +1772,14 @@ impl Game<'_> {
                 }
             });
             let g = &host.hub.guests[i];
-            self.save_guest_records(&host, g);
+            records = self.save_guest_records(&host, g);
             stored = Some(g.name.clone());
         } else if let Some(saved) = host.owner.as_ref().and_then(|o| o.saved.as_ref()) {
             self.level.position = saved.position;
         }
         self.lan = Some(host);
-        stored.map(|name| (uuid, name))
+        records?;
+        Ok(stored.map(|name| (uuid, name)))
     }
 
     /// The world's default game mode (`defaultgamemode`).
@@ -2503,6 +2514,7 @@ impl Game<'_> {
         let Some(mut host) = self.lan.take() else {
             return;
         };
+        crate::game::dedicated::crash_fixture("hub", || host.hub.guests.iter().any(|g| g.placed));
         let holding = lan::Holding::start();
         // Last tick's tracked entities: enough for place collision and joins
         // before this tick moves anyone.
@@ -5696,7 +5708,7 @@ mod owner_attachment_save_tests {
                 7,
             )
             .unwrap();
-        assert!(game.store_owner().is_some());
+        assert!(game.store_owner().unwrap().is_some());
         assert_eq!(
             saved_value(&game),
             Some(7),
@@ -5716,7 +5728,7 @@ mod owner_attachment_save_tests {
                 9,
             )
             .unwrap();
-        game.store_owner();
+        game.store_owner().unwrap();
         assert_eq!(saved_value(&game), Some(9));
     }
 }
@@ -5850,15 +5862,15 @@ mod connected_statistics_save_exclusion_tests {
             .stats
             .add("used", "minecraft:diamond_sword", 1);
         host.hub.guests.update(0, |guest| guest.placed = false);
-        game.save_connected_guest_statistics(&host);
+        game.save_connected_guest_statistics(&host).unwrap();
         assert!(!path.exists(), "not placed: no statistics file");
         host.hub.guests.update(0, |guest| guest.placed = true);
         host.hub.guests.update(0, |guest| guest.released = true);
-        game.save_connected_guest_statistics(&host);
+        game.save_connected_guest_statistics(&host).unwrap();
         assert!(!path.exists(), "released: no statistics file");
         host.hub.guests.update(0, |guest| guest.released = false);
         let play = host.play.remove(&1).unwrap();
-        game.save_connected_guest_statistics(&host);
+        game.save_connected_guest_statistics(&host).unwrap();
         assert!(!path.exists(), "no play record: no invented statistics");
         host.play.insert(1, play);
         game.lan = Some(host);

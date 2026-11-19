@@ -1210,9 +1210,9 @@ impl Game<'_> {
                 })
         })
     }
-    pub(super) fn save_fight(&mut self) {
+    pub(super) fn save_fight(&mut self) -> horizon_client::Result<()> {
         if !self.fight.loaded || !self.fight.dirty {
-            return;
+            return Ok(());
         }
 
         let f = &self.fight;
@@ -1247,9 +1247,10 @@ impl Game<'_> {
             ("data", Tag::compound(data)),
             ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
         ]);
-        if horizon_client::save::write_dat(&self.fight_path(), tag).is_ok() {
-            self.fight.dirty = false;
-        }
+        horizon_client::save::write_dat(&self.fight_path(), tag)
+            .map_err(|e| format!("could not save the dragon fight: {e}"))?;
+        self.fight.dirty = false;
+        Ok(())
     }
     /// The island's centre chunks are lit (the arena is "loaded").
     fn arena_loaded(&self) -> bool {
@@ -2504,8 +2505,7 @@ impl Game<'_> {
                             f64::from(-trig::cos(r)),
                         ));
                         let dot = dir.dot(aim) as f32;
-                        let angle = (f64::from(dot).acos() * 180.0
-                            / f64::from(std::f32::consts::PI))
+                        let angle = (f64::from(dot).acos() * f64::from(trig::RAD_TO_DEG))
                             as f32
                             + 0.5;
                         if angle < 0.0 || angle > 10.0 {
@@ -2513,7 +2513,7 @@ impl Game<'_> {
                             let (xd, zd) = (pp.x - head.x, pp.z - head.z);
                             let delta = wrap64(
                                 180.0
-                                    - trig::atan2(xd, zd) * 180.0 / f64::from(std::f32::consts::PI)
+                                    - trig::atan2(xd, zd) * f64::from(trig::RAD_TO_DEG)
                                     - f64::from(d.yaw),
                             )
                             .clamp(-100.0, 100.0);
@@ -3073,7 +3073,9 @@ impl Game<'_> {
         self.fight.previously_killed = true;
         self.fight.killed = true;
         self.fight.dirty = true;
-        self.save_fight();
+        if let Err(error) = self.save_fight() {
+            log::warn!("Horizon: {error}");
+        }
     }
     /// `DragonStrafePlayerPhase`'s shot: `new DragonFireball(level, dragon,
     /// direction.normalize())`, whose `AbstractHurtingProjectile` constructor

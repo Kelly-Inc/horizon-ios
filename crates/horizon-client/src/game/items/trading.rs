@@ -186,28 +186,30 @@ pub(super) fn read_random_sequences(world_root: &std::path::Path) -> RandomSeque
 /// `SavedDataStorage.saveAndJoin` for `RandomSequences`: written only while dirty, with
 /// whatever it holds then, so the emptied map and the salt a `/random reset *` left reach
 /// the file after a draw, and not without one.
-pub(super) fn write_random_sequences(world_root: &std::path::Path, data: &mut RandomSequences) {
-    let Some(data) = data.take_dirty_nbt() else {
-        return;
-    };
-    let tag = horizon_core::nbt::Tag::compound([
-        ("data", data),
-        (
-            "DataVersion",
-            horizon_core::nbt::Tag::Int(horizon_world::DATA_VERSION),
-        ),
-    ]);
-    if let Err(e) = horizon_client::save::write_dat(&random_sequences_file(world_root), tag) {
-        log::warn!("the villager random sequences were not written: {e}");
-    }
+pub(super) fn write_random_sequences(
+    world_root: &std::path::Path,
+    data: &mut RandomSequences,
+) -> horizon_client::Result<()> {
+    data.save_dirty(|data| {
+        let tag = horizon_core::nbt::Tag::compound([
+            ("data", data),
+            (
+                "DataVersion",
+                horizon_core::nbt::Tag::Int(horizon_world::DATA_VERSION),
+            ),
+        ]);
+        horizon_client::save::write_dat(&random_sequences_file(world_root), tag)
+            .map_err(|error| format!("could not save random sequences: {error}").into())
+    })
 }
 
 impl Game<'_> {
     /// `RandomSequences` as `random_sequences.dat` (not on a server's guest).
-    pub(super) fn save_random_sequences(&mut self) {
-        if self.remote.is_none() {
-            write_random_sequences(&self.world_root, &mut self.rand_sequences);
+    pub(super) fn save_random_sequences(&mut self) -> horizon_client::Result<()> {
+        if self.remote.is_some() {
+            return Ok(());
         }
+        write_random_sequences(&self.world_root, &mut self.rand_sequences)
     }
     /// `AbstractVillager.addOffersFromTradeSet` with the world's random
     /// sequence of the set, at the merchant's position.

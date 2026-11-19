@@ -116,22 +116,21 @@ impl Game<'_> {
         self.bosses.rebuild_listing();
         self.ui.registries.bossbars = self.bosses.bars.ids();
     }
-    pub(super) fn save_bossbars(&self) {
+    pub(super) fn save_bossbars(&self) -> horizon_client::Result<()> {
         if !self.bosses.loaded || self.remote.is_some() {
-            return;
+            return Ok(());
         }
         if self.bosses.bars.bars.is_empty() && !self.bossbar_path().exists() {
-            return;
+            return Ok(());
         }
-        if let Err(e) = save::write_dat(
+        save::write_dat(
             &self.bossbar_path(),
             Tag::compound([
                 ("data", self.bosses.bars.pack()),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]),
-        ) {
-            log::warn!("boss bars were not written: {e}");
-        }
+        )
+        .map_err(|e| format!("could not save the custom boss bars: {e}").into())
     }
     pub(in crate::game) fn bossbar_exists(&self, id: &str) -> bool {
         self.bosses.bars.get(id).is_some()

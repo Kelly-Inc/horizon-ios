@@ -171,12 +171,9 @@ pub fn mark_committed() {
     s.last_ended = Some(Instant::now());
 }
 
-/// Clear both active preedit and any pending post-composition suppression window
-/// (used when the text field itself loses focus or IME is disabled).
+/// Discard the composition, key suppression, and caret of a closed input session.
 pub fn reset() {
-    let mut s = state();
-    s.preedit = None;
-    s.last_ended = None;
+    *state() = State::default();
 }
 
 /// Whether text is being composed.
@@ -267,6 +264,13 @@ pub fn draw_overlay(batch: &mut HudBatch, atlas: &HudAtlas) {
     }
 }
 
+/// Discard the non-owning player's caret without touching the active composition.
+pub fn discard_layout() {
+    let mut s = state();
+    s.caret = None;
+    s.area = None;
+}
+
 /// The text input area (`x0, y0, x1, y1` in GUI pixels) set since the last
 /// call, for `Window.set_ime_cursor_area`.
 pub fn take_text_input_area() -> Option<[f32; 4]> {
@@ -283,6 +287,21 @@ mod tests {
     static STATE_TESTS: Mutex<()> = Mutex::new(());
     fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         STATE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn closing_input_clears_the_old_caret_and_candidate_area() {
+        let _turn = one_at_a_time();
+        set_preedit(PreeditEvent::from_winit("unfinished", None));
+        report_caret(20.0, 30.0, 10.0);
+        state().area = Some([20.0, 30.0, 21.0, 40.0]);
+
+        reset();
+
+        assert!(!composing());
+        assert!(!should_suppress_key());
+        assert!(state().caret.is_none());
+        assert!(take_text_input_area().is_none());
     }
 
     #[test]

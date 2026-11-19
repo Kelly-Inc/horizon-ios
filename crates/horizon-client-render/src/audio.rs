@@ -19,7 +19,10 @@ use horizon_core::random::{LegacyRandom, RandomSource};
 use std::path::Path;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// An OpenAL source's state.
@@ -43,7 +46,7 @@ struct Channel {
     at: [f32; 3],
     relative: bool,
     /// Whose sounds these are: 0 the game's, another splitscreen player's (`Audio::share`).
-    owner: u8,
+    owner: u64,
     /// Its world (`Mixer::world_id`; 0 none).
     world: u32,
     /// The sound file it started and when, to tell another player's copy of it.
@@ -104,9 +107,9 @@ struct Mixer {
     listener_pitch: f32,
     /// Splitscreen: the other players' cameras (position, yaw, pitch) by owner. A world sound is
     /// heard from the nearest camera, and panned half as wide while several share the speakers.
-    listeners: HashMap<u8, ([f64; 3], f32, f32)>,
+    listeners: HashMap<u64, ([f64; 3], f32, f32)>,
     /// Each camera's world by owner, as ids: the callback compares and copies integers.
-    worlds: HashMap<u8, u32>,
+    worlds: HashMap<u64, u32>,
     /// World names by id - 1 (`world_id`).
     world_names: Vec<String>,
     /// The callback's cameras (position, basis, world), kept to be refilled without allocating.
@@ -121,6 +124,9 @@ struct Mixer {
     /// The output device the stream was opened on (`Library.currentDeviceName`).
     #[cfg(feature = "audio")]
     device_name: String,
+    /// Only callbacks for this output may advance the mixer or report a loss.
+    #[cfg(any(feature = "audio", test))]
+    active_stream: Option<Arc<OutputStreamIdentity>>,
     /// How the stream reported the output lost, if it did (`Lost`).
     #[cfg(any(feature = "audio", test))]
     lost: Option<Lost>,
@@ -130,6 +136,12 @@ struct Mixer {
     /// How many times the output's buffer has been doubled this session (`buffer_frames`).
     #[cfg(any(feature = "audio", test))]
     buffer_steps: u32,
+}
+
+#[cfg(any(feature = "audio", test))]
+#[derive(Default)]
+struct OutputStreamIdentity {
+    disconnected: AtomicBool,
 }
 
 /// How the output was lost, as the stream's error callback saw it. The worse one wins.
@@ -149,6 +161,51 @@ enum Lost {
 }
 #[cfg(any(feature = "audio", test))]
 impl Mixer {
+    fn is_active_stream(&self, identity: &Arc<OutputStreamIdentity>) -> bool {
+        self.active_stream
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, identity))
+    }
+
+    fn activate_stream(&mut self, identity: Arc<OutputStreamIdentity>) -> bool {
+        if identity.disconnected.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.active_stream = Some(identity);
+        self.lost = None;
+        self.stream_errors = StreamErrors::default();
+        true
+    }
+
+    fn stream_rendered(&mut self, identity: &Arc<OutputStreamIdentity>) -> bool {
+        if !self.is_active_stream(identity) {
+            return false;
+        }
+        self.stream_errors = StreamErrors::default();
+        if self.lost == Some(Lost::Stream) {
+            self.lost = None;
+        }
+        true
+    }
+
+    fn stream_error_for(
+        &mut self,
+        identity: &Arc<OutputStreamIdentity>,
+        gone: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.is_active_stream(identity) {
+            if gone {
+                // Startup can report a disconnect before play() returns. Keep
+                // it with that stream instead of affecting the current output.
+                identity.disconnected.store(true, Ordering::Relaxed);
+            }
+            return false;
+        }
+        self.stream_error(gone, now);
+        true
+    }
+
     /// An error from the stream at `now`; `gone` when it said its device is
     /// (`DeviceNotAvailable`), otherwise a backend error such as ALSA's POLLERR.
     fn stream_error(&mut self, gone: bool, now: std::time::Instant) {
@@ -243,15 +300,25 @@ struct Reopen {
     tries: u32,
     /// Ticks since the last try.
     ticks: u32,
+    /// A delayed route switch still reloads sounds after it succeeds.
+    reload_on_success: bool,
 }
 #[cfg(any(feature = "audio", test))]
 impl Reopen {
     const TRIES: u32 = 5;
     /// Two seconds of client ticks.
     const TICKS: u32 = 40;
+    fn after_initial_open(requested: bool, opened: bool) -> Self {
+        let mut reopen = Self::default();
+        if requested && !opened {
+            reopen.failed(false);
+        }
+        reopen
+    }
     /// The output failed to open: whether to keep trying.
     fn failed(&mut self, retrying: bool) -> bool {
         self.ticks = 0;
+        self.reload_on_success = false;
         self.tries = if retrying {
             self.tries.saturating_sub(1)
         } else {
@@ -278,10 +345,11 @@ const MOD_AUDIO_SOURCES: usize = 64;
 /// The distance at which positioned mod audio has faded out, in blocks (linear, as a sound's
 /// `AL_LINEAR_DISTANCE` fades).
 const MOD_AUDIO_RANGE: f32 = 48.0;
-/// One of a mod's audio sources (`push_voice`): a speaker, keyed by the mod and its own id
-/// for it. Its chunks play one after another, oldest first, so each speaker's audio stays in
-/// order while different speakers play at the same time.
+/// One of a local player's mod audio sources (`push_voice`). Its chunks play in order,
+/// while different sources play at the same time.
 struct ModAudioSource {
+    // The client identity outlives seat reuse while a departing guest finishes shutting down.
+    owner: Arc<()>,
     mod_id: String,
     source: u128,
     chunks: std::collections::VecDeque<ModAudioChunk>,
@@ -303,6 +371,7 @@ impl Mixer {
     /// than [`MOD_AUDIO_SECONDS`], or when a new source would pass [`MOD_AUDIO_SOURCES`].
     fn push_mod_audio(
         &mut self,
+        owner: &Arc<()>,
         mod_id: &str,
         source: u128,
         samples: &[f32],
@@ -322,7 +391,7 @@ impl Mixer {
         match self
             .mod_audio
             .iter()
-            .position(|s| s.source == source && s.mod_id == mod_id)
+            .position(|s| Arc::ptr_eq(&s.owner, owner) && s.source == source && s.mod_id == mod_id)
         {
             Some(i) => {
                 let s = &mut self.mod_audio[i];
@@ -341,6 +410,7 @@ impl Mixer {
                     return false;
                 }
                 self.mod_audio.push(ModAudioSource {
+                    owner: owner.clone(),
                     mod_id: mod_id.to_owned(),
                     source,
                     chunks: std::collections::VecDeque::from([chunk]),
@@ -350,6 +420,12 @@ impl Mixer {
         }
         true
     }
+
+    fn stop_mod_audio(&mut self, owner: &Arc<()>) {
+        self.mod_audio
+            .retain(|source| !Arc::ptr_eq(&source.owner, owner));
+    }
+
     /// The id of world `name` (1 and up), given once per name.
     fn world_id(&mut self, name: &str) -> u32 {
         let i = match self.world_names.iter().position(|w| w == name) {
@@ -400,11 +476,13 @@ impl MixerBackend {
         rate: u32,
         at: Option<[f64; 3]>,
     ) -> bool {
-        self.live
-            && self
-                .mixer
-                .lock()
-                .is_ok_and(|mut m| m.push_mod_audio(mod_id, source, samples, rate, at))
+        self.mixer.lock().is_ok_and(|mut m| {
+            self.is_live() && m.push_mod_audio(&self.work_owner, mod_id, source, samples, rate, at)
+        })
+    }
+
+    fn is_live(&self) -> bool {
+        !self.retired && self.output_live.load(Ordering::Acquire)
     }
 }
 /// The mixer side of the engine (`Backend`).
@@ -418,17 +496,30 @@ pub struct MixerBackend {
     streams: Vec<AudioWork>,
     work_owner: Arc<()>,
     next: ChannelId,
-    live: bool,
-    /// Whose channels these are (`Channel::owner`).
-    owner: u8,
+    /// One stream belongs to the host and serves every local player.
+    output_live: Arc<AtomicBool>,
+    /// A departing guest stops accepting work while the host keeps the stream.
+    retired: bool,
+    /// Whose channels these are, unique across joins even when a seat is reused.
+    owner: u64,
     world: u32,
     /// How many other players share this output: alone, a sound never looks for its copy.
     shares: Arc<std::sync::atomic::AtomicUsize>,
 }
-/// A splitscreen player's backend leaving: its camera and sounds go with it.
 impl Drop for MixerBackend {
     fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+impl MixerBackend {
+    /// Remove a departing player's camera and sounds before waiting for its workers.
+    fn retire(&mut self) {
         self.retire_work();
+        if self.retired {
+            return;
+        }
+        self.retired = true;
         if self.owner == 0 {
             return;
         }
@@ -439,6 +530,7 @@ impl Drop for MixerBackend {
             m.worlds.remove(&self.owner);
             let owner = self.owner;
             m.channels.retain(|_, c| c.owner != owner);
+            m.stop_mod_audio(&self.work_owner);
         }
     }
 }
@@ -540,10 +632,8 @@ fn poll_retired_for(owner: Option<&Arc<()>>) -> bool {
         Some(owner) => !work.iter().any(|work| Arc::ptr_eq(&work.owner, owner)),
     }
 }
-/// Splitscreen: each shared backend's channel ids start at a block of their own, never handed out
-/// again, so a player in a seat used before never reuses an id a departed one's decoder may
-/// still attach to. The game's own backend counts from 0, as before.
-static SHARED_CHANNELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Each split-screen join gets a new owner and channel-id block, independent of its seat.
+static SHARED_OWNERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Two players' copies of one sound: started within this of each other.
 const SAME_SOUND: std::time::Duration = std::time::Duration::from_millis(150);
 /// Decoded interleaved samples, their rate and channel count (`None`: the file did not load).
@@ -652,12 +742,16 @@ impl Audio {
 }
 
 pub struct Audio {
+    /// This game owns an output even if the first attempt to open it failed.
+    #[cfg(feature = "audio")]
+    output_requested: bool,
     _stream: Option<Stream>,
     device_name: String,
     pub engine: SoundEngine,
     backend: MixerBackend,
     /// Record `Heard` sounds (the subtitle overlay is listening).
     pub record_heard: bool,
+    listener_registered: bool,
     pub listener: [f64; 3],
     pub listener_yaw: f32,
     pub listener_pitch: f32,
@@ -701,6 +795,41 @@ pub struct Audio {
     #[cfg(feature = "audio")]
     device_probe: Option<PendingProbe>,
 }
+#[cfg(feature = "audio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReopenReason {
+    DeviceLost,
+    StreamStopped,
+    RouteChanged,
+    Retry,
+}
+
+/// Keep a live preferred output, or follow a changed system default while
+/// using a fallback. Some devices disappear before reporting a stream error.
+#[cfg(any(feature = "audio", test))]
+fn output_route_changed(
+    wanted: &str,
+    current: &str,
+    default: Option<&str>,
+    default_changed: bool,
+    previous_devices: &[String],
+    devices: &[String],
+) -> bool {
+    let has = |name: &str| devices.iter().any(|device| device == name);
+    if !wanted.is_empty()
+        && current != wanted
+        && has(wanted)
+        && !previous_devices.iter().any(|device| device == wanted)
+    {
+        return true;
+    }
+    if !current.is_empty() && default != Some(current) && !has(current) {
+        return default.is_some() || !devices.is_empty();
+    }
+    let using_default_or_fallback = wanted.is_empty() || current != wanted;
+    using_default_or_fallback && default_changed && default.is_some_and(|name| name != current)
+}
+
 /// What one look at the output devices found: the system default, the
 /// fingerprint, and the device list when those say it may have changed.
 #[cfg(feature = "audio")]
@@ -710,7 +839,7 @@ struct DeviceProbe {
     devices: Option<Vec<String>>,
 }
 #[cfg(feature = "audio")]
-type PendingProbe = Arc<Mutex<Option<DeviceProbe>>>;
+type PendingProbe = std::sync::mpsc::Receiver<DeviceProbe>;
 /// Looks at the output devices as `should_change_device` did on the render
 /// thread: the device list only when the default or the fingerprint moved.
 #[cfg(feature = "audio")]
@@ -871,6 +1000,9 @@ impl MixerBackend {
 }
 impl Backend for MixerBackend {
     fn create(&mut self, _streaming: bool) -> Option<ChannelId> {
+        if self.retired {
+            return None;
+        }
         self.next += 1;
         let id = self.next;
         self.mixer.lock().ok()?.channels.insert(
@@ -948,7 +1080,7 @@ impl Backend for MixerBackend {
     /// as a failed buffer future does in vanilla.
     fn start(&mut self, channel: ChannelId, sound: &Sound, looping: bool) {
         self.poll_work();
-        if !self.live {
+        if !self.is_live() {
             return;
         }
         let (namespace, path) = sound.path();
@@ -1421,8 +1553,8 @@ fn open_device(
             short.buffer_size
         );
     }
-    let stream = match build(&short) {
-        Ok(stream) => stream,
+    let (stream, identity) = match build(&short) {
+        Ok(output) => output,
         // A device that refuses the short fixed buffer still plays with cpal's default one.
         Err(e) if short != config.config() => {
             log::info!("Horizon: audio output refused a short buffer ({e}); using the default");
@@ -1432,13 +1564,14 @@ fn open_device(
     };
     stream.play()?;
     if let Ok(mut m) = mixer.lock() {
+        if !m.activate_stream(identity) {
+            return Err("audio output disconnected while starting".into());
+        }
         m.device_name = device.name().unwrap_or_default();
-        m.lost = None;
-        m.stream_errors = StreamErrors::default();
     }
     Ok((stream, config))
 }
-/// Try one output device for `open`: skip it when it was already tried, log it
+/// Try one output device for `open_named`: skip it when it was already tried, log it
 /// when it opens, and keep its error when it does not.
 #[cfg(feature = "audio")]
 fn try_open_device(
@@ -1569,16 +1702,21 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
     config: &cpal::SupportedStreamConfig,
     stream_config: &cpal::StreamConfig,
     mixer: Arc<Mutex<Mixer>>,
-) -> Result<cpal::Stream> {
+) -> Result<(cpal::Stream, Arc<OutputStreamIdentity>)> {
     let rate = config.sample_rate().0;
     let channels = config.channels() as usize;
     let mut scratch = Vec::new();
     let on_error = mixer.clone();
+    let identity = Arc::new(OutputStreamIdentity::default());
+    let render_identity = identity.clone();
+    let error_identity = identity.clone();
     let stream = device.build_output_stream(
         stream_config,
         move |data: &mut [T], _| {
             scratch.resize(data.len(), 0.0f32);
-            if let Ok(mut m) = mixer.lock() {
+            if let Ok(mut m) = mixer.lock()
+                && m.stream_rendered(&render_identity)
+            {
                 mix(&mut m, &mut scratch, channels, rate);
             } else {
                 scratch.fill(0.0);
@@ -1588,15 +1726,16 @@ fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
             }
         },
         move |e| {
-            log::warn!("Horizon: audio stream error: {e}");
-            if let Ok(mut m) = on_error.lock() {
-                let gone = matches!(e, cpal::StreamError::DeviceNotAvailable);
-                m.stream_error(gone, std::time::Instant::now());
+            let gone = matches!(e, cpal::StreamError::DeviceNotAvailable);
+            if on_error.lock().is_ok_and(|mut m| {
+                m.stream_error_for(&error_identity, gone, std::time::Instant::now())
+            }) {
+                log::warn!("Horizon: audio stream error: {e}");
             }
         },
         None,
     )?;
-    Ok(stream)
+    Ok((stream, identity))
 }
 /// Available audio output device names.
 #[cfg(feature = "audio")]
@@ -1651,16 +1790,16 @@ impl Audio {
     }
     fn with_output(root: &ResourceSource, output: bool, target_device: &str) -> Self {
         let registry = SoundRegistry::load(root);
-        if output && registry.is_empty() {
+        if output && !registry.has_samples() {
             // The game then plays nothing on a working output (#1035, #1076).
             log::warn!(
-                "Horizon: no sounds in the active resources; prepare the game again in the \
-                 launcher (or run horizon-prepare sounds)"
+                "Horizon: no sound samples are available in the active resources; \
+                 prepare the game again in the launcher (or run horizon-prepare sounds)"
             );
         }
         let mixer = Arc::new(Mutex::new(Mixer::default()));
         let opened = if output {
-            Self::open_named(mixer.clone(), target_device)
+            Self::open_named(mixer.clone(), target_device, None)
         } else {
             Err("no output on a dedicated server".into())
         };
@@ -1688,7 +1827,11 @@ impl Audio {
         } else {
             Vec::new()
         };
+        #[cfg(feature = "audio")]
+        let output_requested = output && output_disabled(|name| std::env::var_os(name)).is_none();
         Self {
+            #[cfg(feature = "audio")]
+            output_requested,
             _stream: stream,
             device_name: target_device.to_owned(),
             engine,
@@ -1701,12 +1844,14 @@ impl Audio {
                 streams: Vec::new(),
                 work_owner: Arc::new(()),
                 next: 0,
-                live,
+                output_live: Arc::new(AtomicBool::new(live)),
+                retired: false,
                 owner: 0,
                 world: 0,
                 shares: Arc::default(),
             },
             record_heard: false,
+            listener_registered: true,
             listener: [0.0; 3],
             listener_yaw: 0.0,
             listener_pitch: 0.0,
@@ -1727,86 +1872,73 @@ impl Audio {
             #[cfg(feature = "audio")]
             device_ticks: 0,
             #[cfg(feature = "audio")]
-            reopen: Reopen::default(),
+            reopen: Reopen::after_initial_open(output_requested, live),
             #[cfg(feature = "audio")]
             device_probe: None,
         }
     }
     #[cfg(not(feature = "audio"))]
-    fn open_named(_: Arc<Mutex<Mixer>>, _: &str) -> Result<Stream> {
+    fn open_named(_: Arc<Mutex<Mixer>>, _: &str, _: Option<&str>) -> Result<Stream> {
         Err("this build has no sound output (built without the `audio` feature)".into())
     }
     #[cfg(feature = "audio")]
-    fn open_named(mixer: Arc<Mutex<Mixer>>, target: &str) -> Result<Stream> {
+    fn open_named(
+        mixer: Arc<Mutex<Mixer>>,
+        target: &str,
+        keep_open: Option<&str>,
+    ) -> Result<Stream> {
         if let Some(reason) = output_disabled(|name| std::env::var_os(name)) {
             return Err(reason.into());
         }
         let host = cpal::default_host();
-        if !target.is_empty()
-            && let Ok(devices) = host.output_devices()
-        {
-            for device in devices {
+        // Reopening the same working device is not a successful route switch.
+        let mut tried: Vec<_> = keep_open.into_iter().map(str::to_owned).collect();
+        let mut errors = Vec::new();
+
+        // Reuse the preferred-device enumeration for fallback.
+        let mut listed = if target.is_empty() {
+            None
+        } else {
+            host.output_devices().ok()
+        };
+        let mut before_preferred = Vec::new();
+        if let Some(devices) = listed.as_mut() {
+            for device in devices.by_ref() {
                 let name = device.name().unwrap_or_else(|_| "unnamed device".into());
-                if name == target {
-                    match open_device(&device, mixer.clone()) {
-                        Ok((stream, config)) => {
-                            log::info!(
-                                "Horizon: audio output {name} ({} Hz, {} channels, {})",
-                                config.sample_rate().0,
-                                config.channels(),
-                                config.sample_format()
-                            );
-                            return Ok(stream);
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Horizon: could not open audio device '{target}': {e}; falling back to default"
-                            );
-                        }
-                    }
-                    break;
+                if name != target {
+                    before_preferred.push(device);
+                    continue;
                 }
+                if let Some(stream) =
+                    try_open_device(&device, mixer.clone(), &mut tried, &mut errors)
+                {
+                    return Ok(stream);
+                }
+                if let Some(error) = errors.last() {
+                    log::warn!(
+                        "Horizon: could not open preferred output ({error}); falling back to default"
+                    );
+                }
+                break;
             }
         }
-        Self::open(mixer)
-    }
-    #[cfg(feature = "audio")]
-    pub fn set_device(&mut self, name: &str) -> Result<()> {
-        if !self.backend.live && self._stream.is_none() && !self.engine.loaded {
-            self.device_name = name.to_owned();
-            return Ok(());
-        }
-        self._stream = Some(Self::open_named(self.backend.mixer.clone(), name)?);
-        self.device_name = name.to_owned();
-        self.backend.live = true;
-        self.engine.loaded = true;
-        self.engine.notify_loaded();
-        Ok(())
-    }
-    #[cfg(not(feature = "audio"))]
-    pub fn set_device(&mut self, name: &str) -> Result<()> {
-        self.device_name = name.to_owned();
-        Ok(())
-    }
-    #[cfg(feature = "audio")]
-    fn open(mixer: Arc<Mutex<Mixer>>) -> Result<Stream> {
-        if let Some(reason) = output_disabled(|name| std::env::var_os(name)) {
-            return Err(reason.into());
-        }
-        let host = cpal::default_host();
-        let mut errors = Vec::new();
-        // The default device first: it is what plays, and listing the others
-        // probes every PCM, which is slow and prints ALSA's errors for the
-        // plugins this system lacks.
-        let mut tried = Vec::new();
+
+        // Try the default before probing any other outputs.
         if let Some(device) = host.default_output_device()
             && let Some(stream) = try_open_device(&device, mixer.clone(), &mut tried, &mut errors)
         {
             return Ok(stream);
         }
-        // A default that cannot open (busy, or a stale ALSA default) should not
-        // leave the game silent when another device works.
-        for device in host.output_devices().into_iter().flatten() {
+        if keep_open.is_some() {
+            return Err(
+                "the selected audio route is unavailable; keeping the current output".into(),
+            );
+        }
+        let remaining = listed.or_else(|| host.output_devices().ok());
+        for device in before_preferred
+            .into_iter()
+            .chain(remaining.into_iter().flatten())
+        {
             if let Some(stream) = try_open_device(&device, mixer.clone(), &mut tried, &mut errors) {
                 return Ok(stream);
             }
@@ -1816,6 +1948,53 @@ impl Audio {
         }
         Err(format!("no audio output device opened ({})", errors.join("; ")).into())
     }
+    #[cfg(feature = "audio")]
+    pub fn set_device(&mut self, name: &str) -> Result<()> {
+        self.device_name = name.to_owned();
+        self.device_probe = None;
+        if !self.output_requested {
+            return Ok(());
+        }
+        let result = self.open_requested_output(false);
+        if result.is_err() {
+            self.reopen.failed(false);
+        }
+        result
+    }
+    #[cfg(feature = "audio")]
+    fn open_requested_output(&mut self, reload_sounds: bool) -> Result<()> {
+        let keep_open = if reload_sounds && self._stream.is_some() {
+            self.backend
+                .mixer
+                .lock()
+                .ok()
+                .map(|mixer| mixer.device_name.clone())
+                .filter(|name| {
+                    self.default_seen.as_ref() == Some(name) || self.devices_seen.contains(name)
+                })
+        } else {
+            None
+        };
+        let stream = Self::open_named(
+            self.backend.mixer.clone(),
+            &self.device_name,
+            keep_open.as_deref(),
+        )?;
+        if reload_sounds {
+            self.stop_all();
+        }
+        self._stream = Some(stream);
+        self.reopen = Reopen::default();
+        self.backend.output_live.store(true, Ordering::Release);
+        self.engine.loaded = true;
+        self.engine.notify_loaded();
+        Ok(())
+    }
+    #[cfg(not(feature = "audio"))]
+    pub fn set_device(&mut self, name: &str) -> Result<()> {
+        self.device_name = name.to_owned();
+        Ok(())
+    }
     fn bound(&mut self) -> Bound<'_, MixerBackend> {
         Bound {
             engine: &mut self.engine,
@@ -1824,6 +2003,9 @@ impl Audio {
     }
     /// World identity for this player's sources and camera. Existing channels keep their world.
     pub fn set_world(&mut self, world: &str) {
+        if self.backend.retired {
+            return;
+        }
         if let Ok(mut mixer) = self.backend.mixer.lock() {
             let id = mixer.world_id(world);
             self.backend.world = id;
@@ -1834,7 +2016,12 @@ impl Audio {
     /// `SoundManager.updateSource`: the camera position and rotation
     /// (`Listener.setTransform` takes its forward and up vectors).
     pub fn set_listener(&mut self, position: [f64; 3], yaw: f32, pitch: f32) {
-        if self.listener == position && self.listener_yaw == yaw && self.listener_pitch == pitch {
+        if self.backend.retired
+            || (self.listener_registered
+                && self.listener == position
+                && self.listener_yaw == yaw
+                && self.listener_pitch == pitch)
+        {
             return;
         }
         self.listener = position;
@@ -1849,18 +2036,22 @@ impl Audio {
                 m.listeners
                     .insert(self.backend.owner, (position, yaw, pitch));
             }
+            self.listener_registered = true;
         }
     }
     /// Splitscreen: another player's sounds on this output, heard from its camera too
-    /// (`owner`: 1 to 255, its own). Dropped, its camera and sounds go.
-    pub fn share(&self, owner: u8) -> Self {
-        assert_ne!(owner, 0, "shared audio owners must be nonzero");
+    /// The seat can be reused while the previous player's workers finish retiring.
+    pub fn share(&self, seat: u8) -> Self {
+        assert_ne!(seat, 0, "the host seat cannot share its own output");
+        let owner = SHARED_OWNERS.fetch_add(1, Ordering::Relaxed) + 1;
         self.backend
             .shares
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut engine = SoundEngine::new(self.engine.registry.clone());
-        engine.loaded = self.backend.live;
+        engine.loaded = self.backend.is_live();
         Self {
+            #[cfg(feature = "audio")]
+            output_requested: false,
             _stream: None,
             device_name: self.device_name.clone(),
             engine,
@@ -1872,14 +2063,15 @@ impl Audio {
                 decoder_work: None,
                 streams: Vec::new(),
                 work_owner: Arc::new(()),
-                next: (SHARED_CHANNELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
-                    << 40,
-                live: self.backend.live,
+                next: owner << 40,
+                output_live: self.backend.output_live.clone(),
+                retired: false,
                 owner,
                 world: self.backend.world,
                 shares: self.backend.shares.clone(),
             },
             record_heard: false,
+            listener_registered: false,
             listener: [0.0; 3],
             listener_yaw: 0.0,
             listener_pitch: 0.0,
@@ -1909,6 +2101,7 @@ impl Audio {
     /// Sync the volume options, refreshing the categories that changed
     /// (the option sliders' `refreshCategoryVolume`).
     fn sync_volumes(&mut self) {
+        self.sync_shared_output();
         let mut volumes = [self.master; 11];
         for (i, v) in volumes.iter_mut().enumerate().skip(1) {
             *v = crate::settings::source_volume(i);
@@ -1928,52 +2121,55 @@ impl Audio {
     /// at once a second, on a thread of their own: a later tick reads what it
     /// found.
     #[cfg(feature = "audio")]
-    fn should_change_device(&mut self) -> bool {
+    fn should_change_device(&mut self) -> Option<ReopenReason> {
         // A splitscreen share plays through the first player's output: it leaves the device,
         // and the mixer's lost flag, to that output.
-        if self.backend.owner != 0 {
-            return false;
+        if !self.output_requested {
+            return None;
         }
         let (current, lost) = match self.backend.mixer.lock() {
             Ok(mut m) => (m.device_name.clone(), m.take_lost_device()),
-            Err(_) => return false,
+            Err(_) => return None,
         };
         if lost {
             log::info!("Horizon: audio device was lost");
             self.device_probe = None;
-            self.default_seen = default_output_name();
-            self.cards_seen = card_fingerprint();
-            self.devices_seen = output_devices();
-            return true;
+            // Reopen now. Refresh the device list on a later background probe.
+            return Some(ReopenReason::DeviceLost);
         }
         if let Some(pending) = &self.device_probe {
-            let Some(probe) = pending.lock().ok().and_then(|mut found| found.take()) else {
-                return false;
-            };
+            let result = pending.try_recv();
+            if matches!(result, Err(std::sync::mpsc::TryRecvError::Empty)) {
+                return None;
+            }
             self.device_probe = None;
-            return self.devices_changed(probe, current);
+            return match result {
+                Ok(probe) => self
+                    .devices_changed(probe, current)
+                    .then_some(ReopenReason::RouteChanged),
+                Err(_) => {
+                    log::warn!("Horizon: audio device probe stopped before answering");
+                    None
+                }
+            };
         }
         self.device_ticks += 1;
-        if self._stream.is_none() || self.device_ticks < 20 {
-            return false;
+        if self.device_ticks < 20 {
+            return None;
         }
         self.device_ticks = 0;
-        let pending = PendingProbe::default();
-        let out = Arc::clone(&pending);
+        let (out, pending) = std::sync::mpsc::channel();
         let seen = (self.default_seen.clone(), self.cards_seen.clone());
         let started = std::thread::Builder::new()
             .name("audio-devices".into())
             .spawn(move || {
-                let probe = probe_devices(seen.0, seen.1);
-                if let Ok(mut found) = out.lock() {
-                    *found = Some(probe);
-                }
+                let _ = out.send(probe_devices(seen.0, seen.1));
             });
         match started {
             Ok(_) => self.device_probe = Some(pending),
             Err(e) => log::warn!("Horizon: could not look at the audio devices: {e}"),
         }
-        false
+        None
     }
     /// The rest of `shouldChangeDevice` with what a look at the devices found,
     /// `current` being the device playing now.
@@ -1990,75 +2186,88 @@ impl Audio {
         self.cards_seen = cards;
         // Only a change in the device lists is looked at, as in vanilla: a
         // preferred device that is listed but cannot open is not retried.
-        if default == self.default_seen && devices == self.devices_seen {
+        let default_changed = default != self.default_seen;
+        if !default_changed && devices == self.devices_seen {
             return false;
         }
-        self.default_seen = default.clone();
-        let wanted = self.device_name.clone();
-        let available = devices.contains(&wanted);
+        // A failed reopen leaves no stream. A new output can restore sound
+        // even if its name matches the lost device or the preferred one is absent.
+        let changed = if self._stream.is_none() {
+            default.is_some() || !devices.is_empty()
+        } else {
+            output_route_changed(
+                &self.device_name,
+                &current,
+                default.as_deref(),
+                default_changed,
+                &self.devices_seen,
+                &devices,
+            )
+        };
+        self.default_seen = default;
         self.devices_seen = devices;
-        if wanted.is_empty() {
-            let changed = default.as_deref().is_some_and(|d| d != current);
-            if changed {
-                log::info!("Horizon: system default audio device has changed");
-            }
-            return changed;
-        }
-        let changed = current != wanted && available;
         if changed {
-            log::info!("Horizon: preferred audio device has become available");
+            log::info!("Horizon: audio devices changed; reopening the output");
         }
         changed
     }
-    /// Opens the output on the chosen device again; `retrying` after an earlier try failed.
-    /// Whether it opened.
+    /// Keep playing through a route change until a replacement has opened.
     #[cfg(feature = "audio")]
-    fn reopen_output(&mut self, retrying: bool) -> bool {
-        // The old stream lets go of the device first: a dead one may still hold it.
-        self._stream = None;
-        let device = self.device_name.clone();
-        match self.set_device(&device) {
+    fn reopen_output(&mut self, reason: ReopenReason) {
+        if reason == ReopenReason::DeviceLost {
+            self.stop_all();
+        }
+        if matches!(reason, ReopenReason::DeviceLost | ReopenReason::StreamStopped) {
+            self.release_output_stream();
+        }
+        let retrying = reason == ReopenReason::Retry;
+        let reload_sounds = reason == ReopenReason::RouteChanged
+            || (retrying && self.reopen.reload_on_success);
+        match self.open_requested_output(reload_sounds) {
             Ok(()) => {
                 if retrying {
                     log::info!("Horizon: the audio output is back");
                 }
-                self.reopen = Reopen::default();
-                true
-            }
-            Err(e) if self.reopen.failed(retrying) => {
-                log::warn!("Horizon: could not reopen the audio output ({e}); trying again soon");
-                false
             }
             Err(e) => {
-                log::warn!("Horizon: could not reopen the audio output ({e}); it stays off");
-                false
+                if self._stream.is_none() {
+                    self.disable_output();
+                }
+                if self.reopen.failed(retrying) {
+                    self.reopen.reload_on_success = reload_sounds;
+                    log::warn!("Horizon: could not reopen the audio output ({e}); trying again soon");
+                } else {
+                    log::warn!(
+                        "Horizon: could not reopen the audio output ({e}); waiting for an output device change"
+                    );
+                }
             }
         }
     }
     /// `SoundManager.tick(paused)`, once per client tick.
     pub fn tick(&mut self, paused: bool, ctx: &TickContext) {
         #[cfg(feature = "audio")]
-        {
-            // A splitscreen share leaves the output to the first player's, as in `should_change_device`.
-            let stopped = self.backend.owner == 0
-                && self
-                    .backend
-                    .mixer
-                    .lock()
-                    .is_ok_and(|mut m| m.take_stopped_stream());
-            if self.should_change_device() {
-                // SoundEngine.reload: stop every sound, open the output again.
-                self.stop_all();
-                self.reopen_output(false);
-            } else if stopped {
-                // The device is still there (`Lost::Stream`): only the stream is opened again.
-                // The mixer keeps its channels, so the sounds playing go on where they were.
-                // If it doesn't open, they stop as on a reload.
-                if !self.reopen_output(false) {
-                    self.stop_all();
+        if self.output_requested {
+            // A splitscreen share leaves the output to the first player.
+            let stopped = self
+                .backend
+                .mixer
+                .lock()
+                .is_ok_and(|mut m| m.take_stopped_stream());
+            match (self.should_change_device(), stopped) {
+                (Some(reason), stopped) => {
+                    // A route switch still reloads sounds, even if the old stream stopped.
+                    if stopped && reason == ReopenReason::RouteChanged {
+                        self.release_output_stream();
+                    }
+                    self.reopen_output(reason);
                 }
-            } else if self.backend.owner == 0 && self.reopen.due() {
-                self.reopen_output(true);
+                (None, true) => {
+                    // An underrun restart keeps the mixer's channels.
+                    self.reopen_output(ReopenReason::StreamStopped);
+                }
+                (None, false) if self.reopen.due() => self.reopen_output(ReopenReason::Retry),
+                (None, false) => {}
             }
         }
         self.sync_volumes();
@@ -2131,6 +2340,9 @@ impl Audio {
     /// `SoundManager.stop()`: every sound.
     pub fn stop_all(&mut self) {
         self.engine.stop_all(&mut self.backend);
+        if let Ok(mut mixer) = self.backend.mixer.lock() {
+            mixer.stop_mod_audio(&self.backend.work_owner);
+        }
     }
     /// `SoundManager.reload` (resource packs changed): stop every sound, then
     /// read sound events and sound files from the new resource root.
@@ -2153,10 +2365,46 @@ impl Audio {
     /// Cancel queued reads and retire all owned workers before the game home can
     /// be imported/replaced. An already running decode keeps its root until done.
     pub fn shutdown_workers(&mut self) -> bool {
-        self.stop_all();
-        self.backend.live = false;
-        self.backend.retire_work();
+        self.disable_output();
+        self.backend.retire();
+        #[cfg(feature = "audio")]
+        {
+            self.output_requested = false;
+            self.device_probe = None;
+        }
         poll_retired_for(Some(&self.backend.work_owner))
+    }
+
+    fn release_output_stream(&mut self) {
+        #[cfg(feature = "audio")]
+        if let Ok(mut mixer) = self.backend.mixer.lock() {
+            mixer.active_stream = None;
+        }
+        self._stream = None;
+    }
+
+    fn disable_output(&mut self) {
+        // stop_all needs a loaded engine to release its active channels.
+        self.stop_all();
+        if self.backend.owner == 0 {
+            self.backend.output_live.store(false, Ordering::Release);
+            self.release_output_stream();
+            if let Ok(mut mixer) = self.backend.mixer.lock() {
+                mixer.mod_audio.clear();
+            }
+        }
+        self.engine.loaded = false;
+    }
+
+    fn sync_shared_output(&mut self) {
+        if self.backend.owner == 0 {
+            return;
+        }
+        let live = self.backend.is_live();
+        if !live && self.engine.loaded {
+            self.stop_all();
+        }
+        self.engine.loaded = live;
     }
     /// Reserve the seed of a local level request before its cancellable hooks run.
     pub fn next_sound_seed(&mut self) -> i64 {
@@ -2527,7 +2775,7 @@ impl Audio {
     }
     #[doc(hidden)]
     pub fn backend_live_for_bench(&mut self) {
-        self.backend.live = true;
+        self.backend.output_live.store(true, Ordering::Release);
     }
 }
 impl Sounds for Audio {
@@ -2650,6 +2898,162 @@ mod tests {
         assert_eq!(lost.buffer_steps, 0);
     }
 
+    #[test]
+    fn successful_output_breaks_the_error_streak_without_clearing_device_loss() {
+        let mut mixer = Mixer::default();
+        let current = Arc::new(OutputStreamIdentity::default());
+        assert!(mixer.activate_stream(current.clone()));
+        let now = std::time::Instant::now();
+        for _ in 0..5 {
+            mixer.stream_error(false, now);
+            assert!(!mixer.take_stopped_stream());
+            assert!(mixer.stream_rendered(&current));
+        }
+        for _ in 0..3 {
+            mixer.stream_error(false, now);
+        }
+        assert_eq!(mixer.lost, Some(Lost::Stream));
+        assert!(mixer.stream_rendered(&current));
+        assert!(!mixer.take_stopped_stream());
+        mixer.stream_error(true, now);
+        assert!(mixer.stream_rendered(&current));
+        assert!(mixer.take_lost_device());
+    }
+
+    #[test]
+    fn callbacks_from_a_replaced_output_cannot_mark_the_new_stream_lost() {
+        let mut mixer = Mixer::default();
+        let old = Arc::new(OutputStreamIdentity::default());
+        let current = Arc::new(OutputStreamIdentity::default());
+        assert!(mixer.activate_stream(old.clone()));
+        assert!(mixer.is_active_stream(&old));
+        assert!(mixer.activate_stream(current.clone()));
+        assert!(!mixer.is_active_stream(&old));
+        assert!(!mixer.stream_error_for(&old, true, std::time::Instant::now()));
+        assert!(!mixer.take_lost_device());
+
+        assert!(mixer.stream_error_for(&current, true, std::time::Instant::now()));
+        assert!(mixer.take_lost_device());
+        mixer.active_stream = None;
+        assert!(!mixer.is_active_stream(&current));
+        assert!(!mixer.stream_error_for(&current, true, std::time::Instant::now()));
+    }
+
+    #[test]
+    fn a_disconnect_during_startup_does_not_replace_the_active_output() {
+        let mut mixer = Mixer::default();
+        let current = Arc::new(OutputStreamIdentity::default());
+        let candidate = Arc::new(OutputStreamIdentity::default());
+        assert!(mixer.activate_stream(current.clone()));
+
+        assert!(!mixer.stream_error_for(&candidate, true, std::time::Instant::now()));
+        assert!(!mixer.activate_stream(candidate));
+        assert!(mixer.is_active_stream(&current));
+        assert!(!mixer.take_lost_device());
+    }
+
+    #[test]
+    fn disabling_output_rejects_new_audio_until_the_stream_reopens() {
+        let source = ResourceSource::indexed(Default::default());
+        let mut audio = Audio::silent(&source);
+        audio.engine.loaded = true;
+        audio.backend.output_live.store(true, Ordering::Release);
+
+        audio.disable_output();
+
+        assert!(!audio.engine.loaded);
+        assert!(!audio.backend.push_voice("fixture", 1, &[0.25, -0.25], 48_000, None));
+    }
+
+    #[test]
+    fn split_audio_follows_host_output_and_guest_shutdown_leaves_it_open() {
+        let source = ResourceSource::indexed(Default::default());
+        let mut host = Audio::silent(&source);
+        let mut guest = host.share(1);
+        assert!(!guest.engine.loaded);
+
+        host.backend.output_live.store(true, Ordering::Release);
+        host.engine.loaded = true;
+        guest.sync_volumes();
+        assert!(guest.engine.loaded);
+
+        host.disable_output();
+        guest.sync_volumes();
+        assert!(!guest.engine.loaded);
+        assert!(
+            !guest
+                .backend
+                .push_voice("fixture", 1, &[0.25, -0.25], 48_000, None)
+        );
+
+        host.backend.output_live.store(true, Ordering::Release);
+        host.engine.loaded = true;
+        guest.sync_volumes();
+        assert!(guest.engine.loaded);
+
+        let _ = guest.shutdown_workers();
+        guest.sync_volumes();
+        assert!(!guest.engine.loaded);
+        assert!(host.backend.is_live());
+    }
+
+    #[test]
+    fn mod_audio_stops_with_its_player_or_the_shared_output() {
+        let source = ResourceSource::indexed(Default::default());
+        let mut host = Audio::silent(&source);
+        host.backend_live_for_bench();
+        let mut guest = host.share(1);
+        let samples = [0.25; 2];
+
+        assert!(host.backend.push_voice("voice", 1, &samples, 48_000, None));
+        assert!(guest.backend.push_voice("voice", 1, &samples, 48_000, None));
+        assert_eq!(host.backend.mixer.lock().unwrap().mod_audio.len(), 2);
+
+        guest.stop_all();
+        let mut data = [0.0; 4];
+        mix(
+            &mut host.backend.mixer.lock().unwrap(),
+            &mut data,
+            2,
+            48_000,
+        );
+        assert_eq!(data, [0.25; 4], "only the host's voice remains");
+
+        assert!(guest.backend.push_voice("voice", 1, &samples, 48_000, None));
+        host.disable_output();
+        assert!(!guest.backend.push_voice("voice", 1, &samples, 48_000, None));
+
+        host.backend_live_for_bench();
+        let mut data = [0.0; 4];
+        mix(
+            &mut host.backend.mixer.lock().unwrap(),
+            &mut data,
+            2,
+            48_000,
+        );
+        assert_eq!(
+            data, [0.0; 4],
+            "queued audio from before the outage is gone"
+        );
+    }
+
+    #[test]
+    fn a_failed_initial_open_retries_without_a_device_list_change() {
+        let mut reopen = Reopen::after_initial_open(true, false);
+        for _ in 1..Reopen::TICKS {
+            assert!(!reopen.due());
+        }
+        assert!(reopen.due());
+        assert_eq!(reopen.tries, Reopen::TRIES);
+
+        for (requested, opened) in [(false, false), (true, true)] {
+            assert_eq!(
+                Reopen::after_initial_open(requested, opened),
+                Reopen::default()
+            );
+        }
+    }
+
     /// A failed reopening is tried again every two seconds, five more times, then given up.
     #[test]
     fn a_failed_reopening_retries_a_few_times_then_stops() {
@@ -2670,6 +3074,118 @@ mod tests {
         // The next lost device starts a fresh run.
         assert!(reopen.failed(false));
         assert_eq!(reopen.tries, Reopen::TRIES);
+    }
+
+    #[test]
+    fn a_live_route_falls_back_when_the_current_device_disappears() {
+        let devices = ["Speakers".into(), "Monitor".into()];
+        assert!(output_route_changed(
+            "Headset",
+            "Headset",
+            Some("Speakers"),
+            false,
+            &[],
+            &devices
+        ));
+        assert!(output_route_changed(
+            "Headset",
+            "Speakers",
+            Some("Monitor"),
+            true,
+            &[],
+            &devices
+        ));
+        assert!(!output_route_changed(
+            "Speakers",
+            "Speakers",
+            Some("Monitor"),
+            true,
+            &[],
+            &devices
+        ));
+        assert!(!output_route_changed(
+            "Headset",
+            "Speakers",
+            Some("Monitor"),
+            false,
+            &[],
+            &devices
+        ));
+        assert!(output_route_changed(
+            "Monitor",
+            "Speakers",
+            Some("Speakers"),
+            false,
+            &[],
+            &devices
+        ));
+    }
+
+    #[test]
+    fn unrelated_devices_do_not_restart_a_working_fallback() {
+        let before = ["Speakers".into(), "Headset".into()];
+        let after = ["Speakers".into(), "Headset".into(), "Monitor".into()];
+        assert!(!output_route_changed(
+            "Headset",
+            "Speakers",
+            Some("Speakers"),
+            false,
+            &before,
+            &after,
+        ));
+        assert!(output_route_changed(
+            "Headset",
+            "Speakers",
+            Some("Speakers"),
+            false,
+            &["Speakers".into()],
+            &after,
+        ));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn a_returning_output_can_recover_after_retries_stop() {
+        let source = ResourceSource::indexed(Default::default());
+        let mut audio = Audio::silent(&source);
+        audio.output_requested = true;
+        audio.backend.output_live.store(true, Ordering::Release); // The game previously had an open stream.
+        let probe = |name: Option<&str>| DeviceProbe {
+            default: name.map(str::to_owned),
+            cards: None,
+            devices: Some(name.into_iter().map(str::to_owned).collect()),
+        };
+
+        // A connection change can bring back the same default device name.
+        assert!(audio.devices_changed(probe(Some("Speakers")), "Speakers".into()));
+        // Probing a stable listing does not start another bounded retry cycle.
+        assert!(!audio.devices_changed(probe(Some("Speakers")), "Speakers".into()));
+        // With the preferred device gone, the new default can still play.
+        audio.device_name = "Headset".into();
+        assert!(audio.devices_changed(probe(Some("Monitor")), "Headset".into()));
+        assert!(!audio.devices_changed(probe(None), "Headset".into()));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn a_failed_initial_open_can_recover_without_enabling_silent_output() {
+        let source = ResourceSource::indexed(Default::default());
+        let mut audio = Audio::silent(&source);
+        let probed = DeviceProbe {
+            default: Some("Speakers".into()),
+            cards: None,
+            devices: Some(vec!["Speakers".into()]),
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(probed).unwrap();
+        audio.device_probe = Some(receive);
+        assert!(audio.should_change_device().is_none(), "silent output stays off");
+        assert!(audio.device_probe.is_some());
+
+        audio.output_requested = true;
+        // Reproduce the state after the first open failed, with an output since discovered.
+        assert_eq!(audio.should_change_device(), Some(ReopenReason::RouteChanged));
+        assert!(audio.device_probe.is_none());
     }
 
     #[test]
@@ -2853,7 +3369,7 @@ mod tests {
         // Exercise the mixer without opening an output device. The missing
         // sample is harmless: this test checks the source the engine creates.
         audio.engine.loaded = true;
-        audio.backend.live = true;
+        audio.backend.output_live.store(true, Ordering::Release);
         let mut random = audio.random.clone();
         audio.play_button_click();
         let instance = audio.engine.instance(1).expect("click reached the engine");
@@ -2893,7 +3409,7 @@ mod tests {
             &|_, _| true,
         );
         audio.engine.loaded = true;
-        audio.backend.live = true;
+        audio.backend.output_live.store(true, Ordering::Release);
 
         audio.play_mod_sound(
             &SoundPlay::ui("minecraft:ui.button.click").with_volume(0.5),
@@ -3222,18 +3738,29 @@ mod tests {
             (Path::new("/nonexistent/horizon-test-audio")).to_path_buf(),
         ));
         host.set_world("minecraft:overworld");
+        host.set_listener([100.0, 0.0, 0.0], 0.0, 0.0);
         let mut guest = host.share(1);
         guest.set_world("minecraft:overworld");
-        guest.set_listener([1.0, 2.0, 3.0], 0.0, 0.0);
+        // Its first camera matches the default position and orientation exactly.
+        guest.set_listener([0.0; 3], 0.0, 0.0);
         let id = guest.backend.create(false).unwrap();
-        let mixer = host.backend.mixer.lock().unwrap();
+        let mut mixer = host.backend.mixer.lock().unwrap();
         let overworld = mixer
             .world_names
             .iter()
             .position(|w| w == "minecraft:overworld");
         let overworld = overworld.map(|i| i as u32 + 1);
-        assert_eq!(mixer.worlds.get(&1).copied(), overworld);
+        assert_eq!(mixer.worlds.get(&guest.backend.owner).copied(), overworld);
         assert_eq!(Some(mixer.channels[&id].world), overworld);
+        let sound = mixer.channels.get_mut(&id).unwrap();
+        sound.samples = Some((Arc::new(vec![1.0; 4]), 48_000, 1));
+        sound.at = [0.0, 0.0, 1.0];
+        sound.linear = Some(16.0);
+        sound.state = State::Playing;
+
+        let mut data = [0.0; 2];
+        mix(&mut mixer, &mut data, 2, 48_000);
+        assert!(data.iter().all(|sample| *sample > 0.5), "{data:?}");
     }
 
     #[test]
@@ -3329,8 +3856,9 @@ mod tests {
             decoder_work: None,
             streams: Vec::new(),
             work_owner: Arc::new(()),
-            next: (u64::from(owner)) << 40,
-            live: true,
+            next: owner << 40,
+            output_live: Arc::new(AtomicBool::new(true)),
+            retired: false,
             owner,
             world: 0,
             shares: shares.clone(),
@@ -3377,25 +3905,34 @@ mod tests {
         guest.set_world("overworld");
         guest.set_listener([1.0, 0.0, 0.0], 0.0, 0.0);
         let old = guest.backend.create(false).unwrap();
-        drop(guest);
+        let old_owner = guest.backend.owner;
+
+        // The same seat can be filled before the old player's shutdown completes.
+        let mut replacement = host.share(1);
+        replacement.set_world("nether");
+        replacement.set_listener([2.0, 0.0, 0.0], 0.0, 0.0);
+        let new = replacement.backend.create(false).unwrap();
+        let new_owner = replacement.backend.owner;
+        assert_ne!(old, new);
+        assert_ne!(old_owner, new_owner);
+
+        let _ = guest.shutdown_workers();
+        assert!(guest.backend.create(false).is_none());
+        guest.set_world("end");
+        guest.set_listener([3.0, 0.0, 0.0], 0.0, 0.0);
         {
             let mixer = host.backend.mixer.lock().unwrap();
             assert!(!mixer.channels.contains_key(&old));
-            assert!(!mixer.listeners.contains_key(&1));
-            assert!(!mixer.worlds.contains_key(&1));
+            assert!(!mixer.listeners.contains_key(&old_owner));
+            assert!(!mixer.worlds.contains_key(&old_owner));
         }
-        let mut replacement = host.share(1);
-        let new = replacement.backend.create(false).unwrap();
-        assert_ne!(old, new);
-        assert!(
-            replacement
-                .backend
-                .mixer
-                .lock()
-                .unwrap()
-                .channels
-                .contains_key(&new)
-        );
+        drop(guest);
+
+        let mixer = host.backend.mixer.lock().unwrap();
+        assert_eq!(mixer.channels[&new].owner, new_owner);
+        assert_eq!(mixer.listeners[&new_owner].0, [2.0, 0.0, 0.0]);
+        assert_eq!(mixer.worlds[&new_owner], mixer.channels[&new].world);
+        assert_eq!(host.backend.shares.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3530,9 +4067,10 @@ mod tests {
     #[test]
     fn each_mod_audio_source_plays_its_own_chunks_in_order() {
         let mut m = Mixer::default();
+        let owner = Arc::new(());
         // Two speakers of one mod, each queuing two chunks, interleaved.
         for (source, level) in [(1, 0.1), (2, 0.4), (1, 0.2), (2, 0.3)] {
-            assert!(m.push_mod_audio("voice", source, &[level; 4], 48_000, None));
+            assert!(m.push_mod_audio(&owner, "voice", source, &[level; 4], 48_000, None));
         }
         let mut data = vec![0.0f32; 8 * 2];
         mix(&mut m, &mut data, 2, 48_000);
@@ -3545,8 +4083,8 @@ mod tests {
         );
         assert!(m.mod_audio.is_empty(), "both sources played out");
         // Order within a source: its second chunk follows its first.
-        assert!(m.push_mod_audio("voice", 1, &[0.25; 2], 48_000, None));
-        assert!(m.push_mod_audio("voice", 1, &[0.5; 2], 48_000, None));
+        assert!(m.push_mod_audio(&owner, "voice", 1, &[0.25; 2], 48_000, None));
+        assert!(m.push_mod_audio(&owner, "voice", 1, &[0.5; 2], 48_000, None));
         let mut data = vec![0.0f32; 4 * 2];
         mix(&mut m, &mut data, 2, 48_000);
         let left: Vec<f32> = data.chunks(2).map(|f| f[0]).collect();
@@ -3556,35 +4094,73 @@ mod tests {
     #[test]
     fn mod_audio_sources_are_kept_apart_by_mod_and_capped() {
         let mut m = Mixer::default();
-        assert!(m.push_mod_audio("a", 1, &[0.1; 48_000], 48_000, None));
-        assert!(m.push_mod_audio("b", 1, &[0.1; 48_000], 48_000, None));
+        let owner = Arc::new(());
+        assert!(m.push_mod_audio(&owner, "a", 1, &[0.1; 48_000], 48_000, None));
+        assert!(m.push_mod_audio(&owner, "b", 1, &[0.1; 48_000], 48_000, None));
         assert_eq!(
             m.mod_audio.len(),
             2,
             "the same id in two mods is two sources"
         );
         // Two seconds wait at most per source; a burst past that is refused, not delayed.
-        assert!(m.push_mod_audio("a", 1, &[0.1; 48_000], 48_000, None));
-        assert!(!m.push_mod_audio("a", 1, &[0.1; 1], 48_000, None));
-        assert!(!m.push_mod_audio("a", 2, &[], 48_000, None));
-        assert!(!m.push_mod_audio("a", 2, &[0.1], 0, None));
+        assert!(m.push_mod_audio(&owner, "a", 1, &[0.1; 48_000], 48_000, None));
+        assert!(!m.push_mod_audio(&owner, "a", 1, &[0.1; 1], 48_000, None));
+        assert!(!m.push_mod_audio(&owner, "a", 2, &[], 48_000, None));
+        assert!(!m.push_mod_audio(&owner, "a", 2, &[0.1], 0, None));
     }
 
     #[test]
     fn mod_audio_is_panned_and_faded_by_where_it_was_spoken() {
         let mut m = Mixer::default();
+        let owner = Arc::new(());
         // Facing south (yaw 0), -X is the listener's right.
-        assert!(m.push_mod_audio("voice", 1, &[0.5; 16], 48_000, Some([-4.0, 0.0, 0.0])));
+        assert!(m.push_mod_audio(
+            &owner,
+            "voice",
+            1,
+            &[0.5; 16],
+            48_000,
+            Some([-4.0, 0.0, 0.0])
+        ));
         let mut data = vec![0.0f32; 16 * 2];
         mix(&mut m, &mut data, 2, 48_000);
         let left: f32 = data.chunks(2).map(|f| f[0]).sum();
         let right: f32 = data.chunks(2).map(|f| f[1]).sum();
         assert!(right > left, "right {right} should beat left {left}");
         // Past the range it is silent.
-        assert!(m.push_mod_audio("voice", 1, &[0.5; 16], 48_000, Some([0.0, 0.0, 60.0])));
+        assert!(m.push_mod_audio(
+            &owner,
+            "voice",
+            1,
+            &[0.5; 16],
+            48_000,
+            Some([0.0, 0.0, 60.0])
+        ));
         let mut data = vec![0.0f32; 16 * 2];
         mix(&mut m, &mut data, 2, 48_000);
         assert!(data.iter().all(|s| *s == 0.0));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn an_audio_device_probe_that_stops_does_not_block_later_scans() {
+        let root = ResourceSource::directory(Path::new("/nonexistent/horizon-test-assets").into());
+        let mut audio = Audio::silent(&root);
+        audio.output_requested = true;
+        let (send, receiver) = std::sync::mpsc::channel();
+        audio.device_probe = Some(receiver);
+        assert!(audio.should_change_device().is_none());
+        assert!(
+            audio.device_probe.is_some(),
+            "the running probe remains pending"
+        );
+
+        drop(send);
+        assert!(audio.should_change_device().is_none());
+        assert!(
+            audio.device_probe.is_none(),
+            "a stopped probe frees the next scan"
+        );
     }
 
     #[test]
@@ -3610,7 +4186,7 @@ mod tests {
             &|_, _| true,
         );
         audio.engine.loaded = true;
-        audio.backend.live = true;
+        audio.backend.output_live.store(true, Ordering::Release);
         audio
     }
 

@@ -311,7 +311,8 @@ impl Default for Settings {
 }
 fn put_f(f: &mut OptionsFile, key: &str, v: f32) {
     if v != f.double(key) as f32 {
-        f.set(key, V::Double(f64::from(v)));
+        // OptionsFile widens slider steps without losing their persisted precision.
+        f.set_f32(key, v);
     }
 }
 fn put_i(f: &mut OptionsFile, key: &str, v: i32) {
@@ -694,7 +695,12 @@ impl Settings {
             controller: self.controller.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
+            startup_api: self.startup_api,
             video_modes: self.video_modes.clone(),
+            fullbright_held: self.fullbright_held,
+            shader_packs: self.shader_packs.clone(),
+            shader_options: self.shader_options.clone(),
+            running_pack: self.running_pack.clone(),
             ..Self::from_file(file)
         };
         // Horizon's own bindings aren't in options.txt.
@@ -705,9 +711,16 @@ impl Settings {
     pub fn serialize(&self) -> String {
         self.to_file().serialize()
     }
-    pub fn save(&self, path: &Path) {
+    /// Save only options.txt and report failures before acknowledging an options command.
+    pub fn save_options(&self, path: &Path) -> std::io::Result<()> {
+        crate::config_file::write_atomic(path, self.serialize().as_bytes())?;
         self.describe_for_crashes();
-        if let Err(e) = fs::write(path, self.serialize()) {
+        Ok(())
+    }
+
+    pub fn save(&self, path: &Path) {
+        if let Err(e) = self.save_options(path) {
+            self.describe_for_crashes();
             log::warn!("Horizon: options.txt is not saved: {e}");
         }
         if let Some(dir) = path.parent() {
@@ -1082,6 +1095,32 @@ mod tests {
             Settings::load(&options).keys.get("key.emote"),
             "key.keyboard.b"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launcher_option_save_touches_only_options_txt_and_reports_failure() {
+        let dir = scratch("launcher-options-save");
+        let path = dir.join("options.txt");
+        let extras = dir.join(crate::extras::FILE);
+        fs::write(&extras, b"emoteKey:key.keyboard.g").unwrap();
+        let mut before = Settings::load(&path);
+        before.startup_api = crate::graphics::GraphicsApi::Vulkan;
+        before.fullbright_held = true;
+        before.running_pack = Some("Current shader".into());
+        let after = before.with_option("fov", "90").unwrap();
+        assert_eq!(after.keys.get("key.emote"), "key.keyboard.g");
+        assert_eq!(after.startup_api, before.startup_api);
+        assert!(after.fullbright_held);
+        assert_eq!(after.running_pack, before.running_pack);
+
+        fs::create_dir(&path).unwrap();
+        assert!(after.save_options(&path).is_err());
+        assert_eq!(fs::read(&extras).unwrap(), b"emoteKey:key.keyboard.g");
+        fs::remove_dir(&path).unwrap();
+        after.save_options(&path).unwrap();
+        assert_eq!(Settings::load(&path).fov, 90.0);
+        assert_eq!(fs::read(&extras).unwrap(), b"emoteKey:key.keyboard.g");
         let _ = fs::remove_dir_all(&dir);
     }
 

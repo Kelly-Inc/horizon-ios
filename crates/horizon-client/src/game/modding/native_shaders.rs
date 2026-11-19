@@ -20,7 +20,7 @@ use horizon_shader_api::{Manifest, Pack, Primaries, check};
 
 use super::{
     Game,
-    shader_packs::{PendingClassicPack, PickedPack},
+    shader_packs::{ClassicPack, PickedPack, classic_options_path},
 };
 
 const LOOK_EVERY: Duration = Duration::from_millis(500);
@@ -42,6 +42,18 @@ pub(super) fn outcome(path: &Path) -> Option<bool> {
 
 pub(super) fn remember(path: &Path, stamp: Option<u64>, draws: bool) {
     OUTCOMES.with_borrow_mut(|packs| packs.insert(path.to_owned(), (stamp, draws)));
+}
+
+/// Clear only this pack's cached refusal after an explicit retry.
+pub(super) fn clear_refusal(path: &Path) -> bool {
+    OUTCOMES.with_borrow_mut(|packs| {
+        if packs.get(path).is_some_and(|&(_, draws)| !draws) {
+            packs.remove(path);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Remembers a look at one of Horizon's own packs: its files were `taken`, or they failed
@@ -66,9 +78,9 @@ fn refused(path: &Path, stamp: Option<u64>) -> bool {
 pub(super) struct NativeShaders {
     /// The resolved pack path, of either kind (`game/interface/shader_packs.rs`); empty: none.
     pub picked: String,
-    /// The classic pack awaiting GPU compilation for the current renderer.
-    pub pending_classic: Option<PendingClassicPack>,
-    classic_refusal_checked_at: Option<Instant>,
+    /// The classic pack being compiled or running on the current renderer.
+    pub classic: Option<ClassicPack>,
+    classic_source_checked_at: Option<Instant>,
     /// The pack's files when it was last read (`fingerprint`).
     stamp: Option<u64>,
     looked: Option<Instant>,
@@ -133,14 +145,13 @@ impl NativeShaders {
 
     pub fn select(&mut self, name: &str) {
         self.picked = name.to_owned();
-        self.pending_classic = None;
-        self.classic_refusal_checked_at = None;
+        self.classic = None;
+        self.classic_source_checked_at = None;
         self.stamp = None;
         self.looked = None;
     }
 
-    /// Checks source bytes at load boundaries. A refused pack still selected by the
-    /// player gets a periodic check so it can recover when its files are replaced.
+    /// Check at load boundaries and periodically watch running ZIPs and refused packs.
     pub fn check_classic_source(
         &mut self,
         path: &Path,
@@ -150,24 +161,31 @@ impl NativeShaders {
         if parser_busy {
             return None;
         }
+        let loaded_stamp = if dimension_loaded {
+            self.classic
+                .as_ref()
+                .and_then(|pack| pack.watched_stamp(path))
+        } else {
+            None
+        };
         let was_refused = outcome(path) == Some(false);
-        if was_refused {
+        if was_refused || loaded_stamp.is_some() {
             let now = Instant::now();
             if self
-                .classic_refusal_checked_at
+                .classic_source_checked_at
                 .is_some_and(|last| now.duration_since(last) < LOOK_EVERY)
             {
                 return None;
             }
-            self.classic_refusal_checked_at = Some(now);
+            self.classic_source_checked_at = Some(now);
         } else {
-            self.classic_refusal_checked_at = None;
+            self.classic_source_checked_at = None;
             if dimension_loaded {
                 return None;
             }
         }
         let stamp = fingerprint(path);
-        if refused(path, stamp) {
+        if loaded_stamp == Some(stamp) || refused(path, stamp) {
             return None;
         }
         if was_refused {
@@ -242,7 +260,7 @@ impl Game<'_> {
     }
 
     /// Builds the pack at `path` when its files changed since it was last read.
-    pub(super) fn tick_native_shader_pack(&mut self, path: &Path) {
+    pub(in crate::game) fn tick_native_shader_pack(&mut self, path: &Path) {
         // A reload would replace the pack a `screenshot-sequence` draws: it waits for the reply.
         if self.screenshot_sequence.is_some() {
             return;
@@ -254,7 +272,21 @@ impl Game<'_> {
         }
         state.looked = Some(now);
         let stamp = fingerprint(path);
-        if stamp == state.stamp || refused(path, stamp) {
+        if stamp == state.stamp {
+            // A pack gone (no stamp) is never read: a renderer made again holds the world for
+            // nothing (`release_world`, which leaves a running pack's alone).
+            if stamp.is_none()
+                && let Some(renderer) = &mut self.renderer
+            {
+                renderer.release_world();
+            }
+            return;
+        }
+        if refused(path, stamp) {
+            // A renderer made again for this pack holds the world for it (`release_world`).
+            if let Some(renderer) = &mut self.renderer {
+                renderer.release_world();
+            }
             return;
         }
         let reload = state.stamp.is_some();
@@ -360,13 +392,20 @@ impl Game<'_> {
                     super::Dim::Nether => -1,
                     super::Dim::End => 1,
                 };
-                super::shader_packs::record_reload_error(&name, dimension, &problems);
                 if manifest_refused.is_some() {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.drop_shader_packs();
                     }
                     self.set_translucent_layers(Vec::new());
+                } else if let Some(renderer) = &mut self.renderer {
+                    renderer.release_world();
                 }
+                super::shader_packs::record_reload_error(
+                    &name,
+                    dimension,
+                    &problems,
+                    running && manifest_refused.is_none(),
+                );
                 log::warn!("shader pack {name} refused: {}", problems.join("; "));
                 self.system_message(Text::colored(format!("Shader pack {name} refused:"), RED));
                 for p in problems {
@@ -410,9 +449,16 @@ pub(super) fn fingerprint(path: &Path) -> Option<u64> {
     let mut hasher = std::hash::DefaultHasher::new();
     source_fingerprint::walk(path, &mut hasher)?;
     // The player's option values, when there are any.
-    if let Ok(manifest) = Pack::read_manifest(path) {
-        let values_pack = horizon_client::shader_pack_list::native_values_pack(path, &manifest.id);
-        let values = horizon_client::shader_pack_list::values_path(&values_pack);
+    let values = if horizon_shader_api::package::is_pack(path) {
+        Pack::read_manifest(path).ok().map(|manifest| {
+            let values_pack =
+                horizon_client::shader_pack_list::native_values_pack(path, &manifest.id);
+            horizon_client::shader_pack_list::values_path(&values_pack)
+        })
+    } else {
+        classic_options_path(path)
+    };
+    if let Some(values) = values.filter(|values| values.is_file()) {
         let _ = source_fingerprint::walk(&values, &mut hasher);
     }
     Some(hasher.finish())
@@ -450,6 +496,78 @@ mod tests {
     }
 
     #[test]
+    fn classic_options_changes_invalidate_the_shader_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Example.zip");
+        let options = super::classic_options_path(&path).unwrap();
+        std::fs::write(&path, b"synthetic shader source").unwrap();
+        let initial = super::fingerprint(&path).unwrap();
+
+        std::fs::write(&options, b"SHADOWS=true").unwrap();
+        let selected = super::fingerprint(&path).unwrap();
+        assert_ne!(initial, selected);
+        std::fs::write(&options, b"SHADOWS=false").unwrap();
+        assert_ne!(selected, super::fingerprint(&path).unwrap());
+
+        std::fs::remove_file(options).unwrap();
+        assert_eq!(initial, super::fingerprint(&path).unwrap());
+    }
+
+    #[test]
+    fn explicit_retry_rechecks_the_same_shader_files_once() {
+        use super::{NativeShaders, clear_refusal, fingerprint, outcome, remember};
+
+        let root = tempfile::tempdir().unwrap();
+        let failed = root.path().join("failed.zip");
+        let healthy = root.path().join("healthy.zip");
+        std::fs::write(&failed, "stable source").unwrap();
+        std::fs::write(&healthy, "different source").unwrap();
+        let stamp = fingerprint(&failed);
+        remember(&failed, stamp, false);
+        remember(&healthy, fingerprint(&healthy), true);
+
+        let mut state = NativeShaders::default();
+        assert_eq!(state.check_classic_source(&failed, false, false), None);
+        assert!(clear_refusal(&failed));
+        assert!(!clear_refusal(&failed));
+        assert!(!clear_refusal(&healthy));
+        assert_eq!(outcome(&healthy), Some(true));
+        assert_eq!(
+            state.check_classic_source(&failed, false, false),
+            Some(stamp)
+        );
+
+        remember(&failed, stamp, false);
+        assert_eq!(state.check_classic_source(&failed, false, false), None);
+    }
+
+    #[test]
+    fn a_dimension_refusal_expires_with_source_or_renderer_changes() {
+        use super::{ClassicPack, LOOK_EVERY, NativeShaders, fingerprint, outcome};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dimension-shaders.zip");
+        std::fs::write(&path, "initial source").unwrap();
+        let stamp = fingerprint(&path);
+        let mut state = NativeShaders {
+            classic: Some(ClassicPack::refusal(&path, stamp, "server:no_effects")),
+            ..NativeShaders::default()
+        };
+        assert_eq!(state.check_classic_source(&path, true, false), None);
+        assert_eq!(outcome(&path), None);
+        assert_eq!(state.check_classic_source(&path, false, false), Some(stamp));
+
+        state.classic_source_checked_at = Some(Instant::now() - LOOK_EVERY);
+        std::fs::write(&path, "different source with supported inputs").unwrap();
+        assert_ne!(fingerprint(&path), stamp);
+        assert_eq!(
+            state.check_classic_source(&path, true, false),
+            Some(fingerprint(&path))
+        );
+    }
+
+    #[test]
     fn classic_source_checks_only_at_load_boundaries_and_retries_changed_refusals() {
         use super::{LOOK_EVERY, NativeShaders, fingerprint, outcome, remember};
         use std::time::Instant;
@@ -473,13 +591,13 @@ mod tests {
 
         remember(&pack, original, false);
         assert_eq!(state.check_classic_source(&pack, true, false), None);
-        let checked_at = state.classic_refusal_checked_at;
+        let checked_at = state.classic_source_checked_at;
         assert!(checked_at.is_some());
         std::fs::write(&file, "a repaired source with a different size").unwrap();
         assert_eq!(state.check_classic_source(&pack, true, true), None);
-        assert_eq!(state.classic_refusal_checked_at, checked_at);
+        assert_eq!(state.classic_source_checked_at, checked_at);
 
-        state.classic_refusal_checked_at = Some(Instant::now() - LOOK_EVERY);
+        state.classic_source_checked_at = Some(Instant::now() - LOOK_EVERY);
         let replacement = fingerprint(&pack);
         assert_ne!(replacement, original);
         assert_eq!(

@@ -3,7 +3,7 @@
 //! beside glass and leaves, back faces, cardinal shading and max(self, above)
 //! light.
 use super::{
-    Info, MeshTables, Padded, QuadLighting, QuadState, SectionMesh, TerrainVertex, fluid_face,
+    Info, MeshTables, Padded, QuadLighting, QuadState, SectionMesh, TerrainVertex,
     lighting, pack_coords, pack_rgb, part_tables::PartTables, pi,
 };
 use horizon_core::{
@@ -228,7 +228,7 @@ pub(super) fn splits_north_east(nw: f32, ne: f32, sw: f32, se: f32) -> bool {
 pub(super) fn tesselate(
     tables: &MeshTables,
     parts: &PartTables,
-    (nether, shader_pack_lighting, _separate_ao, shader_pack): (bool, bool, bool, bool),
+    (nether, shader_pack_lighting, _separate_ao, shader_pack, looks): (bool, bool, bool, bool, bool),
     pad: &Padded,
     water_color: u32,
     out: &mut SectionMesh,
@@ -287,6 +287,11 @@ pub(super) fn tesselate(
         0
     } else {
         crate::mesher::hdr_tier("lava", 15)
+    };
+    let level = match kind {
+        FluidKind::Lava | FluidKind::FlowingLava => 15,
+        FluidKind::Mod(_) | FluidKind::ModFlowing(_) => me.emission,
+        _ => 0,
     };
     let color = |by: f32| {
         let rgb = [16, 8, 0].map(|shift| lighting::scale((tint >> shift & 255) as i32, by) as u32);
@@ -364,16 +369,18 @@ pub(super) fn tesselate(
     } else {
         (tables.lava_still, tables.lava_flow, None)
     };
-    let (target, states, sprite_layers) = if water {
+    let (target, states, target_looks, sprite_layers) = if water {
         (
             &mut out.translucent,
             &mut out.translucent_states,
+            &mut out.translucent_looks,
             &mut out.sprite_layers,
         )
     } else {
         (
             &mut out.solid,
             &mut out.solid_states,
+            &mut out.solid_looks,
             &mut out.sprite_layers,
         )
     };
@@ -387,7 +394,17 @@ pub(super) fn tesselate(
         if tables.is_animated(layer) && !sprite_layers.contains(&layer) {
             sprite_layers.push(layer);
         }
-        let shaded = fluid_face(color(shade), face);
+        if looks {
+            let look = super::QuadLook::new(tint, shade, face as u32, [1.0; 4]);
+            target_looks.resize(target.len() / 4, super::QuadLook::default());
+            target_looks.extend(std::iter::repeat_n(look, 1 + usize::from(back)));
+        }
+        let shaded = color(shade);
+        let shaded = if shader_pack {
+            super::for_shaders_format(shaded, Some(face))
+        } else {
+            super::as_fluid(super::giving_off(shaded, level))
+        };
         let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, shaded, light);
         let state = QuadState {
             lighting: Some(quad_lighting(color(1.0), shaded)),
@@ -624,7 +641,7 @@ mod tests {
             tesselate(
                 &tables,
                 &PartTables::NONE,
-                (false, false, true, false),
+                (false, false, true, false, false),
                 &pad,
                 0x00FF00,
                 &mut mesh,
@@ -660,7 +677,7 @@ mod tests {
         tesselate(
             &tables,
             &PartTables::NONE,
-            (false, false, true, false),
+            (false, false, true, false, false),
             &pad,
             0x00FF00,
             &mut mesh,
@@ -671,6 +688,113 @@ mod tests {
         layers.sort_unstable();
         layers.dedup();
         assert_eq!(layers, vec![11, 12, 13]);
+    }
+
+    /// A fluid side's look has the shade its colour has, the top's times the side's (0.72 and
+    /// 0.54 in the Nether), and so does a far tile's look of that side: a pack's `shade`
+    /// doesn't change where the far tiles begin.
+    #[test]
+    fn a_fluid_sides_look_has_the_far_tiles_shade() {
+        use horizon_assets::model::Direction as D;
+        let mut tables = super::super::part_tables_tests::tables(false);
+        let mut pad = Padded {
+            blocks: vec![0; super::super::P.pow(3)],
+            light: vec![0xF0; super::super::P.pow(3)],
+        };
+        pad.blocks[pi(0, 0, 0)] = 1;
+        for nether in [false, true] {
+            for kind in [FluidKind::Water, FluidKind::Lava] {
+                tables.info[1].fluid = FluidState::new(kind, 8, false);
+                let mut mesh = SectionMesh::default();
+                let keys = (nether, false, false, false, true);
+                tesselate(
+                    &tables,
+                    &PartTables::NONE,
+                    keys,
+                    &pad,
+                    0x3F76E4,
+                    &mut mesh,
+                    [0; 3],
+                    1,
+                );
+                let looks = [mesh.solid_looks, mesh.translucent_looks].concat();
+                for side in [D::North, D::South, D::West, D::East] {
+                    let far = crate::lod::far_look(1 + u8::from(nether), 0xFFFFFF, side, true);
+                    let shades: Vec<u32> = looks
+                        .iter()
+                        .filter(|l| l.0[0] >> 27 & 7 == side as u32)
+                        .map(|l| l.0[0] >> 24 & 7)
+                        .collect();
+                    assert!(!shades.is_empty(), "{kind:?} {side:?}");
+                    assert!(
+                        shades.iter().all(|&s| s == far[0] >> 24 & 7),
+                        "{kind:?} {side:?} nether {nether}: near {shades:?}, far {}",
+                        far[0] >> 24 & 7
+                    );
+                }
+            }
+        }
+    }
+
+    /// With a `shaders/` pack, a fluid's alpha is main's byte from before the light level and the
+    /// fluid flag: the tier's `15 - code` in the low four bits, 8 plus the quad's face in the high
+    /// four (`fluid_face`); else 6c's.
+    #[test]
+    fn a_fluids_alpha_is_the_old_byte_for_a_shaders_format_pack() {
+        let mut tables = super::super::part_tables_tests::tables(false);
+        let mut pad = Padded {
+            blocks: vec![0; super::super::P.pow(3)],
+            light: vec![0xF0; super::super::P.pow(3)],
+        };
+        pad.blocks[pi(0, 0, 0)] = 1;
+        for (kind, tier, level) in [
+            (FluidKind::Water, 0, 0u32),
+            (FluidKind::Lava, crate::mesher::hdr_tier("lava", 15), 15),
+        ] {
+            tables.info[1].fluid = FluidState::new(kind, 8, false);
+            let old = crate::mesher::emitting(0, tier) >> 24 | 0xF0;
+            for shader_pack in [false, true] {
+                let mut mesh = SectionMesh::default();
+                // With looks, for each quad's face; the vertices are the same without.
+                let keys = (false, false, false, shader_pack, true);
+                tesselate(
+                    &tables,
+                    &PartTables::NONE,
+                    keys,
+                    &pad,
+                    0x3F76E4,
+                    &mut mesh,
+                    [0; 3],
+                    1,
+                );
+                let quads = (mesh.solid.as_chunks::<4>().0.iter().zip(&mesh.solid_looks)).chain(
+                    mesh.translucent
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(&mesh.translucent_looks),
+                );
+                let mut faces = Vec::new();
+                for (quad, look) in quads {
+                    let face = look.0[0] >> 27 & 7;
+                    faces.push(face);
+                    // Main's `fluid_face(emitting(rgb, tier), face)`.
+                    let want = if shader_pack {
+                        0x80 | face << 4 | old & 0xF
+                    } else {
+                        (15 - level) << 4 | old & 0x7
+                    };
+                    let alphas = quad.map(|v| v.color >> 24);
+                    assert!(
+                        alphas.iter().all(|&a| a == want),
+                        "{kind:?} shader pack {shader_pack}, face {face}: {alphas:x?}, want {want:x}"
+                    );
+                }
+                faces.sort_unstable();
+                faces.dedup();
+                assert_eq!(faces, [0, 1, 2, 3, 4, 5], "{kind:?}");
+            }
+        }
     }
 
     #[test]

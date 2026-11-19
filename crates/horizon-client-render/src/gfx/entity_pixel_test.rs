@@ -558,20 +558,37 @@ pub fn render_pack(
     );
     let hud = HudBatch::scratch([SIZE; 2]);
     let mut encoder = device.create_command_encoder(&Default::default());
-    post.run(
-        &device,
-        &queue,
-        &mut encoder,
-        &world,
-        &depth,
-        &screen,
-        &probe_frame(&hud),
-        &Default::default(),
-        [SIZE; 2],
-        [SIZE; 2],
-        &[],
-        &mut |_, _, _, _| {},
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match post
+            .run(
+                &device,
+                &queue,
+                &mut encoder,
+                &world,
+                &depth,
+                &screen,
+                &probe_frame(&hud),
+                &Default::default(),
+                [SIZE; 2],
+                [SIZE; 2],
+                &[],
+                &mut |_, _, _, _| {},
+            )
+            .map_err(|error| format!("shader pack probe could not poll the GPU: {error}"))?
+        {
+            pack_post::ResizeState::Ready => break,
+            pack_post::ResizeState::Pending if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            state => {
+                return Err(format!(
+                    "shader pack probe did not render ({state:?}): {}",
+                    post.notes.join("; ")
+                ));
+            }
+        }
+    }
     let (color, read) = (screen.texture(), SIZE * 4);
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,

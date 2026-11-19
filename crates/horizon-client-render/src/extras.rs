@@ -407,7 +407,9 @@ impl Extras {
         if *self == Self::default() && stores_default && !path.exists() {
             return;
         }
-        let _ = fs::write(path, text);
+        if let Err(error) = crate::config_file::write_atomic(&path, text.as_bytes()) {
+            log::warn!("Horizon: {} was not saved: {error}", path.display());
+        }
     }
 }
 

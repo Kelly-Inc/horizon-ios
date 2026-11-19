@@ -69,9 +69,10 @@ impl Game{
  fn touch_click_context(&self)->Option<ClickContext>{Some(self.context((100.,50.),None))}
  fn context(&self,at:(f32,f32),surface:Option<(u64,(f32,f32))>)->ClickContext{ClickContext{at,screen_at:at,size:(600.,300.),screen:self.key,modifiers:self.modifiers,touch_shift:false,guard:horizon_client::widgets::capture_pointer(at),surface}}
  fn touch_raw_button(&mut self,b:MouseButton,down:bool)->Result<(),&'static str>{self.note();self.events.push(Event::Button(b,down));Ok(())}
- fn touch_act(&mut self,_:Vec<touch::Out>,_:f32)->Result<(),&'static str>{self.touch.hidden=!self.touch.hidden;Ok(())}
+ fn touch_act(&mut self,_:Vec<touch::Out>,_:f32,_:bool)->Result<(),&'static str>{self.touch.hidden=!self.touch.hidden;Ok(())}
  fn touch_key_held(&self,key:KeyCode)->bool{self.touch.native_keys.contains(&key)||self.touch.custom_keys.contains(&key)}
  fn touch_custom_activity(&mut self){}
+ fn touch_cancel_key(&mut self,key:KeyCode)->Result<(),&'static str>{self.touch_raw_key(key,false)}
  fn touch_custom_keyboard(&mut self,_:&dyn EventLoopCtl,key:KeyCode,down:bool){self.touch_raw_key(key,down).unwrap();}
  fn hardware_hides_touch(&self)->bool{false}
  fn touch_grab(&mut self){}

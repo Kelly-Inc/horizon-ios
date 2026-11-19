@@ -96,6 +96,70 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+// Limit owned string allocations as well as table entries: obsolete, rejected profile
+// payloads must not accumulate a server's worth of maximum-size properties.
+const SKIN_MEMO_BYTES: usize = 4 * 1024 * 1024;
+struct SkinMemo<K, V> {
+    values: std::collections::HashMap<K, (V, usize)>,
+    bytes: usize,
+}
+impl<K, V> Default for SkinMemo<K, V> {
+    fn default() -> Self {
+        Self {
+            values: std::collections::HashMap::new(),
+            bytes: 0,
+        }
+    }
+}
+impl<K: Eq + std::hash::Hash, V> SkinMemo<K, V> {
+    fn get(&self, key: &K) -> Option<&V> {
+        self.values.get(key).map(|(value, _)| value)
+    }
+    fn remember(&mut self, key: K, value: V, bytes: usize) {
+        if bytes > SKIN_MEMO_BYTES {
+            return;
+        }
+        if self.values.len() >= 4096 || bytes > SKIN_MEMO_BYTES.saturating_sub(self.bytes) {
+            self.values.clear();
+            self.bytes = 0;
+        }
+        if let Some((_, previous)) = self.values.insert(key, (value, bytes)) {
+            self.bytes -= previous;
+        }
+        self.bytes += bytes;
+    }
+}
+thread_local! {
+    static UNPACKED: std::cell::RefCell<SkinMemo<(String, u8), Textures>> =
+        std::cell::RefCell::default();
+    static LOCATIONS: std::cell::RefCell<SkinMemo<(String, String), String>> =
+        std::cell::RefCell::default();
+}
+
+/// [`unpack`] with [`texture_uris`], remembered by the payload. A frame resolves every drawn
+/// mannequin's skin, and decoding each one's base64 JSON again was most of that.
+pub fn unpack_known(value: &str, signature: Signature) -> Textures {
+    if value.len() > SKIN_MEMO_BYTES {
+        return unpack(value, signature, texture_uris());
+    }
+    let key = (value.to_owned(), signature as u8);
+    if let Some(textures) = UNPACKED.with_borrow(|known| known.get(&key).cloned()) {
+        return textures;
+    }
+    let textures = unpack(value, signature, texture_uris());
+    UNPACKED.with_borrow_mut(|known| {
+        let cached = textures.clone();
+        let bytes = key.0.capacity()
+            + [&cached.skin, &cached.cape, &cached.elytra]
+                .into_iter()
+                .flatten()
+                .map(String::capacity)
+                .sum::<usize>();
+        known.remember(key, cached, bytes);
+    });
+    textures
+}
+
 /// `unpackTextures(property)`: the textures of a `textures` property's
 /// base64 JSON payload.
 pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>]) -> Textures {
@@ -278,24 +342,37 @@ impl ResolvedProfile {
 #[derive(Clone, Debug)]
 pub enum Resolve {
     Pending,
-    /// The services' answer: `None` for no profile or no answer, which the
-    /// cache holds like any result (`Optional.empty`).
+    /// `None` stands for a missing profile or a temporary failure. The captured
+    /// lookup retains any retry deadline separately.
     Done(Option<ResolvedProfile>),
 }
 
 /// A caller's captured profile future. Its result outlives eviction from the
 /// shared resolver cache, as ClientMannequin.skinLookup does in vanilla.
 #[derive(Clone, Debug, Default)]
-pub struct ProfileLookup(std::sync::Arc<std::sync::OnceLock<Option<ResolvedProfile>>>);
+pub struct ProfileLookup(
+    Arc<std::sync::OnceLock<Result<Option<ResolvedProfile>, std::time::Instant>>>,
+);
 impl ProfileLookup {
     pub fn state(&self) -> Resolve {
         match self.0.get() {
-            Some(resolved) => Resolve::Done(resolved.clone()),
+            Some(Ok(resolved)) => Resolve::Done(resolved.clone()),
+            Some(Err(_)) => Resolve::Done(None),
             None => Resolve::Pending,
         }
     }
     fn complete(&self, resolved: Option<ResolvedProfile>) {
-        let _ = self.0.set(resolved);
+        let _ = self.0.set(Ok(resolved));
+    }
+    fn defer_retry(&self) {
+        let _ = self.0.set(Err(std::time::Instant::now() + PROFILE_RETRY));
+    }
+    /// When a rendering caller may replace this temporarily unavailable lookup.
+    pub fn retry_at(&self) -> Option<std::time::Instant> {
+        self.0.get().and_then(|result| result.as_ref().err().copied())
+    }
+    fn retry_due(&self) -> bool {
+        self.retry_at().is_some_and(|at| std::time::Instant::now() >= at)
     }
     fn completed(resolved: Option<ResolvedProfile>) -> Self {
         let lookup = Self::default();
@@ -334,6 +411,7 @@ struct RenderEntry {
 /// `ProfileResolver.Cached`'s cache bounds.
 const MAX_PROFILES: usize = 256;
 const PROFILE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const PROFILE_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 /// PlayerSkinRenderCache keeps rendering futures five minutes after access,
 /// independently of ProfileResolver's maximum of 256 service entries.
 const RENDER_PROFILE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
@@ -347,32 +425,35 @@ fn valid_player_name(name: &str) -> bool {
 /// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
 /// asked `unsigned=false` so the `textures` property is signed.
 fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
-    resolve_profile_cancellable(key, doc, &|| true)
+    resolve_profile_cancellable(key, doc, &|| true).ok().flatten()
 }
 fn resolve_profile_cancellable(
     key: &NameOrId,
     doc: &serde_json::Value,
     active: &impl Fn() -> bool,
-) -> Option<ResolvedProfile> {
-    if !active() {
-        return None;
-    }
+) -> Result<Option<ResolvedProfile>, ()> {
     let id = match key {
         NameOrId::Id(id) => *id,
         NameOrId::Name(name) => {
-            let url = crate::auth::endpoint(doc, "profiles", "getByName")?
+            let url = crate::auth::endpoint(doc, "profiles", "getByName")
+                .ok_or(())?
                 .replace("{name}", &name.to_lowercase());
-            let body = http_get_cancellable(&url, active)?;
-            let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
-            crate::auth::parse_uuid(v.get("id")?.as_str()?)?
+            let Some(body) = fetch_body(&url, active)? else {
+                return Ok(None);
+            };
+            let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+            v["id"].as_str().and_then(crate::auth::parse_uuid).ok_or(())?
         }
     };
-    let url = crate::auth::endpoint(doc, "session", "getProfileById")?
+    let url = crate::auth::endpoint(doc, "session", "getProfileById")
+        .ok_or(())?
         .replace("{profileId}", &format!("{id:032x}"));
     let separator = if url.contains('?') { '&' } else { '?' };
-    let body = http_get_cancellable(&format!("{url}{separator}unsigned=false"), active)?;
-    let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    Some(ResolvedProfile {
+    let Some(body) = fetch_body(&format!("{url}{separator}unsigned=false"), active)? else {
+        return Ok(None);
+    };
+    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+    let profile = (|| Some(ResolvedProfile {
         id: crate::auth::parse_uuid(v.get("id")?.as_str()?)?,
         name: v.get("name")?.as_str()?.to_owned(),
         properties: v
@@ -389,7 +470,8 @@ fn resolve_profile_cancellable(
                 ))
             })
             .collect::<Option<Vec<_>>>()?,
-    })
+    }))();
+    profile.ok_or(()).map(Some)
 }
 
 impl Default for Resolver {
@@ -478,7 +560,9 @@ impl Resolver {
         if let Some(entry) = self
             .render_entries
             .get_mut(key)
-            .filter(|entry| entry.touched.elapsed() < RENDER_PROFILE_TTL)
+            .filter(|entry| {
+                entry.touched.elapsed() < RENDER_PROFILE_TTL && !entry.lookup.retry_due()
+            })
         {
             entry.touched = std::time::Instant::now();
             return entry.lookup.state();
@@ -497,7 +581,9 @@ impl Resolver {
     /// How the shared cache's resolution stands, starting it the first time.
     pub fn state(&mut self, key: &NameOrId) -> Resolve {
         self.poll();
-        if let Some(entry) = self.entries.get_mut(key) {
+        if let Some(entry) = self.entries.get_mut(key)
+            && !entry.lookup.retry_due()
+        {
             entry.touched = std::time::Instant::now();
             return entry.lookup.state();
         }
@@ -532,11 +618,14 @@ impl Resolver {
                 let resolved = active()
                     .then(crate::auth::discovery)
                     .and_then(Result::ok)
-                    .filter(|_| active())
+                    .ok_or(())
                     .and_then(|doc| resolve_profile_cancellable(&key, &doc, &active));
-                // Captured futures settle even after cache eviction. A canceled
-                // game can settle its old future but cannot publish another fetch.
-                lookup.complete(if active() { resolved } else { None });
+                // Settle even evicted futures. A canceled game cannot start another fetch.
+                match (active(), resolved) {
+                    (false, _) => lookup.complete(None),
+                    (true, Ok(profile)) => lookup.complete(profile),
+                    (true, Err(())) => lookup.defer_retry(),
+                }
                 let _ = send.send((key, request, lookup));
             },
             move || canceled.complete(None),
@@ -869,10 +958,28 @@ pub fn elytra_location(hash: &str) -> String {
     location("elytra/", hash)
 }
 
-fn location(folder: &str, hash: &str) -> String {
+fn location(prefix: &str, hash: &str) -> String {
+    // Remembered: every frame resolves every drawn player's skin, and the SHA-1 and its hex
+    // each time were most of that.
+    if hash.len() > SKIN_MEMO_BYTES {
+        return location_of(prefix, hash);
+    }
+    let key = (prefix.to_owned(), hash.to_owned());
+    if let Some(known) = LOCATIONS.with_borrow(|known| known.get(&key).cloned()) {
+        return known;
+    }
+    let out = location_of(prefix, hash);
+    LOCATIONS.with_borrow_mut(|known| {
+        let cached = out.clone();
+        let bytes = key.0.capacity() + key.1.capacity() + cached.capacity();
+        known.remember(key, cached, bytes);
+    });
+    out
+}
+fn location_of(prefix: &str, hash: &str) -> String {
     let units: Vec<u8> = hash.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let digest = sha1(&units);
-    let mut out = String::from(folder);
+    let mut out = String::from(prefix);
     for b in digest {
         out.push_str(&format!("{b:02x}"));
     }
@@ -1803,27 +1910,36 @@ fn http_get(url: &str) -> Option<Vec<u8>> {
     http_get_cancellable(url, &|| true)
 }
 fn http_get_cancellable(url: &str, active: &impl Fn() -> bool) -> Option<Vec<u8>> {
+    fetch_body(url, active).ok().flatten()
+}
+
+fn fetch_body(url: &str, active: &impl Fn() -> bool) -> Result<Option<Vec<u8>>, ()> {
     use std::io::Read;
     if !active() {
-        return None;
+        return Err(());
     }
-    let response = ureq::AgentBuilder::new()
+    let response = match ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent("Java")
         .build()
         .get(url)
         .call()
-        .ok()?;
+    {
+        Ok(response) if response.status() == 204 => return Ok(None),
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Ok(response) => response,
+        Err(_) => return Err(()),
+    };
     if !active() {
-        return None;
+        return Err(());
     }
     let mut body = Vec::new();
     response
         .into_reader()
         .take(16 << 20)
         .read_to_end(&mut body)
-        .ok()?;
-    active().then_some(body)
+        .map_err(|_| ())?;
+    active().then_some(Some(body)).ok_or(())
 }
 
 /// The textures of an Ely.by `textures/<name>` answer: `{"SKIN":{"url":…,"metadata":{"model":"slim"}},"CAPE":…}`.
@@ -2515,9 +2631,23 @@ mod tests {
             .send((key.clone(), 2, ProfileLookup::completed(None)))
             .unwrap();
         assert!(matches!(cache.state(&key), Resolve::Done(None)));
-        // A genuine missing-profile answer remains cached, as before; this
-        // repair does not introduce a new per-frame network retry policy.
+        // A genuine missing-profile answer stays cached.
         assert!(matches!(cache.state(&key), Resolve::Done(None)));
+
+        // Stop the worker pool to exercise the retry decision without network IO.
+        assert!(cache.shutdown());
+        let failed = ProfileLookup::default();
+        failed.0.set(Err(now + super::PROFILE_RETRY)).unwrap();
+        cache.entries.get_mut(&key).unwrap().lookup = failed.clone();
+        assert!(matches!(cache.render_state(&key), Resolve::Done(None)));
+        assert!(cache.lookup(&key).retry_at().is_some());
+
+        let expired = ProfileLookup::default();
+        expired.0.set(Err(now)).unwrap();
+        cache.entries.get_mut(&key).unwrap().lookup = expired.clone();
+        cache.render_entries.get_mut(&key).unwrap().lookup = expired;
+        assert!(matches!(cache.render_state(&key), Resolve::Done(None)));
+        assert!(cache.lookup(&key).retry_at().is_none());
     }
 
     #[test]
@@ -2828,6 +2958,167 @@ mod tests {
         assert!(super::read_offline_skin(&file, "slim").is_err());
         assert!(super::read_offline_skin(&dir.join("missing.png"), "").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_skins_keep_payload_signature_and_location() {
+        use super::{
+            Signature, Textures, cape_location, skin_location, texture_uris, unpack_known,
+        };
+        use base64::Engine;
+        let url = texture_uris()[0].replace("{textureId}", "");
+        let skin_url = format!("{url}skin");
+        let cape_url = format!("{url}cape");
+        let elytra_url = format!("{url}elytra");
+        let json = serde_json::json!({"textures": {
+            "SKIN": {"url": skin_url, "metadata": {"model": "slim"}},
+            "CAPE": {"url": cape_url},
+            "ELYTRA": {"url": elytra_url},
+        }});
+        let value = base64::engine::general_purpose::STANDARD.encode(json.to_string());
+        let mut expected = Textures {
+            skin: Some(skin_url),
+            slim: true,
+            cape: Some(cape_url),
+            elytra: Some(elytra_url),
+            signed: false,
+        };
+        let hash = "abc";
+        let skin = super::location_of("skins/", hash);
+        let cape = super::location_of("capes/", hash);
+        for _ in 0..2 {
+            for signature in [Signature::Unsigned, Signature::Signed, Signature::Invalid] {
+                expected.signed = signature == Signature::Signed;
+                assert_eq!(unpack_known(&value, signature), expected);
+                assert_eq!(unpack_known("not base64!", signature), Textures::default());
+            }
+            assert_eq!(skin_location(hash), skin);
+            assert_eq!(cape_location(hash), cape);
+        }
+    }
+
+    #[test]
+    fn cached_skins_bound_obsolete_string_allocations() {
+        use super::{LOCATIONS, SKIN_MEMO_BYTES, Signature, Textures, UNPACKED};
+        UNPACKED.with_borrow_mut(|memo| *memo = Default::default());
+        LOCATIONS.with_borrow_mut(|memo| *memo = Default::default());
+        // Each rejected payload fits Property's 32767 UTF-16-unit network limit.
+        let padding = "\u{0800}".repeat(32759);
+        let mut first = String::new();
+        for i in 0..64 {
+            let value = format!("{i:08}{padding}");
+            if i == 0 {
+                first = value.clone();
+            }
+            assert_eq!(
+                super::unpack_known(&value, Signature::Unsigned),
+                Textures::default()
+            );
+            assert_eq!(
+                super::skin_location(&value),
+                super::location_of("skins/", &value)
+            );
+        }
+        UNPACKED.with_borrow(|memo| {
+            let bytes: usize = memo.values.keys().map(|(value, _)| value.capacity()).sum();
+            assert!(
+                bytes <= SKIN_MEMO_BYTES,
+                "rejected payloads retained {bytes} bytes"
+            );
+            assert!(
+                memo.get(&(first.clone(), Signature::Unsigned as u8))
+                    .is_none()
+            );
+        });
+        LOCATIONS.with_borrow(|memo| {
+            let bytes: usize = memo
+                .values
+                .iter()
+                .map(|((prefix, hash), (location, _))| {
+                    prefix.capacity() + hash.capacity() + location.capacity()
+                })
+                .sum();
+            assert!(bytes <= SKIN_MEMO_BYTES, "locations retained {bytes} bytes");
+            assert!(memo.get(&("skins/".to_owned(), first)).is_none());
+        });
+        // Bypassing retention is not rejecting input or changing its result.
+        let huge = "!".repeat(SKIN_MEMO_BYTES + 1);
+        assert_eq!(
+            super::unpack_known(&huge, Signature::Unsigned),
+            Textures::default()
+        );
+        assert_eq!(
+            super::skin_location(&huge),
+            super::location_of("skins/", &huge)
+        );
+    }
+
+    // Set HORIZON_MEASURE_SKINS=1 and run this test with --nocapture to print the timings.
+    #[test]
+    fn measure_repeated_skin_lookups() {
+        if std::env::var("HORIZON_MEASURE_SKINS").as_deref() != Ok("1") {
+            return;
+        }
+        use super::{Signature, location_of, skin_location, texture_uris, unpack, unpack_known};
+        use base64::Engine;
+        use std::{hint::black_box, time::Instant};
+
+        const RUNS: usize = 21;
+        const CALLS: usize = 256;
+        fn measure<T>(mut call: impl FnMut() -> T) -> u128 {
+            let start = Instant::now();
+            for _ in 0..CALLS {
+                black_box(call());
+            }
+            start.elapsed().as_nanos() / CALLS as u128
+        }
+
+        let hash = "abcdef0123456789";
+        let uri = texture_uris()[0].replace("{textureId}", "");
+        let payload = serde_json::json!({"textures":{"SKIN":{
+            "url":format!("{uri}{hash}"), "metadata":{"model":"slim"}
+        }}});
+        let value = base64::engine::general_purpose::STANDARD.encode(payload.to_string());
+        let decode = || measure(|| unpack(black_box(&value), Signature::Unsigned, texture_uris()));
+        let recall = || measure(|| unpack_known(black_box(&value), Signature::Unsigned));
+        let compute = || measure(|| location_of("skins/", black_box(hash)));
+        let lookup = || measure(|| skin_location(black_box(hash)));
+        for _ in 0..2 {
+            decode();
+            recall();
+            compute();
+            lookup();
+        }
+        let mut samples = [[0; RUNS]; 4];
+        for run in 0..RUNS {
+            let (decode_ns, recall_ns, compute_ns, lookup_ns) = if run % 2 == 0 {
+                (decode(), recall(), compute(), lookup())
+            } else {
+                let (lookup_ns, compute_ns, recall_ns, decode_ns) =
+                    (lookup(), compute(), recall(), decode());
+                (decode_ns, recall_ns, compute_ns, lookup_ns)
+            };
+            for (series, nanos) in samples
+                .iter_mut()
+                .zip([decode_ns, recall_ns, compute_ns, lookup_ns])
+            {
+                series[run] = nanos;
+            }
+        }
+        println!("one textures payload and skin hash, {RUNS} runs of {CALLS} calls");
+        for (name, mut series) in ["unpack", "unpack_cached", "location", "location_cached"]
+            .into_iter()
+            .zip(samples)
+        {
+            series.sort_unstable();
+            let p95 = (RUNS * 95).div_ceil(100) - 1;
+            println!(
+                "{name}_ns median={} p95={} worst={}",
+                series[RUNS / 2],
+                series[p95],
+                series[RUNS - 1]
+            );
+        }
     }
 
     /// `MinecraftServicesDiscoveryService`: another environment's document

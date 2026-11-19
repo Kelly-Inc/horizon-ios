@@ -52,7 +52,11 @@ struct HomeView: View {
                                         .padding(.horizontal, 16)
                                         .foregroundStyle(tab == item ? Theme.accent : Theme.textMuted)
                                         .background(tab == item ? Theme.notice : .clear, in: RoundedRectangle(cornerRadius: 18))
-                                }.buttonStyle(.plain).accessibilityIdentifier("launcher-nav-" + item.rawValue)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("launcher-nav-" + item.rawValue)
+                                .accessibilityAddTraits(tab == item ? .isSelected : [])
                             }
                         }
                         Spacer()
@@ -60,6 +64,7 @@ struct HomeView: View {
                     .padding(20).padding(.top, 12)
                     .background(Theme.background)
                     .navigationSplitViewColumnWidth(min: 210, ideal: 240, max: 280)
+                    .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("launcher-navigation-rail")
                 } detail: {
                     NavigationStack { destination(tab) }
@@ -83,6 +88,8 @@ struct HomeView: View {
             GameFilesRecovery(download: download, version: link.version,
                               signedIn: account.profile != nil,
                               repairing: link.repairingGameFiles,
+                              engineProblem: link.gameFilesProblem,
+                              retryLoader: link.retryInstalledFiles,
                               configureManually: {
                                   tab = .settings
                                   link.requestingGameFiles = false
@@ -90,10 +97,7 @@ struct HomeView: View {
         }
         .onChange(of: download.state) { state in
             if case .done = state {
-                Task {
-                    await link.refresh()
-                    if GameFolder.hasGameFiles { link.requestingGameFiles = false }
-                }
+                Task { await link.refresh() }
             }
         }
         .alert("Something went wrong", isPresented: Binding(
@@ -105,11 +109,20 @@ struct HomeView: View {
         }
         .task {
             link.uncover = onPlay
+            link.gameFilesSetupBusy = { [weak download = self.download] in download?.busy == true }
             link.prepareSession = { try await account.handOver() }
             await link.watch()
         }
-        .task(id: link.phase) {
-            if link.phase == .waiting { await download.startAutomaticallyIfNeeded() }
+        .onAppear(perform: startAutomaticSetupIfNeeded)
+        .onChange(of: shouldAutomaticallyDownload) { _ in startAutomaticSetupIfNeeded() }
+    }
+
+    private func startAutomaticSetupIfNeeded() {
+        guard shouldAutomaticallyDownload else { return }
+        // The download model owns setup across transient SwiftUI view changes.
+        Task {
+            guard shouldAutomaticallyDownload else { return }
+            await download.startAutomaticallyIfNeeded()
         }
     }
 
@@ -147,7 +160,7 @@ struct HomeView: View {
     }
 
     private func destination(_ item: Destination) -> some View {
-        page {
+        LauncherScrollPage(refresh: { await link.refresh() }) {
             VStack(alignment: .leading, spacing: 26) {
                 pageHeading(item)
                 switch item {
@@ -156,7 +169,7 @@ struct HomeView: View {
                 case .settings:
                     VStack(spacing: 24) {
                         SettingsPage(link: link, download: download)
-                        NavigationLink { page { GalleryPage() }.navigationTitle("Screenshots") } label: {
+                        NavigationLink { GalleryPage().navigationTitle("Screenshots") } label: {
                             Label("Screenshots", systemImage: "photo.on.rectangle")
                                 .frame(maxWidth: .infinity, alignment: .leading).padding(16).card()
                         }
@@ -169,24 +182,12 @@ struct HomeView: View {
         .toolbarBackground(.hidden, for: .navigationBar)
     }
 
-    private func page<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        ScrollView {
-            content()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(sizeClass == .regular ? 32 : 20)
-                .frame(maxWidth: sizeClass == .regular ? 1200 : 700)
-                .frame(maxWidth: .infinity)
-        }
-        .background(Theme.background)
-        .refreshable { await link.refresh() }
-    }
-
     private var home: some View {
         VStack(alignment: .leading, spacing: 28) {
             launchPanel
             if needsFiles {
                 GameFilesCard(download: download, missing: true, repairing: link.repairingGameFiles,
-                              setupHelp: { link.requestingGameFiles = true })
+                              setupHelp: { link.requestingGameFiles = true }, retryLoader: link.retryInstalledFiles)
             }
         }
     }
@@ -230,12 +231,18 @@ struct HomeView: View {
                 .controlSize(.large)
                 .launcherPrimaryButton()
                 .tint(Theme.accent)
-                .disabled(!needsFiles && (download.busy || link.launching != nil))
+                .disabled(link.phase == .unknown || (!needsFiles && (link.cleaningUpCache || download.busy || link.launching != nil)))
                 .accessibilityIdentifier("launcher-play-button")
                 if link.launching != nil {
                     Button("Cancel") { link.cancelLaunch() }.foregroundStyle(.white).frame(minHeight: 44)
                 }
                 Spacer(minLength: 0)
+            }
+            if let error = link.startupStatusError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .accessibilityIdentifier("launcher-startup-status-error")
             }
             if needsFiles, download.automaticFailure != nil {
                 VStack(alignment: .leading, spacing: 6) {
@@ -263,8 +270,18 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 28))
     }
 
-    private var playLabel: String { needsFiles ? "Game files needed" : (link.launching ?? "Play") }
+    private var playLabel: String {
+        if link.phase == .unknown {
+            return link.startupStatusError == nil ? "Checking game files…" : "Game status unavailable"
+        }
+        // Keep the relevant action available alongside a temporary status warning.
+        if needsFiles { return "Game files needed" }
+        return link.launching ?? (link.cleaningUpCache ? "Finishing cleanup…" : "Play")
+    }
     private var needsFiles: Bool { link.needsGameFiles }
+    private var shouldAutomaticallyDownload: Bool {
+        link.phase == .waiting && !link.cleaningUpCache && needsFiles && !link.repairingGameFiles
+    }
 
     private var accountSheet: some View {
         NavigationStack {

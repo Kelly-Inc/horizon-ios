@@ -62,7 +62,7 @@ fn delayed_decode_keeps_both_overlay_and_source_after_reload() {
     let mut audio = Audio::silent(&ResourceSource::directory(root.clone()));
     let owner = audio.backend.work_owner.clone();
     let old_cache = audio.backend.cache.clone();
-    audio.backend.live = true;
+    audio.backend_live_for_bench();
     let (send, receive) = mpsc::channel();
     audio.backend.decoder = Some(send);
     let channel = audio.backend.create(false).unwrap();
@@ -171,7 +171,7 @@ fn stream_read_from_prepared_base_finishes_before_the_retirement_gate_opens() {
     ready.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(!audio.shutdown_workers());
     assert!(
-        !audio.backend.live,
+        !audio.backend.is_live(),
         "no new decode can start while shutting down"
     );
     drop(audio);

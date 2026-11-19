@@ -59,7 +59,7 @@ const RELOAD_LINES:[&str;0]=[];
 struct Settings{resource_packs:Vec<String>,mods:Mods,force_unicode:bool,japanese_glyphs:bool}
 struct Ui{vanilla_root:PathBuf}
 struct Options{dev_mods:Vec<PathBuf>,resources:PathBuf,execution_role:()}
-struct ServerPacks{active:Vec<()>}
+struct ServerPacks{active:Vec<u8>,pending_active:Option<Vec<u8>>}
 mod mods{pub fn register_fluid_models(_:()){}pub mod catalog{
  #[derive(Clone,Default,PartialEq)]pub struct Selection(pub u32);
  #[derive(Default)]pub struct Catalog{pub id:u32}
@@ -74,15 +74,17 @@ impl Game{
  // The input-block behavior has its own production-hook fixture. Here its
  // synchronous boundary is counted while the ownership hooks run unchanged.
  fn begin_reload_input_block(&mut self){self.input_blocks+=1;}
- fn new()->Self{Self{keys:vec![],physical_keys:vec![],left:false,right:false,ui:Ui{vanilla_root:PathBuf::new()},settings:Settings{resource_packs:vec![],mods:Mods{enabled:vec![]},force_unicode:false,japanese_glyphs:false},server_packs:ServerPacks{active:vec![]},options:Options{execution_role:(),dev_mods:vec![],resources:import::home().join("resources")},pack:Pack{source:(),data_source:(),data_changes:(),additional_data:vec![],assets:Arc::new(()),context:(),content:None},res:Arc::new(()),pack_reload:None,mods:ModsState{content:Some(Arc::new(mods::PreparedContent{selection:Selection(1),catalog:Arc::new(Catalog{id:3})})),catalog:Some(Arc::new(Catalog{id:7})),pending:Some(Selection(9))},remote:None,integrated:None,world_root:PathBuf::new(),input_blocks:0}}
+ fn new()->Self{Self{keys:vec![],physical_keys:vec![],left:false,right:false,ui:Ui{vanilla_root:PathBuf::new()},settings:Settings{resource_packs:vec![],mods:Mods{enabled:vec![]},force_unicode:false,japanese_glyphs:false},server_packs:ServerPacks{active:vec![1],pending_active:Some(vec![2])},options:Options{execution_role:(),dev_mods:vec![],resources:import::home().join("resources")},pack:Pack{source:(),data_source:(),data_changes:(),additional_data:vec![],assets:Arc::new(()),context:(),content:None},res:Arc::new(()),pack_reload:None,mods:ModsState{content:Some(Arc::new(mods::PreparedContent{selection:Selection(1),catalog:Arc::new(Catalog{id:3})})),catalog:Some(Arc::new(Catalog{id:7})),pending:Some(Selection(9))},remote:None,integrated:None,world_root:PathBuf::new(),input_blocks:0}}
 }
 static CORE:Mutex<String>=Mutex::new(String::new());
 static SELECTIONS:Mutex<Vec<(u32,u32)>>=Mutex::new(Vec::new());
+static SERVER_LISTS:Mutex<Vec<Vec<u8>>>=Mutex::new(Vec::new());
 '''
 
 STAGE = r'''
-fn stage_pack(root:&Path,_:&Vec<String>,_:&Vec<()>,selection:&Selection,catalog:Arc<Catalog>,_:&ModsState,_:(),_:&[()],_:&[()],_:&Arc<()>,_:&Arc<()>,_:&(),_:bool,_:bool,_:&Progress)->Result<StagedPack>{
+fn stage_pack(root:&Path,_:&Vec<String>,server:&Vec<u8>,selection:&Selection,catalog:Arc<Catalog>,_:&ModsState,_:(),_:&[()],_:&[()],_:&Arc<()>,_:&Arc<()>,_:&(),_:bool,_:bool,_:&Progress)->Result<StagedPack>{
  SELECTIONS.lock().unwrap().push((selection.0,catalog.id));
+ SERVER_LISTS.lock().unwrap().push(server.clone());
  *CORE.lock().unwrap()=fs::read_to_string(root.join("generation"))?;
  Ok(StagedPack{STAGED_FIELDS})
 }
@@ -121,11 +123,12 @@ fn main(){
  assert_eq!(core,applied);assert_eq!(fs::read_to_string(home.join("resources/generation")).unwrap(),"after");
  // Discarding a completed worker also releases ownership; no UI apply is needed.
  game.remote=Some(());
- game.spawn_pack_reload(production::ReloadKind::Selection).unwrap();
+ game.spawn_pack_reload(production::ReloadKind::Server).unwrap();
  let deadline=Instant::now()+Duration::from_secs(3);while !production::worker_done(&game){assert!(Instant::now()<deadline);std::thread::yield_now();}
  let(thread,finished)=writer(home);assert!(finished.recv_timeout(Duration::from_millis(150)).is_err());
  production::discard(&mut game);finished.recv_timeout(Duration::from_secs(3)).unwrap();thread.join().unwrap();
  assert_eq!(*SELECTIONS.lock().unwrap(),vec![(9,7),(1,3)],"remote server reload retains its applied content instead of pending local selection");assert_eq!(game.input_blocks,2);
+ assert_eq!(*SERVER_LISTS.lock().unwrap(), vec![vec![1], vec![2]]);
 }
 '''
 

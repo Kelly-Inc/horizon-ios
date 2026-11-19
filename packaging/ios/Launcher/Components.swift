@@ -1,6 +1,25 @@
 import SwiftUI
 import UIKit
 
+/// A launcher destination with shared margins and a page-specific refresh action.
+struct LauncherScrollPage<Content: View>: View {
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    let refresh: () async -> Void
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        ScrollView {
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(sizeClass == .regular ? 32 : 20)
+                .frame(maxWidth: sizeClass == .regular ? 1200 : 700)
+                .frame(maxWidth: .infinity)
+        }
+        .background(Theme.background)
+        .refreshable { await refresh() }
+    }
+}
+
 /// A labelled text field in the launcher's look.
 struct Field: View {
     let title: String

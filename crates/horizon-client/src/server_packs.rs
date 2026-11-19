@@ -8,7 +8,10 @@ pub mod download;
 
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 // Download workers can outlive a connection or a replaced manager. Never
@@ -72,7 +75,7 @@ pub fn parse_sha1(hash: &str) -> Option<String> {
 }
 
 /// One pack to download (`DownloadQueue.DownloadRequest`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Request {
     /// The server's UUID, used for protocol reports and cache directories.
     pub id: u128,
@@ -80,7 +83,21 @@ pub struct Request {
     pub key: u64,
     pub url: String,
     pub sha1: Option<String>,
+    cancelled: Arc<AtomicBool>,
 }
+
+impl Request {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for Request {
+    fn eq(&self, other: &Self) -> bool {
+        (self.id, self.key, &self.url, &self.sha1) == (other.id, other.key, &other.url, &other.sha1)
+    }
+}
+impl Eq for Request {}
 
 /// `DownloadQueue.BatchResult`: the file each downloaded pack is in, and the
 /// packs that failed.
@@ -153,10 +170,12 @@ struct Pack {
     download: Download,
     activation: Activation,
     accepted: bool,
+    cancelled: Arc<AtomicBool>,
 }
 impl Pack {
     fn remove(&mut self, reason: Removal) {
         self.removal.get_or_insert(reason);
+        self.cancelled.store(true, Ordering::Relaxed);
     }
     fn removed(&self) -> bool {
         self.removal.is_some()
@@ -178,8 +197,6 @@ struct Reload {
 pub struct ServerPacks {
     packs: Vec<Pack>,
     next_generation: u64,
-    /// The native download queue completes batches in request order. Retain each batch's
-    /// pack identities even after replacement/disconnect removes those packs from `packs`.
     prompt: Prompt,
     reload: Option<Reload>,
     /// `registerForUpdate`: something changed, [`Self::tick`] again.
@@ -202,6 +219,12 @@ impl Default for ServerPacks {
         }
     }
 }
+impl Drop for ServerPacks {
+    fn drop(&mut self) {
+        self.pop_all();
+    }
+}
+
 impl ServerPacks {
     fn generation(&mut self) -> Generation {
         let generation = Generation(self.next_generation);
@@ -270,6 +293,7 @@ impl ServerPacks {
             download: Download::Requested,
             activation: Activation::Inactive,
             accepted: false,
+            cancelled: Arc::default(),
         });
         if self.prompt == Prompt::Allowed {
             self.accept(self.packs.len() - 1);
@@ -299,6 +323,7 @@ impl ServerPacks {
             download: Download::Done,
             activation: Activation::Inactive,
             accepted: false,
+            cancelled: Arc::default(),
         });
         if self.prompt == Prompt::Allowed {
             self.accept(self.packs.len() - 1);
@@ -361,6 +386,7 @@ impl ServerPacks {
                     key: pack.key,
                     url: pack.url.clone(),
                     sha1: pack.sha1.clone(),
+                    cancelled: pack.cancelled.clone(),
                 });
             }
         }

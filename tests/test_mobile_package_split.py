@@ -43,7 +43,9 @@ class MobilePackageSplitTests(unittest.TestCase):
             source = (ROOT / path).read_text()
             self.assertIn('-p horizon-official --no-default-features --features audio,horizon-extras', source)
         project = (ROOT / 'packaging/ios/project.yml').read_text()
-        self.assertIn('release/horizon-official', project)
+        # Both build phases must resolve the same executable. The toolchain
+        # regression executes these phases with Cargo's non-default target dir.
+        self.assertEqual(project.count('bash tools/ci/ios-game-artifact.sh "$IOS_TARGET"'), 2)
         for package, dependency in [('horizon-official', 'horizon-game'), ('horizon-game', 'horizon-client')]:
             data = manifest(package)
             self.assertFalse(data['dependencies'][dependency]['default-features'])

@@ -87,6 +87,20 @@ impl Game<'_> {
         if !self.key_focus_screen() || self.key_focus_blocked() {
             return false;
         }
+        if key == KeyCode::Tab && self.screen == Screen::Playing {
+            let ctrl = self.has_control_down_with_quirk();
+            let shift = self.has_shift_down();
+            if let Some(sound) = self
+                .title
+                .as_mut()
+                .and_then(|title| title.tab_bar_key(key, ctrl, shift))
+            {
+                if sound {
+                    self.audio.play_button_click();
+                }
+                return true;
+            }
+        }
         let targets = self.key_targets();
         if targets.is_empty() {
             return false;
@@ -175,6 +189,11 @@ impl Game<'_> {
         let container =
             self.title.is_none() && matches!(self.screen, Screen::Inventory | Screen::Creative);
         !key_focus::passes_on(act, container)
+    }
+
+    /// A held direction belongs to either the on-screen keyboard or its menu.
+    pub(super) fn pad_repeat_owner(&self) -> (u64, bool) {
+        (self.key_screen(), self.pad.menu.osk.is_some())
     }
 
     /// Which screen is open, as far as the keyboard's focus cares.
@@ -351,6 +370,10 @@ impl Game<'_> {
     /// Each poll: what a click focused is forgotten once it is gone (the
     /// screen changed), and out of menus.
     pub(super) fn key_focus_frame(&mut self) {
+        if self.pad.menu.osk.is_some() && !self.text_field_focused() {
+            self.pad.menu.osk = None;
+            self.pad.menu.osk_dismissed = true;
+        }
         let Some(origin) = self.pad.menu.origin else {
             return;
         };

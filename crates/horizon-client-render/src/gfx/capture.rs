@@ -30,6 +30,98 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Encode on the destination volume.
+pub(super) fn stage_screenshot(
+    path: &Path,
+    encode: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<tempfile::NamedTempFile> {
+    let directory = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(directory)?;
+    encode(staged.as_file_mut())?;
+    staged.as_file().sync_all()?;
+    Ok(staged)
+}
+
+pub(super) fn persist_screenshot(
+    staged: tempfile::NamedTempFile,
+    path: &Path,
+) -> std::result::Result<(), tempfile::PersistError> {
+    use std::io::ErrorKind::{PermissionDenied, Unsupported};
+
+    match staged.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(error.error.kind(), Unsupported | PermissionDenied)
+            || cfg!(target_vendor = "apple") && error.error.raw_os_error() == Some(45) =>
+        {
+            persist_reserved(error.file, path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn persist_reserved(
+    file: tempfile::NamedTempFile,
+    path: &Path,
+) -> std::result::Result<(), tempfile::PersistError> {
+    // Some removable volumes have neither exclusive rename nor hard links.
+    if let Err(error) = File::create_new(path) {
+        return Err(tempfile::PersistError { error, file });
+    }
+    file.persist(path).map(drop).inspect_err(|_| {
+        let _ = fs::remove_file(path);
+    })
+}
+
+/// Claim a free player capture name.
+pub(super) fn publish_player_screenshot(
+    mut staged: tempfile::NamedTempFile,
+    path: &Path,
+) -> std::io::Result<PathBuf> {
+    let occupied = |candidate: &Path| match candidate.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    };
+    let mut candidate = path.to_path_buf();
+    let mut suffix = 2;
+    loop {
+        if !occupied(&candidate)? && !occupied(&super::hdr_screenshot_path(&candidate))? {
+            match persist_screenshot(staged, &candidate) {
+                Ok(_) => return Ok(candidate),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    staged = error.file;
+                }
+                Err(error) => return Err(error.error),
+            }
+        }
+        let mut name = path.file_stem().unwrap_or_default().to_os_string();
+        name.push(format!("_{suffix}"));
+        if let Some(extension) = path.extension() {
+            name.push(".");
+            name.push(extension);
+        }
+        candidate = path.with_file_name(name);
+        suffix += 1;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn reserved_publication_preserves_a_collision() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("shot.png");
+    let png = stage_screenshot(&path, |f| Ok(f.write_all(b"new")?)).unwrap();
+    fs::write(&path, b"original").unwrap();
+    let err = persist_reserved(png, &path).unwrap_err();
+    assert_eq!(fs::read(&path).unwrap(), b"original");
+    fs::remove_file(&path).unwrap();
+    persist_reserved(err.file, &path).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"new");
+}
+
 /// CPU copies of the meshes uploaded since capturing was turned on.
 #[derive(Default)]
 pub(super) struct Copies {
@@ -40,6 +132,11 @@ pub(super) struct Copies {
 impl Copies {
     pub(super) fn section(&mut self, key: SectionKey, mesh: &SectionMesh) {
         self.sections.insert(key, copy(mesh));
+    }
+    /// The copy of section `key`'s mesh as it was handed over.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn held(&self, key: SectionKey) -> Option<&SectionMesh> {
+        self.sections.get(&key)
     }
     /// Columns unloaded (`Renderer::remove_columns`).
     pub(super) fn remove_columns(&mut self, columns: &[(i32, i32)]) {
@@ -73,6 +170,8 @@ fn copy(mesh: &SectionMesh) -> SectionMesh {
         packed: mesh.packed.clone(),
         packed_far: mesh.packed_far,
         solid_tints: Vec::new(),
+        solid_looks: mesh.solid_looks.clone(),
+        translucent_looks: mesh.translucent_looks.clone(),
         visibility: mesh.visibility,
         block_entities: mesh.block_entities.clone(),
         lights: mesh.lights.clone(),
@@ -398,7 +497,7 @@ impl Renderer {
                 fullbright: self.fullbright,
                 improved_transparency: self.improved_transparency,
                 animated_textures: self.animated_textures,
-                shader_pack: self.pack_post.is_some() || self.executor.is_some(),
+                shader_pack: self.shader_pack_kind().is_some(),
             },
             frame: FrameInputs {
                 camera: frame.camera.to_array(),

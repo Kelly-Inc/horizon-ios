@@ -9,7 +9,7 @@ This repository holds the game and the launcher, plus the tools, tests and docs 
 The website (playhorizon.dev) is built in a separate repository from this one's README, `docs/api/` and roadmap. Anything
 else (videos, Discord and other community material) lives elsewhere.
 
-**Where to start: [the mobile fork’s issues](https://github.com/heyskylo/horizon-ios/issues).** Report iOS/iPadOS bugs and propose mobile improvements there. Submit changes through [this fork’s pull requests](https://github.com/heyskylo/horizon-ios/pulls).
+**Where to start: [the mobile fork’s issues](https://github.com/Kelly-Inc/horizon-ios/issues).** Report iOS/iPadOS bugs and propose mobile improvements there. Submit changes through [this fork’s pull requests](https://github.com/Kelly-Inc/horizon-ios/pulls).
 
 The shared engine’s [upstream roadmap](ROADMAP.md) is background for engine work. Its numbered upstream issue links identify that work; they are not the place to file a new mobile-port report.
 
@@ -188,6 +188,8 @@ it (edited on every push, never repeated): talk to its author in the thread befo
 
 Who reviews and merges: the Horizon Team, on CI for ordinary pull requests; risky ones (saves, network, world
 generation, the launcher's updates) wait for a local proof first ([merging](docs/release-flow.md#merging)).
+A bot, CodeRabbit, also comments when a pull request opens. Treat it like any reviewer: fix what's right, say why
+when it isn't, and resolve the thread. It can't block a merge; `@coderabbitai review` asks it to look again.
 
 Every merge to main is released automatically ([release flow](docs/release-flow.md)), so main always stays playable.
 How agents, checks, releases and signed updates keep this safe: [security](docs/security.md).

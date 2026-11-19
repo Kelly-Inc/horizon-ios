@@ -7,7 +7,8 @@ import subprocess
 import sys
 
 
-JOBSERVER = re.compile(r"(?<!\S)--jobserver-(?:fds|auth)=([+-]?\d+),([+-]?\d+)(?=\s|$)")
+JOBSERVER = re.compile(r"(?<!\S)--jobserver-(fds|auth)=(\S*)(?=\s|$)")
+PIPE_DESCRIPTORS = re.compile(r"([+-]?\d+),([+-]?\d+)")
 
 
 def jobserver_environment():
@@ -19,11 +20,20 @@ def jobserver_environment():
         if key not in environment:
             continue
         invalid = False
+        usable = False
 
         def validate(match):
-            nonlocal invalid
+            nonlocal invalid, usable
+            kind, value = match.groups()
+            if kind == "auth" and value.startswith("fifo:") and value[5:]:
+                usable = True
+                return match.group(0)
+            pair = PIPE_DESCRIPTORS.fullmatch(value)
+            if pair is None:
+                invalid = True
+                return ""
             try:
-                read_fd, write_fd = map(int, match.groups())
+                read_fd, write_fd = map(int, pair.groups())
                 valid = (
                     read_fd >= 3 and write_fd >= 3 and read_fd != write_fd
                     and stat.S_ISFIFO(os.fstat(read_fd).st_mode)
@@ -35,13 +45,14 @@ def jobserver_environment():
                 valid = False
             # Darwin's two pipe ends have different inode identities.
             if valid:
+                usable = True
                 descriptors.update((read_fd, write_fd))
                 return match.group(0)
             invalid = True
             return ""
 
         flags = JOBSERVER.sub(validate, environment[key])
-        if invalid and not re.search(r"--jobserver-(?:fds|auth)=", flags):
+        if invalid and not usable:
             # Without its jobserver, a bare -j would give a child make unlimited jobs.
             flags = re.sub(r"(?<!\S)-j(?=\s|$)", "-j1", flags)
         environment[key] = flags

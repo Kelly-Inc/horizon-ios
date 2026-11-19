@@ -17,12 +17,16 @@ def program():
     source = (ROOT / 'crates/horizon-client/src/game/interface/pad/ios.rs').read_text()
     router = source[source.index('pub(in crate::game) type PadId'):source.index('\nimpl Pads {', source.index('struct RoutedPad'))]
     router = router.replace('pub(in crate::game)', 'pub(crate)')
-    code = '#![allow(dead_code)]\n'
+    code = '#![allow(dead_code)]\nextern crate self as horizon_client_core;\n'
+    config = ROOT / 'crates/horizon-client-core/src/config_file.rs'
+    code += f'#[path="{config}"] mod config_file;\n'
+    code += '#[macro_export]macro_rules! warn { ($($args:tt)*) => { let _ = format_args!($($args)*); }; }\n'
     code += f'#[path={str(ROOT / "crates/horizon-gamecontroller/src/lib.rs")!r}] mod horizon_gamecontroller;\n'.replace("'", '"')
     for name in ("radial", "input_source", "mouse"):
         code += f'#[path="{ROOT / "crates/horizon-client-input/src" / (name + ".rs")}"] mod {name};\n'
     gamepad = (ROOT / 'crates/horizon-client-input/src/gamepad.rs').read_text()
     gamepad = gamepad.replace("mod radial_file;", f'#[path="{ROOT / "crates/horizon-client-input/src/gamepad/radial_file.rs"}"] mod radial_file;')
+    gamepad = gamepad.replace("use std::{", "use crate::log;\nuse std::{", 1)
     # This probe owns native snapshot/seat/edge behavior, not the separate
     # keyboard binding dispatcher. Keep real production state, hysteresis,
     # cancellation and glyph code without inventing winit/keybind shims.
@@ -49,7 +53,7 @@ macro_rules! json {
 }
 #[derive(Debug,PartialEq)]enum Connection {Connected(GlyphStyle),Disconnected{active:bool}}
 // The production native poll only logs names. Keep logging out of this standalone fixture.
-mod log { pub(crate) use crate::info; }
+mod log { pub(crate) use crate::{info, warn}; }
 #[macro_export]macro_rules! info {($($arg:tt)*)=>{let _=format!($($arg)*);};}
 '''
     code += 'impl Pads {\n' + method(source, 'read_snapshots') + '\n' + method(source, 'release_hardware') + '\n}\n'
@@ -88,7 +92,7 @@ fn handoffs(){
  let mut pads=Pads::default();let mut router=PadRouter::default();
  let one=snapshot(41,true,false,[0.5,-0.3],0.8);
  let two=snapshot(42,false,true,[-0.4,0.2],0.);
- assert!(pads.read_snapshots(vec![one.clone(),two.clone()],Some(one.clone())).held(Button::South));
+ assert!(pads.read_snapshots(vec![one.clone(),two.clone()],Some(one.id)).held(Button::South));
  pads.menu.armed=Some(Button::South);
  // An undelivered notice and the menu's press belong to P1, not to routing.
  pads.connections.push(Connection::Connected(GlyphStyle::Nintendo));
@@ -113,7 +117,7 @@ fn handoffs(){
  assert_eq!(pads.device.as_ref().map(|device|device.name.as_str()),Some("pad42"));
  assert_eq!(pads.style,GlyphStyle::PlayStation);assert_eq!(pads.menu.armed,None);
  assert_eq!(pads.connections,vec![Connection::Connected(GlyphStyle::Nintendo)]);
- assert!(pads.read_snapshots(vec![two.clone(),one.clone()],Some(two.clone())).held(Button::East));
+ assert!(pads.read_snapshots(vec![two.clone(),one.clone()],Some(two.id)).held(Button::East));
  assert_eq!(pads.connections,vec![Connection::Connected(GlyphStyle::Nintendo)]);
  // Repeated hand-back is inert; a later adopt uses the returned snapshots to
  // suppress held inputs again, while new devices still announce and press.
@@ -123,12 +127,18 @@ fn handoffs(){
  assert_eq!(router.update(vec![two.clone(),three.clone()]),vec![PadEvent::Gone(41),PadEvent::Back(43),PadEvent::Press(43,Button::South)]);
  pads.release_hardware();router.hand_back(&mut pads);
  pads.connections.clear();
- assert!(pads.read_snapshots(vec![three.clone()],Some(three.clone())).held(Button::South));
+ assert!(pads.read_snapshots(vec![three.clone()],Some(three.id)).held(Button::South));
  assert_eq!(pads.connections,vec![Connection::Disconnected{active:true}]);
  // A disappearance while routed must not leave P1's device descriptor behind.
  router.adopt(&mut pads);assert_eq!(router.update(vec![]),vec![PadEvent::Gone(43)]);
  pads.release_hardware();router.hand_back(&mut pads);
  assert_eq!(pads.device,None);assert_eq!(pads.devices.active,None);
+ // If the OS's active hint changed during the read, only a captured device can drive it.
+ let mut coherent=Pads::default();
+ assert!(coherent.read_snapshots(vec![one.clone()],Some(99)).held(Button::South));
+ assert_eq!(coherent.devices.active,Some(one.id));
+ assert_eq!(coherent.read_snapshots(vec![],Some(one.id)),PadState::default());
+ assert_eq!(coherent.peaks,[[0.;2];2]);
  pads.connections.clear();pads.read_snapshots(vec![],None);assert!(pads.connections.is_empty());
 }
 '''

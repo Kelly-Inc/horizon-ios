@@ -39,13 +39,13 @@ def program(game_source=None):
     prepared = 'pub(super) ' + method(world, 'shutdown_prepared_files')
     preload = 'pub(super) ' + method(world, 'shutdown_preload')
     a = launcher.index('enum Waiting {')
-    b = launcher.index('\n/// Answer what has come back', a)
+    b = launcher.index('\n#[derive(Default)]\nstruct Delivery', a)
     pending = launcher[a:b]
-    ack = 'pub(super) ' + method(launcher, 'acknowledge_cancelled_start')
+
     broker = f'#[path="{ROOT / "crates/horizon-ios-launcher/src/lib.rs"}"]mod horizon_ios_launcher;\n'
     return (STUBS + broker + rest + '\nimpl Loading {\n' + drain + '\n}\n'
             + '\nmod world_loading {use super::*;\n' + worker_state + WORLD_STUBS + preload + prepared + '\n}\n'
-            + '\nmod launcher {use super::*;\n' + pending + ack + LAUNCHER_STUBS + '\n}\n'
+            + '\nmod launcher {use super::*;\n' + pending + LAUNCHER_STUBS + '\n}\n'
             + '\nimpl App {fn tick(&mut self,event_loop:&EventLoop){match self {\n' + supervisor + '\n}}}\n' + CASES)
 
 
@@ -109,6 +109,8 @@ mod mod_content{
 mod discord_presence{pub enum Status{Off}pub fn set(_:Status){super::trace("presence_off");}}
 pub fn screen(first:bool,second:bool){assert!(!first&&!second);trace("airplay_idle");}
 struct Installed;
+enum ImportCompletion { Installed(Installed) }
+struct Value;
 fn wait_for(mut ready:impl FnMut()->bool){let deadline=Instant::now()+Duration::from_secs(3);while !ready(){assert!(Instant::now()<deadline,"worker did not finish");thread::yield_now();}}
 fn reply(label:&str)->horizon_ios_launcher::Request{let label=label.to_owned();horizon_ios_launcher::Request::new(label.clone(),move|json|{
  if json.contains("\"stopped\""){assert!(PARENT_DONE.load(Ordering::SeqCst)&&TAIL_DONE.load(Ordering::SeqCst)&&PRELOAD_DONE.load(Ordering::SeqCst)&&PREPARED_DONE.load(Ordering::SeqCst)&&BROWSER_DONE.load(Ordering::SeqCst)&&RETIRED_BROWSER_DONE.load(Ordering::SeqCst)&&AUDIO_DONE.load(Ordering::SeqCst)&&COLLECTOR_DONE.load(Ordering::SeqCst),"ACK preceded producer shutdown");let t=TRACE.lock().unwrap().clone();let drop=t.iter().position(|s|*s=="old_loading_dropped").expect("ACK preceded state replacement/drop");let release=t.iter().position(|s|*s=="world_data_released").expect("ACK preceded world data release");let collect=t.iter().position(|s|*s=="collection_scheduled").expect("ACK preceded retired-root scheduling");assert!(drop<release&&release<collect);}
@@ -125,17 +127,17 @@ pub(super) fn release_world_data(){trace("world_data_released");}
 '''
 
 LAUNCHER_STUBS = r'''
-pub(super) fn seed()->(mpsc::Sender<String>,mpsc::Sender<std::result::Result<Installed,String>>){
+pub(super) fn seed()->(mpsc::Sender<String>,mpsc::Sender<std::result::Result<ImportCompletion,String>>){
  let(control,control_rx)=mpsc::channel();let(import,import_rx)=mpsc::channel();
  PENDING.with_borrow_mut(|p|p.extend([
- (Waiting::CancelStart("A".into()),reply("cancel A first")),
  (Waiting::Control(control_rx),reply("control")),
- (Waiting::CancelStart("B".into()),reply("cancel B")),
  (Waiting::Import(import_rx),reply("import")),
- (Waiting::CancelStart("A".into()),reply("cancel A second")),
- ]));(control,import)
+ ]));
+ horizon_ios_launcher::wait_for_cancel_reply("A".into(),reply("cancel A first"));
+ horizon_ios_launcher::wait_for_cancel_reply("A".into(),reply("cancel A latest"));
+ (control,import)
 }
-pub(super) fn check_untouched(){PENDING.with_borrow(|p|{assert_eq!(p.len(),3);assert_eq!(p.iter().map(|(_,r)|r.line.as_str()).collect::<Vec<_>>(),["control","cancel B","import"]);for(w,_)in p{match w{Waiting::Control(r)=>assert_eq!(r.try_recv().unwrap(),"control still alive"),Waiting::Import(r)=>assert!(r.try_recv().unwrap().is_ok()),Waiting::CancelStart(s)=>assert_eq!(s,"B")}}});}
+pub(super) fn check_untouched(){PENDING.with_borrow(|p|{assert_eq!(p.iter().map(|(_,r)|r.line.as_str()).collect::<Vec<_>>(),["control","import"]);for(w,_)in p{match w{Waiting::Control(r)=>assert_eq!(r.try_recv().unwrap(),"control still alive"),Waiting::Import(r)=>assert!(r.try_recv().unwrap().is_ok()),_=>panic!("unexpected fixture request")}}});}
 pub(super) fn clear(){PENDING.with_borrow_mut(|p|p.clear());}
 '''
 
@@ -156,7 +158,9 @@ fn main(){
  let(release_prepared,prepared_release)=mpsc::channel();let path=root.join("prepared-written");let target=path.clone();
  world_loading::install_prepared(path.clone(),thread::spawn(move||{prepared_release.recv().unwrap();fs::write(target,b"finished").unwrap();PREPARED_DONE.store(true,Ordering::SeqCst);}));
  horizon_ios_launcher::reset();horizon_ios_launcher::set_covered(true);assert!(horizon_ios_launcher::start_owned(Some("A")));assert_eq!(horizon_ios_launcher::request_cancel("A"),horizon_ios_launcher::CancelDecision::Accepted);
- let(control,import)=launcher::seed();launcher::acknowledge_cancelled_start("unrelated");assert!(REPLIES.lock().unwrap().is_empty());
+ let(control,import)=launcher::seed();
+ {let mut replies=REPLIES.lock().unwrap();assert_eq!(replies.len(),1);assert_eq!(replies[0].0,"cancel A first");assert!(replies[0].1.contains("replaced"));replies.clear();}
+ horizon_ios_launcher::acknowledge_cancelled_start("unrelated");assert!(REPLIES.lock().unwrap().is_empty());
  let options=Options{world:Some("do not open".into()),server:Some("do not connect".into()),resources:root.join("old-overlay")};
  let loading=Loading{handle:Some(parent),receiver:parent_rx,loaded:None,delivered:false,completed_without_game:false,gui:Some(DropProbe(gui_drops.clone())),options:Some(options),window:Some(99),settings:7,vanilla_root:root.clone(),error:None,name:"old"};
  let mut app=App::Loading(Box::new(loading));let events=EventLoop::default();
@@ -178,9 +182,9 @@ fn main(){
  RETIRED_BROWSER_DONE.store(true,Ordering::SeqCst);app.tick(&events);
  assert_eq!(ui_drops.load(Ordering::SeqCst),1);assert_eq!(loaded_drops.load(Ordering::SeqCst),1);assert_eq!(gui_drops.load(Ordering::SeqCst),1);assert!(world_loading::prepared_empty());assert_eq!(fs::read(path).unwrap(),b"finished");
  assert!(!events.exited.get());assert!(events.waits.get()>=3);let App::Loading(l)=&app else{panic!()};assert_eq!(l.name,"idle");assert_eq!(l.window,Some(99));
- {let replies=REPLIES.lock().unwrap();assert_eq!(replies.len(),2);assert!(replies.iter().all(|(label,text)|label.starts_with("cancel A")&&text==r#"{"ok":true,"status":"stopped"}"#));}
+ {let replies=REPLIES.lock().unwrap();assert_eq!(replies.len(),1);assert!(replies.iter().all(|(label,text)|label=="cancel A latest"&&text==r#"{"ok":true,"status":"stopped"}"#));}
  assert_eq!(COLLECTIONS.load(Ordering::SeqCst),1);let before=events.waits.get();app.tick(&events);assert!(events.waits.get()>before,"replacement loader must wait for newly scheduled finite collection");NEW_COLLECTION_DONE.store(true,Ordering::SeqCst);
- launcher::acknowledge_cancelled_start("A");assert_eq!(REPLIES.lock().unwrap().len(),2);control.send("control still alive".into()).unwrap();import.send(Ok(Installed)).unwrap();launcher::check_untouched();launcher::clear();assert_eq!(REPLIES.lock().unwrap().len(),5);
+ horizon_ios_launcher::acknowledge_cancelled_start("A");assert_eq!(REPLIES.lock().unwrap().len(),1);control.send("control still alive".into()).unwrap();import.send(Ok(ImportCompletion::Installed(Installed))).unwrap();launcher::check_untouched();launcher::clear();assert_eq!(REPLIES.lock().unwrap().len(),3);
  // A failed Done still drains and drops the menu, without trying to surface
  // the canceled error or upload its UI. Repeated draining is idempotent.
  let(tx,rx)=mpsc::channel();let failed_ui=DropProbe(ui_drops.clone());let failed=thread::spawn(move||{tx.send(LoaderMsg::Ui(failed_ui,PathBuf::new())).unwrap();tx.send(LoaderMsg::Done(Err("resource parse failed".into()))).unwrap();});wait_for(||failed.is_finished());

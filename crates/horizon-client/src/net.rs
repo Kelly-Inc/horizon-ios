@@ -37,7 +37,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use {
     horizon_core::nbt::{JavaString, Tag},
@@ -1757,10 +1757,12 @@ pub fn load_language(resources: &std::path::Path) -> Language {
 pub fn ping(address: &str, timeout: Duration) -> Result<(serde_json::Value, u128), String> {
     use horizon_protocol::packets::status;
     let (host, port) = parse_address(address).ok_or("Invalid address")?;
-    let mut c = Connection::connect_server(&host, port, timeout).map_err(|e| e.to_string())?;
-    c.reader
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("Invalid status timeout")?;
+    let mut c =
+        Connection::connect_server_until(&host, port, deadline).map_err(|e| e.to_string())?;
+    c.reader.set_read_deadline(deadline);
     let e = |e: horizon_protocol::Error| e.to_string();
     c.send(
         &handshake::Serverbound::Intention(handshake::Intention {
@@ -1781,7 +1783,7 @@ pub fn ping(address: &str, timeout: Duration) -> Result<(serde_json::Value, u128
         }
         _ => return Err("unexpected status reply".into()),
     };
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     c.send(&status::Serverbound::PingRequest(status::Ping { time: 1 }).encode())
         .map_err(e)?;
     let _ = c.recv().map_err(e)?;
@@ -1845,10 +1847,12 @@ fn legacy_ping_request(host: &str, port: u16) -> Vec<u8> {
 /// the status handshake with the pre-1.7 ping.
 pub fn ping_legacy(address: &str, timeout: Duration) -> Result<LegacyStatus, String> {
     let (host, port) = parse_address(address).ok_or("Invalid address")?;
-    let mut c = Connection::connect_server(&host, port, timeout).map_err(|e| e.to_string())?;
-    c.reader
-        .set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("Invalid status timeout")?;
+    let mut c =
+        Connection::connect_server_until(&host, port, deadline).map_err(|e| e.to_string())?;
+    c.reader.set_read_deadline(deadline);
     let e = |e: horizon_protocol::Error| e.to_string();
     c.writer
         .write_raw(&legacy_ping_request(&host, port))

@@ -3,7 +3,7 @@
 use super::guest::{Guest, SavedBody};
 use crate::{
     items::ItemStack,
-    save::{Level, put, read_dat, uuid_from_tag, uuid_tag, write_dat},
+    save::{Level, put, read_dat, uuid_from_tag, uuid_tag, write_player_dat},
 };
 use horizon_protocol::crypto::uuid_string;
 use std::{
@@ -119,7 +119,7 @@ pub fn load_owner(guest: &mut Guest, world: &Path, saved: Option<&Level>) -> boo
 /// Save the world's single-player owner: its state into `level` (`store`),
 /// then to the file level.dat names, which it loads ([`load_owner`]), and to
 /// its own file, so that the one it loads is never the older of the two.
-pub fn save_owner(guest: &Guest, level: &mut Level, world: &Path) {
+fn save_owner(guest: &Guest, level: &mut Level, world: &Path) -> Result<(), String> {
     // `MinecraftServer.saveAllChunks`: `saveDataTag(worldData, getSingleplayerProfile().id())`
     // — the server's own profile on every save, never the stale `singleplayer_uuid` a
     // world arrived with (a Realms download, a server world). The player file written is
@@ -128,10 +128,8 @@ pub fn save_owner(guest: &Guest, level: &mut Level, world: &Path) {
     store(guest, level, None);
     // `saveDataTag`: level.dat carries the profile the player file is named after, so the
     // file the owner loads next is the one just written.
-    if let Err(e) = level.write(world) {
-        log::warn!("Horizon: the owner's playerdata is not saved: {e}");
-    }
-    save(guest, world);
+    let metadata = level.write(world).map_err(|e| e.to_string());
+    metadata.and(save_player(guest, world, false))
 }
 
 /// Move a world that older Horizon builds named by the offline profile to the account's
@@ -187,7 +185,7 @@ pub fn migrate_owner(world: &Path, level: &mut Level, old: u128, new: u128) -> b
     if let Some(mut tag) = source {
         // The player file is named after its `UUID` (`PlayerDataStorage.save`).
         put(&mut tag, "UUID", uuid_tag(new_ints));
-        if let Err(e) = write_dat(&new_file, tag.clone()) {
+        if let Err(e) = write_player_dat(&new_file, tag.clone(), false) {
             log::warn!(
                 "Horizon: cannot move the owner's playerdata to {}: {e}",
                 new_file.display()
@@ -354,17 +352,20 @@ pub fn player_tag(guest: &Guest) -> Tag {
 
 /// Save a leaving guest, including its saved vehicle tree.
 pub fn save(guest: &Guest, world: &Path) {
-    let file = path(world, guest.uuid);
-    if let Err(e) = write_dat(&file, player_tag(guest)) {
-        log::warn!("Horizon: {} is not saved: {e}", file.display());
+    if let Err(e) = save_player(guest, world, false) {
+        log::warn!("Horizon: {e}");
     }
 }
 
 /// [`save`], synced to the disk and saying whether the file was written: a hand-over's commit
 /// point (`player-confirm`) answers only once it is.
 pub fn save_now(guest: &Guest, world: &Path) -> Result<(), String> {
+    save_player(guest, world, true)
+}
+
+fn save_player(guest: &Guest, world: &Path, durable: bool) -> Result<(), String> {
     let file = path(world, guest.uuid);
-    crate::save::write_dat_durable(&file, player_tag(guest))
+    write_player_dat(&file, player_tag(guest), durable)
         .map_err(|e| format!("{} is not saved: {e}", file.display()))
 }
 
@@ -383,7 +384,7 @@ pub struct SavedPlayer {
 }
 
 fn write_snapshot(snapshot: Snapshot) -> Result<SavedPlayer, String> {
-    write_dat(&snapshot.file, snapshot.tag)
+    write_player_dat(&snapshot.file, snapshot.tag, false)
         .map(|()| SavedPlayer {
             uuid: snapshot.uuid,
             name: snapshot.name,
@@ -460,9 +461,27 @@ impl Autosaves {
     }
 
     /// Serialize a newer logout snapshot after every queued autosave.
-    pub fn save_after(&mut self, guest: &Guest, world: &Path) -> Vec<SavedPlayer> {
-        let saved = self.completed(true);
-        save(guest, world);
+    pub fn save_after(
+        &mut self,
+        guest: &Guest,
+        world: &Path,
+        owner: Option<&mut Level>,
+    ) -> Vec<SavedPlayer> {
+        let mut saved = self.completed(true);
+        let result = match owner {
+            Some(level) => save_owner(guest, level, world),
+            None => save_player(guest, world, false),
+        };
+        match result {
+            Ok(()) => saved.push(SavedPlayer {
+                uuid: guest.uuid,
+                name: guest.name.clone(),
+            }),
+            Err(error) => {
+                log::warn!("Horizon: {error}");
+                self.error = Some(error);
+            }
+        }
         saved
     }
 
@@ -864,7 +883,8 @@ mod tests {
         for uuid in 1..=150 {
             saves.enqueue(&holding(uuid, "minecraft:diamond", 5), &dir);
         }
-        saves.save_after(&holding(1, "minecraft:iron_ingot", 11), &dir);
+        let saved = saves.save_after(&holding(1, "minecraft:iron_ingot", 11), &dir, None);
+        assert_eq!(saved.last().unwrap().uuid, 1);
         drop(saves);
         assert!(load(&mut loaded, &dir));
         assert_eq!(first_item(&loaded), Some(("minecraft:iron_ingot", 11)));
@@ -877,7 +897,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("players"), b"not a directory").unwrap();
         let mut saves = Autosaves::default();
-        saves.enqueue(&holding(1, "minecraft:diamond", 5), &dir);
+        let guest = holding(1, "minecraft:diamond", 5);
+        assert!(saves.save_after(&guest, &dir, None).is_empty());
+        assert!(saves.writes_finished().is_err());
+        saves.enqueue(&guest, &dir);
         assert!(saves.completed(true).is_empty());
         assert!(saves.writes_finished().is_err());
         assert!(saves.completed(false).is_empty());
@@ -1052,6 +1075,35 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_player_keeps_the_recovery_copy_if_the_current_file_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("player.dat");
+        let old = dir.path().join("player.dat_old");
+        let backup = Tag::compound([("Health", Tag::Float(12.0f32.to_bits()))]);
+        let next = Tag::compound([("Health", Tag::Float(14.0f32.to_bits()))]);
+        crate::save::write_dat(&old, backup.clone()).unwrap();
+        std::fs::write(&current, b"damaged player data").unwrap();
+
+        write_player_dat(&current, next.clone(), true).unwrap();
+        assert_eq!(read_dat(&current), Some(next));
+        assert_eq!(read_dat(&old), Some(backup));
+        let preserved = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("player_corrupted_")
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(preserved.path()).unwrap(),
+            b"damaged player data"
+        );
+    }
+
+    #[test]
     fn a_save_cut_off_between_its_renames_loads_the_dat_old() {
         // PlayerDataStorage.load: a file `write_dat` moved to `.dat_old` and
         // did not replace (the game stopped between the two renames) is read
@@ -1093,7 +1145,7 @@ mod tests {
         store(&holding(owner, "minecraft:diamond", 5), &mut level, None);
         level.write(&dir).unwrap();
         save(&holding(owner, "minecraft:diamond", 5), &dir);
-        save_owner(&holding(owner, "minecraft:gold_ingot", 7), &mut level, &dir);
+        save_owner(&holding(owner, "minecraft:gold_ingot", 7), &mut level, &dir).unwrap();
         let saved = Level::read(&dir).unwrap();
         let mut g = guest();
         g.uuid = owner;
@@ -1196,7 +1248,7 @@ mod tests {
         {
             data.remove(&"singleplayer_uuid".into());
         }
-        write_dat(&dir.join("level.dat"), root).unwrap();
+        crate::save::write_dat(&dir.join("level.dat"), root).unwrap();
 
         let mut read = Level::read(&dir).unwrap();
         assert_eq!(read.player_uuid, None);
@@ -1706,7 +1758,7 @@ mod tests {
         if let Some(Tag::Compound(data)) = tag.get_mut("Data") {
             data.remove(&"singleplayer_uuid".into());
         }
-        write_dat(&dir.join("level.dat"), tag).unwrap();
+        crate::save::write_dat(&dir.join("level.dat"), tag).unwrap();
         let read = Level::read(&dir).unwrap();
         let mut g = holding(owner, "minecraft:dirt", 1);
         g.inventory[0] = None;
@@ -1716,7 +1768,7 @@ mod tests {
         // The owner's save names the owner, and leaves the friend's file alone.
         let before = std::fs::read(path(&dir, friend)).unwrap();
         let mut level = read;
-        save_owner(&g, &mut level, &dir);
+        save_owner(&g, &mut level, &dir).unwrap();
         assert_eq!(level.player_uuid, Some(uuid_ints(owner)));
         assert_eq!(std::fs::read(path(&dir, friend)).unwrap(), before);
         assert!(exists(&dir, owner));
@@ -1736,7 +1788,7 @@ mod tests {
         if let Some(Tag::Compound(data)) = tag.get_mut("Data") {
             data.remove(&"singleplayer_uuid".into());
         }
-        write_dat(&dir.join("level.dat"), tag).unwrap();
+        crate::save::write_dat(&dir.join("level.dat"), tag).unwrap();
         let read = Level::read(&dir).unwrap();
         assert_eq!(read.player_uuid, None);
         let mut g = guest();

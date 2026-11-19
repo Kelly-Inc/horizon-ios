@@ -42,16 +42,16 @@ mod log {pub(crate) use crate::warn;}
 #[derive(Default)]struct Menu{armed:Option<()>,osk:Option<()>,trigger:Option<()>}
 struct Pad{radial:radial::RadialMenu,radial_settle:radial::DpadSettle,peaks:[[f32;2];2],reload_pending:bool,edges:Edges,state:PadState,menu:Menu,blocked_sticks:[bool;2],late_releases:Vec<Button>,actions:[Vec<&'static str>;16],held_drop:Option<()>,drop_stack:bool,in_use:bool}
 impl Default for Pad {fn default()->Self{Self{radial:radial::RadialMenu::default(),radial_settle:radial::DpadSettle::default(),peaks:[[0.;2];2],reload_pending:false,edges:Edges::default(),state:PadState::default(),menu:Menu::default(),blocked_sticks:[false;2],late_releases:vec![],actions:std::array::from_fn(|_|vec![]),held_drop:None,drop_stack:false,in_use:false}}}
-#[derive(Default)]struct Touch{toggle_keys:Vec<i32>,menu:Option<()>,fingers:touch::Touches,late:Vec<()>,holding:Option<()>}
+#[derive(Default)]struct Touch{window_buttons:Vec<()>,toggle_keys:Vec<i32>,menu:Option<()>,fingers:touch::Touches,late:Vec<()>,holding:Option<()>}
 #[derive(Default)]struct Keys{touch:bool} enum Source{Touch}
 impl Keys{fn release_source(&mut self,_:Source){self.touch=false;}}
 struct Controller{move_deadzone:f32,look_deadzone:f32,trigger_threshold:f32}
 impl Controller{fn binding(&self,_:&str)->Option<Button>{None} fn actions_of(&self,_:Button)->Vec<&'static str>{vec!["key.jump"]}}
 struct Settings{controller:Controller}
 struct Renderer{current:bool} impl Renderer{fn presentation_current(&self)->bool{self.current}}
-struct Game{renderer:Option<Renderer>,screen:Screen,captured:bool,focused:bool,menu_calls:usize,pad:Pad,touch:Touch,keys:Keys,pack_reload:Option<()>,transaction:bool,settings:Settings,releases:Vec<Button>,actions:Vec<(&'static str,bool)>,ime:bool,emote:bool}
+struct Game{touch_drag_button:Option<()>,renderer:Option<Renderer>,screen:Screen,captured:bool,focused:bool,menu_calls:usize,pad:Pad,touch:Touch,keys:Keys,pack_reload:Option<()>,transaction:bool,settings:Settings,releases:Vec<Button>,actions:Vec<(&'static str,bool)>,ime:bool,emote:bool}
 impl Game{
- fn new()->Self{Self{renderer:None,screen:Screen::Playing,captured:false,focused:true,menu_calls:0,pad:Pad::default(),touch:Touch::default(),keys:Keys::default(),pack_reload:None,transaction:false,settings:Settings{controller:Controller{move_deadzone:0.2,look_deadzone:0.2,trigger_threshold:0.5}},releases:vec![],actions:vec![],ime:true,emote:true}}
+ fn new()->Self{Self{touch_drag_button:None,renderer:None,screen:Screen::Playing,captured:false,focused:true,menu_calls:0,pad:Pad::default(),touch:Touch::default(),keys:Keys::default(),pack_reload:None,transaction:false,settings:Settings{controller:Controller{move_deadzone:0.2,look_deadzone:0.2,trigger_threshold:0.5}},releases:vec![],actions:vec![],ime:true,emote:true}}
  // Radial actions must never receive a blocked reload press. Releases use
  // the production opener-up helper; cancellation uses the actual state machine.
  fn pad_radial_captures(&self)->bool{self.pad.radial.is_open()}

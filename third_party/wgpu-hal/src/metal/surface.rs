@@ -11,7 +11,7 @@ use objc2::{
 use objc2_core_foundation::{CFString, CGSize};
 use objc2_core_graphics::CGColorSpace;
 use objc2_foundation::NSObjectProtocol;
-use objc2_metal::MTLTextureType;
+use objc2_metal::{MTLTexture, MTLTextureType};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use parking_lot::{Mutex, RwLock};
 
@@ -416,6 +416,12 @@ impl crate::Surface for super::Surface {
 
         let swapchain_format = self.swapchain_format.read().unwrap();
         let extent = self.extent.read();
+        // UIKit can give us a drawable from the previous geometry during a
+        // rotation or resume. Do not advertise its size as the new extent:
+        // that would draw or copy with attachments sized for a different frame.
+        if texture.width() != extent.width as usize || texture.height() != extent.height as usize {
+            return Err(crate::SurfaceError::Outdated);
+        }
         let suf_texture = super::SurfaceTexture {
             texture: super::Texture {
                 raw: texture,

@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 
 
@@ -27,7 +28,15 @@ def restore_and_snapshot(root, snapshot):
     entries = subprocess.check_output(
         ["git", "ls-tree", "-r", "-t", "-z", "HEAD"], cwd=root,
     )
-    previous = json.loads(snapshot.read_text()) if snapshot.exists() else {}
+    try:
+        previous = json.loads(snapshot.read_text())
+    except FileNotFoundError:
+        previous = {}
+    except (UnicodeError, json.JSONDecodeError):
+        previous = None
+    if not isinstance(previous, dict):
+        print("Ignoring unreadable Cargo timestamp snapshot; changed inputs will rebuild")
+        previous = {}
     current = {}
     restored = 0
     for entry in entries.split(b"\0"):
@@ -43,7 +52,7 @@ def restore_and_snapshot(root, snapshot):
         identity = f"{mode} {oid}"
         stat = path.stat()
         old = previous.get(name)
-        if old is not None and old[0] == identity:
+        if isinstance(old, list) and len(old) == 2 and old[0] == identity and type(old[1]) is int:
             mtime = old[1]
             restored += 1
         else:
@@ -54,7 +63,17 @@ def restore_and_snapshot(root, snapshot):
         os.utime(path, ns=(stat.st_atime_ns, mtime))
         current[name] = [identity, path.stat().st_mtime_ns]
     snapshot.parent.mkdir(parents=True, exist_ok=True)
-    snapshot.write_text(json.dumps(current, sort_keys=True) + "\n")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=snapshot.parent,
+                                         prefix=".source-mtimes-", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(current, stream, sort_keys=True)
+            stream.write("\n")
+        temporary.replace(snapshot)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     print(f"Restored mtimes for {restored} unchanged Git files and trees out of {len(current)}")
 
 

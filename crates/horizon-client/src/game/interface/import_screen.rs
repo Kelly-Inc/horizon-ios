@@ -1,29 +1,20 @@
-//! The screen a phone shows when it has no game files, and the wait for someone to bring them.
+//! The recovery screen and transfer options when the game files cannot load.
 //!
-//! `Loading` usually ends one of two ways: a game, or an exit. On a phone the second is worse than
-//! the first sounds — the app vanishes and nothing says why, and there is no terminal in the
-//! sandbox to read the log in. So a phone that found nothing to load keeps its window, says what it
-//! is missing and how to send it, and starts the loader again the moment the files arrive. That
-//! restart is the same one a resource-pack change already makes (`restart_menu_resources`), which is
-//! why nothing here needs new machinery in the loader itself.
-//!
-//! Everything drawn is drawn from `horizon_client::import::screen`, with the one atlas that exists
-//! before Mojang's files do.
+//! Players can retry startup or provide a replacement archive here.
 use super::*;
 
-/// The wait: the listener that takes an archive, the atlas the screen draws with, and the words it
-/// says.
+/// State retained while waiting for usable game files.
 pub(super) struct Import {
-    /// `None` when the port could not be opened, which leaves the cable route and the folder path
-    /// on the screen. The screen never promises a page nobody is serving.
+    /// The Wi-Fi listener, if its port could be opened.
     session: Option<horizon_client::import::http::Session>,
     atlas: HudAtlas,
     /// Where an archive has to arrive: the folder the Files app shows.
     home: std::path::PathBuf,
     /// The loader's own words about why there is nothing to show.
     reason: String,
-    /// The last upload that was refused, and why.
+    /// The last download or upload error.
     error: Option<String>,
+    retry_loader: bool,
     received: u64,
     total: u64,
     /// The game files coming from the download server (`import::download`): the first door, tried
@@ -31,10 +22,22 @@ pub(super) struct Import {
     download: Option<horizon_client::import::download::Download>,
 }
 
-/// Whether this run has downloaded the game files already.
-static DOWNLOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 impl Loading {
+    pub(super) fn start_automatic_game_files(
+        &mut self,
+        url: String,
+        home: &std::path::Path,
+    ) -> std::io::Result<horizon_client::import::download::Download> {
+        if self.file_download_attempted {
+            return Err(std::io::Error::other(
+                "Game-file download was already attempted during this startup.",
+            ));
+        }
+        let download = horizon_client::import::download::Download::start(url, home.to_path_buf())?;
+        self.file_download_attempted = true;
+        Ok(download)
+    }
+
     /// Stop waiting for a game that cannot start and wait for files instead. The caller has already
     /// said on screen that this is what a phone does (`import::waits_on_screen`).
     pub(super) fn wait_for_files(&mut self, reason: String) {
@@ -49,34 +52,22 @@ impl Loading {
                 return;
             }
         };
-        horizon_client::ui_theme::reset_atlas();
+        self.set_import_screen_renderer(&atlas);
         // Download them first; the Wi-Fi and cable doors open only if that fails. Once a run: files that
         // downloaded and still don't load would otherwise be downloaded again and again.
         let url = horizon_client::import::download::url(horizon_core::VANILLA_VERSION);
-        let mut error = None;
-        let download = if let Some(url) = url {
-            if DOWNLOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                log::warn!(
-                    "Horizon: the downloaded game files did not load ({reason}); not downloading again"
-                );
-                error = Some(format!(
-                    "The game files downloaded but did not load: {reason}"
-                ));
-                None
-            } else {
-                match horizon_client::import::download::Download::start(url.clone(), home.clone()) {
-                    Ok(download) => {
-                        log::info!("Horizon: no game files ({reason}); downloading {url}");
-                        Some(download)
-                    }
-                    Err(error) => {
-                        log::warn!("Horizon: could not start downloading the game files: {error}");
-                        None
-                    }
+        let (download, error) = match url {
+            Some(url) => match self.start_automatic_game_files(url, &home) {
+                Ok(download) => {
+                    log::info!("Horizon: starting the game-file download");
+                    (Some(download), None)
                 }
-            }
-        } else {
-            None
+                Err(error) => {
+                    log::warn!("Horizon: could not start downloading the game files: {error}");
+                    (None, Some(error.to_string()))
+                }
+            },
+            None => (None, None),
         };
         let session = if download.is_some() {
             // On a phone the download shows in SwiftUI over this screen; it asks `download-state`.
@@ -95,6 +86,7 @@ impl Loading {
             home,
             reason,
             error,
+            retry_loader: false,
             received: 0,
             total: 0,
             download,
@@ -123,29 +115,37 @@ impl Loading {
         let Some(import) = &mut self.import else {
             return Ok(());
         };
-        let mut ready = false;
+        let mut installed_root = None;
         if let Some(result) = import.download.as_ref().and_then(|d| d.poll()) {
             import.download = None;
             match result {
-                Ok(placed) => {
+                Ok(Some(placed)) => {
                     log::info!(
                         "Horizon: downloaded {} ({} files) to {}",
                         placed.kind.label(),
                         placed.files,
                         placed.path.display()
                     );
-                    ready |= placed.kind == horizon_client::import::Kind::Resources;
-                    if !ready {
+                    if placed.kind == horizon_client::import::Kind::Resources {
+                        installed_root = Some(placed.path);
+                    } else {
                         import.error =
                             Some("The download was not game files. Send them another way.".into());
                     }
+                }
+                Ok(None) => {
+                    installed_root = Some(
+                        import
+                            .home
+                            .join(horizon_client::import::Kind::Resources.folder()),
+                    );
                 }
                 Err(error) => {
                     log::warn!("Horizon: the game files did not download: {error}");
                     import.error = Some(format!("The game files did not download: {error}"));
                 }
             }
-            if !ready {
+            if installed_root.is_none() {
                 import.session = open_session(&import.home);
             }
         }
@@ -155,8 +155,11 @@ impl Loading {
                     horizon_client::import::http::News::Progress { received, total } => {
                         import.received = received;
                         import.total = total;
+                        import.error = None;
                     }
                     horizon_client::import::http::News::Installed(placed) => {
+                        import.total = 0;
+                        import.received = 0;
                         log::info!(
                             "Horizon: imported {} ({} files) to {}",
                             placed.kind.label(),
@@ -166,33 +169,54 @@ impl Loading {
                         // A world or a pack is in place already; the title screen lists it as soon
                         // as there is a title screen. The game files are the only thing that can
                         // start the game.
-                        ready |= placed.kind == horizon_client::import::Kind::Resources;
+                        if placed.kind == horizon_client::import::Kind::Resources {
+                            installed_root = Some(placed.path);
+                        }
                     }
                     horizon_client::import::http::News::Refused { error } => {
+                        import.total = 0;
+                        import.received = 0;
                         import.error = Some(error);
                     }
                 }
             }
         }
-        if ready {
-            return self.files_arrived();
+        if let Some(root) = installed_root {
+            self.files_arrived(root)?;
         }
         Ok(())
     }
 
-    /// Game files are in place (over Wi-Fi, or downloaded by the phone's launcher): stop waiting and load them.
-    pub(super) fn files_arrived(&mut self) -> Result<()> {
-        // Dropping the listener closes the port before the game starts looking at anything.
-        let home = self
-            .import
-            .take()
-            .map(|import| import.home)
-            .unwrap_or_default();
-        self.load_the_files_that_arrived(home)
+    /// Keep the recovery screen alive if an import succeeds but startup fails.
+    pub(super) fn files_arrived(&mut self, root: std::path::PathBuf) -> Result<()> {
+        match self.restart_import_loader(root) {
+            Err(_) if self.import.is_some() => Ok(()),
+            result => result,
+        }
     }
 
-    /// The download, as the phone's SwiftUI download screen reads it (`download-state`): what it is doing and how
-    /// far along, `failed` with why, or `done` once there is nothing left to wait for.
+    pub(super) fn retry_installed_files(&mut self) -> Result<()> {
+        self.retry_import(true)
+    }
+
+    fn restart_import_loader(&mut self, root: std::path::PathBuf) -> Result<()> {
+        let result = self.load_the_files_that_arrived(root);
+        match &result {
+            Err(error) => {
+                if let Some(import) = &mut self.import {
+                    log::warn!("Horizon: could not restart the resource loader: {error}");
+                    import.error = Some(format!(
+                        "The game could not load the installed files: {error}"
+                    ));
+                    import.retry_loader = true;
+                }
+            }
+            Ok(()) => self.import = None,
+        }
+        result
+    }
+
+    /// Status for the phone's SwiftUI download screen.
     pub(super) fn download_state(&self) -> serde_json::Value {
         use horizon_client::import::download::Stage;
         let Some(import) = &self.import else {
@@ -213,30 +237,65 @@ impl Loading {
         }
     }
 
-    /// Try the download again after it failed (`download-retry`): it goes on from what arrived the last time.
+    /// Retry the download or restart the loader on the installed files.
     pub(super) fn retry_download(&mut self) -> Result<()> {
+        self.retry_import(false)
+    }
+
+    fn retry_import(&mut self, loader_only: bool) -> Result<()> {
+        self.poll_import()?;
+        let slot = self
+            .import
+            .as_ref()
+            .and_then(|import| import.session.as_ref())
+            .map(|session| session.reserve_upload_slot())
+            .transpose()?;
+        // Drain any uploads completed before we took the slot.
+        if slot.is_some() {
+            self.poll_import()?;
+        }
         let Some(import) = &mut self.import else {
             return Ok(());
         };
-        if import.download.is_some() {
+        if import.retry_loader {
+            return self.restart_import_loader(self.vanilla_root.clone());
+        }
+        if loader_only || import.download.is_some() {
             return Ok(());
         }
-        let Some(url) = horizon_client::import::download::url(horizon_core::VANILLA_VERSION) else {
-            return Ok(());
-        };
-        import.download = Some(horizon_client::import::download::Download::start(
-            url,
-            import.home.clone(),
-        )?);
+        use horizon_client::import::download;
+        let retry = download::url(horizon_core::VANILLA_VERSION)
+            .ok_or_else(|| std::io::Error::other("No game-file download source is configured."))
+            .and_then(|url| download::Download::start(url, import.home.clone()));
+        match retry {
+            Ok(download) => {
+                import.download = Some(download);
+                self.file_download_attempted = true;
+            }
+            Err(error) => {
+                import.error = Some(error.to_string());
+                return Err(error.into());
+            }
+        }
         // The other doors close while it runs, as they were before the first try.
         import.session = None;
+        import.total = 0;
+        import.received = 0;
         import.error = None;
         Ok(())
     }
 
-    /// Why the loader found nothing to start, as the screen says it.
+    pub(super) fn can_retry_loader(&self) -> bool {
+        self.import
+            .as_ref()
+            .is_some_and(|import| import.retry_loader)
+    }
+
+    /// The latest failure shown by recovery, falling back to the original cause.
     pub(super) fn import_reason(&self) -> Option<&str> {
-        self.import.as_ref().map(|import| import.reason.as_str())
+        self.import
+            .as_ref()
+            .map(|import| import.error.as_deref().unwrap_or(&import.reason))
     }
 
     /// Resolve newly installed files before a loader captures its vanilla base.
@@ -256,15 +315,18 @@ impl Loading {
     }
 
     /// Start the loader again on the files that arrived, as if the first attempt had found them.
-    fn load_the_files_that_arrived(&mut self, home: std::path::PathBuf) -> Result<()> {
+    fn load_the_files_that_arrived(&mut self, root: std::path::PathBuf) -> Result<()> {
         self.loaded = None;
         self.delivered = false;
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
         self.progress = Progress::new();
-        self.refresh_import_root(&home)?;
-        let options = self.options.take().ok_or("loading already finished")?;
+        let mut options = self.options.take().ok_or("loading already finished")?;
+        // An unreadable bundle or explicit root can still have a manifest.
+        // Use the path validated by the importer instead of selecting that root again.
+        options.resources = root.clone();
+        self.vanilla_root = root;
         let spawned = startup_menu::spawn_loader(
             &options,
             &self.settings,

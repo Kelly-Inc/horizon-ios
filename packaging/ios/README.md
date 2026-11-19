@@ -68,7 +68,8 @@ each, so nothing in the render path has to care.
 - `Options::read` looks for `horizon-resources.json` in three places, in this order: a `resources` folder
   **beside the executable**, which on a phone means inside the bundle; then `Documents/resources`, which is
   where an import unpacks; then `Documents/.local/horizon-client/26.3`, the desktop fallback, which the Files
-  app neither shows nor lets you create.
+  app neither shows nor lets you create. If the bundled files fail the prepared-file check and
+  the imported copy passes it, startup uses the imported copy.
 - The first stop is a developer's own: in Xcode, add your prepared `.local/horizon-client/26.3` to the
   **Horizon game** target as a folder reference with a path in bundle of `resources` (produce folders: keep
   their name or rename it there). It is fine to sign for yourself and it is the fastest debug loop, but a
@@ -86,7 +87,8 @@ custom download link, or import a ZIP through Files. Preparation of raw Java fil
 runs on a computer. Use **Reinstall game files** when the engine rejects an existing
 installation. The shared game's recovery screen also supports the routes below.
 
-On the computer, with the same `horizon-client` a player already has:
+On the computer, run `horizon-prepare --check` before packing. If it reports missing sounds,
+run `horizon-prepare sounds` against the same prepared folder. Then create the ZIP with the desktop client:
 
 ```sh
 horizon-client --pack-resources .local/horizon-client/26.3 --out Horizon-26.3.zip
@@ -122,8 +124,12 @@ rather than a dead end.
 *Files* tab, or iTunes' *File Sharing*, or any manager that gets there -- and launch. `main.rs` unpacks what it
 finds there before the game looks for its resources, then deletes the archive.
 
+ZIP imports accept up to 2 GiB compressed. Worlds and prepared game files must also fit within
+4 GiB unpacked. For larger world backups, extract the ZIP on a computer and copy the folder
+containing `level.dat` or `level.dat_old` into `Documents/saves` under a new name.
+
 Both doors route by the archive's root, so one file format carries three things: `horizon-resources.json` is
-the game files, `level.dat` is a world (into `Documents/saves`, never over one that exists), `pack.mcmeta` is a
+the game files, `level.dat` or `level.dat_old` is a world (into `Documents/saves`, never over one that exists), `pack.mcmeta` is a
 resource pack, which stays a `.zip` because the game reads those where they are. An archive that will not
 unpack is renamed `<name>.zip.failed` rather than retried every launch, and an unpacking that a flat battery
 interrupts is finished, or its old tree put back, on the next start -- `import::recover`, before anything reads

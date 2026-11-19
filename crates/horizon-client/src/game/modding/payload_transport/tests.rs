@@ -437,16 +437,21 @@ fn integrated_memory_delivers_registered_raw_payload_and_reply() {
                 "production integrated server handle"
             );
             let wire_timeline = timeline.clone();
-            game.remote.as_ref().unwrap().session.start_recording(
-                WireReceipt {
-                    stopped: std::sync::atomic::AtomicBool::new(false),
-                    channel: CHANNEL,
-                    expected: expected.clone(),
-                    hits: wire_hits.clone(),
-                    observed: Some(Arc::new(move || wire_timeline.mark(5))),
-                },
-                |_| {},
-            );
+            game.remote
+                .as_ref()
+                .unwrap()
+                .session
+                .start_recording(
+                    WireReceipt {
+                        stopped: std::sync::atomic::AtomicBool::new(false),
+                        channel: CHANNEL,
+                        expected: expected.clone(),
+                        hits: wire_hits.clone(),
+                        observed: Some(Arc::new(move || wire_timeline.mark(5))),
+                    },
+                    |_| {},
+                )
+                .expect("attach the integrated raw-payload recorder");
             let deadline = Instant::now() + WAIT_BUDGET;
             timeline.mark(2);
             sampler.start();

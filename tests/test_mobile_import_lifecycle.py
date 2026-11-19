@@ -18,7 +18,8 @@ def program():
     start = source.index('enum Waiting {')
     end = source.index('fn deliver()', start)
     state = source[start:end]
-    methods = '\n'.join(method(source, name) for name in ('deliver', 'start_import', 'start_owner'))
+    methods = '\n'.join(method(source, name) for name in ('deliver', 'start_owner'))
+    methods += '\n' + source[source.index('fn start_import('):source.index('\nfn install_archive(')]
     if 'fn importing_archive(' in source:
         methods += '\n' + method(source, 'importing_archive')
     loading = source[source.index('impl Loading {'):]
@@ -34,8 +35,9 @@ def program():
 
 STUBS = r'''
 #![allow(dead_code)]
-use std::{cell::RefCell,path::Path,sync::{mpsc::{self,Receiver,TryRecvError},atomic::{AtomicUsize,Ordering},Mutex,Condvar,OnceLock},time::{Duration,Instant}};
+use std::{cell::RefCell,path::{Path,PathBuf},sync::{mpsc::{self,Receiver,TryRecvError},atomic::{AtomicUsize,Ordering},Mutex,Condvar,OnceLock},time::{Duration,Instant}};
 extern crate self as horizon_client;
+extern crate self as serde_json;
 #[path="LAUNCHER_PATH"]mod real_launcher;
 mod horizon_ios_launcher{
  pub use crate::real_launcher::Request;
@@ -43,11 +45,20 @@ mod horizon_ios_launcher{
  pub fn start_owned(owner:Option<&str>)->bool{if let Some(owner)=owner{assert_eq!(owner,"owned-attempt");}crate::STARTS.fetch_add(1,crate::Ordering::SeqCst);true}
  pub fn waiting()->bool{true}
 }
-mod import{pub fn home()->std::path::PathBuf{"fixture/home".into()}}
+mod import{pub fn home()->std::path::PathBuf{"fixture/home".into()}
+ pub fn damaged_prepared(_: &std::path::Path)->Option<String>{None}
+ pub fn install_game_files_if_current(_: &std::path::Path,_:&std::path::Path,_:&str)->std::result::Result<Option<super::Installed>,String>{panic!("Unexpected fixture command")}
+}
 type Result<T>=std::result::Result<T,&'static str>;
 struct Loading;impl Loading{fn refresh_import_root(&mut self,_:&Path)->Result<()>{Ok(())}}
-#[derive(Clone,Copy,PartialEq)]enum Kind{Resources}
-struct Installed{kind:Kind}
+#[derive(Clone,Copy,PartialEq)]enum Kind{Resources,World,ResourcePack}
+impl Kind{fn folder(self)->&'static str{"resources"}}
+struct Installed{kind:Kind,path:PathBuf}
+enum ImportCompletion{Installed(Installed),AlreadyInstalled(PathBuf)}
+type Value=Json;
+fn from_str<T>(_: &str)->std::result::Result<T,()>{Err(())}
+impl std::ops::Index<&str> for Json {type Output=Json; fn index(&self,_:&str)->&Json {self}}
+impl Json {fn as_str(&self)->Option<&str>{Some(&self.0)}}
 struct Json(String);impl std::fmt::Display for Json{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str(&self.0)}}
 macro_rules! json{({"error": $error:expr})=>{Json(format!("error:{}",$error))};({"ok": $ok:expr, "phase": $phase:expr})=>{Json(format!(r#"{{"ok":{},"phase":"{}"}}"#,$ok,$phase))};}
 fn installed_json(_: &Installed)->Json{Json("ok".into())}
@@ -57,7 +68,7 @@ fn gate()->&'static(Mutex<bool>,Condvar){static GATE:OnceLock<(Mutex<bool>,Condv
 fn install_archive(path:&Path,_:&Path,_:bool)->std::result::Result<Installed,String>{
  RUNS.fetch_add(1,Ordering::SeqCst);
  let (lock,signal)=gate();let mut open=lock.lock().unwrap();while !*open{open=signal.wait(open).unwrap();}drop(open);
- if path==Path::new("failed.zip"){Err("fixture decode failure".into())}else{Ok(Installed{kind:Kind::Resources})}
+ if path==Path::new("failed.zip"){Err("fixture decode failure".into())}else{Ok(Installed{kind:Kind::Resources,path:path.to_owned()})}
 }
 fn request(line:&str)->(horizon_ios_launcher::Request,Receiver<String>){let(tx,rx)=mpsc::channel();(horizon_ios_launcher::Request::new(line,move|answer|{tx.send(answer.into()).unwrap();}),rx)}
 fn finish(rx:&Receiver<String>)->String{let limit=Instant::now()+Duration::from_secs(3);loop{deliver();if let Ok(answer)=rx.try_recv(){return answer;}assert!(Instant::now()<limit,"worker did not finish");std::thread::yield_now();}}

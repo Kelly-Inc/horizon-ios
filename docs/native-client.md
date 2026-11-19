@@ -1,6 +1,6 @@
 # Horizon native client
 
-> For iOS/iPadOS installation, use the [mobile setup guide](../README.md) and [mobile releases](https://github.com/heyskylo/horizon-ios/releases). This shared engine guide also describes desktop builds and commands. Its upstream desktop download links do not provide an iOS IPA. Report mobile bugs in [the fork’s issues](https://github.com/heyskylo/horizon-ios/issues).
+> For iOS/iPadOS installation, use the [mobile setup guide](../README.md) and [mobile releases](https://github.com/Kelly-Inc/horizon-ios/releases). This shared engine guide also describes desktop builds and commands. Its upstream desktop download links do not provide an iOS IPA. Report mobile bugs in [the fork’s issues](https://github.com/Kelly-Inc/horizon-ios/issues).
 
 `horizon-client` is the playable Rust client for Minecraft Java Edition 26.3.
 It streams a world around the player on worker threads, renders every vanilla
@@ -471,7 +471,8 @@ private.
 The iOS build ships with no assets in it -- the workflow refuses any bundle
 containing `horizon-resources.json`, and the phone's own bundle is read-only
 while the game runs -- so a phone is given its files by the game it already has
-on the computer that prepared them:
+on the computer that prepared them. Run `horizon-prepare --check` before packing. If it reports
+missing sounds, run `horizon-prepare sounds` against that same prepared folder.
 
 ```sh
 horizon-client --pack-resources .local/horizon-client/26.3 --out Horizon-26.3.zip

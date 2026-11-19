@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tools.ci.source_mtimes import restore_and_snapshot
 from tests.test_ci_concurrency import ROOT, yaml
@@ -64,6 +65,56 @@ class SourceMtimesTests(unittest.TestCase):
         os.utime(source.parent, ns=(1, 1))
         restore_and_snapshot(self.root, self.snapshot)
         self.assertGreater(source.parent.stat().st_mtime_ns, before)
+
+    def test_snapshot_refreshes_both_sides_of_a_rename_and_deleted_parents(self):
+        root = self.root
+        left, right = root / "src/left", root / "src/right"
+        removed = root / "src/removed"
+        for directory in (left, right, removed):
+            directory.mkdir()
+        (left / "kept.txt").write_text("kept")
+        (left / "moved.txt").write_text("moved")
+        (removed / "deleted.txt").write_text("deleted")
+        self.commit()
+        restore_and_snapshot(root, self.snapshot)
+        pinned = (left / "kept.txt").stat().st_mtime_ns
+        (left / "moved.txt").rename(right / "moved.txt")
+        shutil.rmtree(removed)
+        self.commit()
+
+        for path in (root / "src", left, right, right / "moved.txt", left / "kept.txt"):
+            os.utime(path, ns=(1, 1))
+        restore_and_snapshot(root, self.snapshot)
+        self.assertEqual((left / "kept.txt").stat().st_mtime_ns, pinned)
+        for path in (root / "src", left, right, right / "moved.txt"):
+            self.assertGreater(path.stat().st_mtime_ns, 1)
+        self.assertFalse(removed.exists())
+
+    def test_unreadable_or_malformed_snapshot_refreshes_file_timestamps(self):
+        self.snapshot.parent.mkdir()
+        source = self.root / "src/value.txt"
+        for prior in (b'{"interrupted":', b"[]", b'{"src/value.txt": []}'):
+            with self.subTest(prior=prior):
+                self.snapshot.write_bytes(prior)
+                os.utime(source, ns=(1, 1))
+                restore_and_snapshot(self.root, self.snapshot)
+                fresh = json.loads(self.snapshot.read_text())
+                self.assertGreater(fresh["src/value.txt"][1], 1)
+                self.assertEqual(source.stat().st_mtime_ns, fresh["src/value.txt"][1])
+
+    def test_interrupted_snapshot_write_preserves_the_previous_snapshot(self):
+        restore_and_snapshot(self.root, self.snapshot)
+        previous = self.snapshot.read_bytes()
+
+        def fail(_, stream, **kwargs):
+            stream.write('{"interrupted":')
+            raise OSError("simulated snapshot write error")
+
+        with mock.patch("tools.ci.source_mtimes.json.dump", side_effect=fail):
+            with self.assertRaisesRegex(OSError, "snapshot write error"):
+                restore_and_snapshot(self.root, self.snapshot)
+        self.assertEqual(self.snapshot.read_bytes(), previous)
+        self.assertEqual(list(self.snapshot.parent.iterdir()), [self.snapshot])
 
     @unittest.skipIf(os.name == "nt", "creating a symlink needs a privilege on Windows")
     def test_modified_checkout_is_refused_and_symlinks_are_not_followed(self):
@@ -132,8 +183,41 @@ class SourceMtimesTests(unittest.TestCase):
 
 
 # Steps that compile into the job's Cargo target: Cargo itself and the tools that run it.
-BUILDS = re.compile(r"\bcargo (build|test|check|clippy|rustc|run|doc)\b|vanilla-data\.sh|prebuilt_game\.py|"
+BUILDS = re.compile(r"\bcargo (\+\S+ )?(build|test|check|clippy|rustc|run|doc)\b|vanilla-data\.sh|prebuilt_game\.py|"
                     r"ignored_tests\.py|run_test_binaries\.py")
+
+
+class BlacksmithBuildFolderTests(unittest.TestCase):
+    def test_every_verify_build_on_blacksmith_restores_its_own_disk_first(self):
+        # A build before the restore would compare against checkout dates and trust another tree's artifacts' dates;
+        # two jobs on one disk would each replace the other's build.
+        workflow = ROOT / ".github/workflows/ci.yml"
+        if not workflow.is_file():
+            self.skipTest("The mobile fork does not run upstream desktop CI")
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        keys, commits = [], []
+        for name, job in jobs.items():
+            steps = job.get("steps", [])
+            builds = [i for i, step in enumerate(steps) if BUILDS.search(step.get("run", ""))]
+            if not builds or "blacksmith-" not in str(job.get("runs-on")):
+                continue
+            with self.subTest(job=name):
+                mount = next(i for i, step in enumerate(steps)
+                             if step.get("uses", "").startswith("useblacksmith/stickydisk@"))
+                restore = next(i for i, step in enumerate(steps) if "tools/ci/build_folder.sh" in step.get("run", ""))
+                self.assertLess(mount, restore)
+                self.assertLess(restore, builds[0])
+                self.assertEqual(steps[restore]["run"], f"tools/ci/build_folder.sh {steps[mount]['with']['path']}")
+                self.assertEqual(steps[mount]["if"], steps[restore]["if"])
+                keys.append(steps[mount]["with"]["key"])
+                commits.append(steps[mount]["with"].get("commit"))
+        self.assertGreaterEqual(len(keys), 4)
+        self.assertEqual(len(set(keys)), len(keys))
+        for key in keys:
+            # Forks' pull requests mount main's disks too: a disk of their own was never saved (pull_request jobs
+            # cannot), so they built from scratch.
+            self.assertTrue(key.endswith("-own"), key)
+        self.assertEqual(commits, ["${{ env.SAVE_BUILD_DISK }}"] * len(keys))
 
 
 if __name__ == "__main__":

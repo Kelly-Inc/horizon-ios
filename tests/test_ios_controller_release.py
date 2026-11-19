@@ -38,6 +38,9 @@ mod horizon_gamecontroller{
  pub fn active_controller()->Option<ConnectedController>{ACTIVE.with_borrow(Clone::clone)}
  pub fn active()->Option<Snapshot>{active_controller().map(|p|p.state)}
  pub fn snapshots()->Vec<ConnectedController>{active_controller().into_iter().collect()}
+ pub fn snapshots_with_active()->(Vec<ConnectedController>,Option<u64>){
+  let pads=snapshots();let active=pads.first().map(|pad|pad.id);(pads,active)
+ }
  pub fn controllers()->Vec<Controller>{snapshots().into_iter().map(|p|p.controller).collect()}
 }
 type Rect=[f32;4];

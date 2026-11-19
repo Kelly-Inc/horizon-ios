@@ -74,7 +74,7 @@ fn main() {
                 "cancel" => fingers.cancel(id),
                 _ => fingers.moved(id, (x as f32, y as f32), &[]),
             };
-            events = game.dispatch(out, c["scale"].as_f64().unwrap_or(1.) as f32);
+            events = game.dispatch(out, c["scale"].as_f64().unwrap_or(1.) as f32, op == "cancel");
         } else if c["mode"] == "world_stick" {
             let r = [0., 0., w as f32, h as f32];
             let layout = [(touch::Control::Joystick, r)];
@@ -83,7 +83,7 @@ fn main() {
                 "end" => fingers.end(1),
                 _ => fingers.moved(1, (x as f32, y as f32), &layout),
             };
-            events = game.dispatch(out, 1.);
+            events = game.dispatch(out, 1., false);
         } else if c["mode"] == "world_buttons" || c["mode"] == "menu_buttons" {
             let id = e["id"].as_u64().unwrap();
             let control = game::control(e["code"].as_i64().unwrap());
@@ -104,7 +104,7 @@ fn main() {
                     1 => fingers.moved(id, at, &layout),
                     _ => fingers.end(id),
                 };
-                events = game.dispatch(out, 1.);
+                events = game.dispatch(out, 1., false);
             } else {
                 for action in buttons.event_controls(id, phase, at, (w as f32, h as f32), &layout) {
                     match action {

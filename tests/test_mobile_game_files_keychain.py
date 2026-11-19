@@ -26,7 +26,7 @@ def program(source=None):
     origin = swift_block(source, source.index("struct GameFilesOrigin"))
     credential = swift_block(source, source.index("struct GameFilesCredential"))
     vault = swift_block(source, source.index("private enum Keychain"))
-    start = swift_block(source, source.index("    func start()"))
+    start = swift_block(source, source.index("    func start(gameFilesOnly:"))
     error_facts = swift_block(source, source.index("    nonisolated static func errorFacts("))
     return "\n".join((PREAMBLE, origin, credential, vault, "final class StartProbe {",
                       START_STUBS, error_facts, start, "}", CASES))
@@ -91,7 +91,7 @@ var diagnosticEvents:[String] = []
 func trace(_ event:String) {diagnosticEvents.append(event)}
 
  enum State {case idle,failed(String)}
- var busy=false,resourcesOnly=true
+ var busy=false,resourcesOnly=true,automaticDownload=true
  var attempt=UUID()
  var link=" https://fixture.invalid/archive.zip "
  var token=" replacement-token "
@@ -151,12 +151,18 @@ check("failed save gates download"){
 check("successful save starts download"){
  let model=StartProbe();model.start()
  expect(model.requests.count == 1,"saved credential starts one download")
+ expect(!model.resourcesOnly && !model.automaticDownload,"general imports still accept worlds and packs")
  expect(model.requests.first?.1 == "replacement-token","download uses trimmed token")
  expect(Keychain.read(for: fixtureOrigin) == "replacement-token","saved token matches request")
  expect(UserDefaults.standard.values["gameFilesLink"] == "https://fixture.invalid/archive.zip","saved link matches request")
 }
+check("custom setup routes to the game-file validator"){
+ let model=StartProbe();model.start(gameFilesOnly:true)
+ expect(model.requests.count == 1,"custom setup starts one download")
+ expect(model.resourcesOnly && !model.automaticDownload,"custom setup requires prepared files without treating the link as automatic")
+}
 if failures > 0 {exit(1)}
-print("8 credential/download cases passed")
+print("9 credential/download cases passed")
 '''
 
 
@@ -174,4 +180,4 @@ class GameFilesKeychainTests(unittest.TestCase):
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
             run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            self.assertIn("8 credential/download cases passed", run.stdout)
+            self.assertIn("9 credential/download cases passed", run.stdout)

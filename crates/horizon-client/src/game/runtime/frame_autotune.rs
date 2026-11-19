@@ -7,6 +7,36 @@ use horizon_client::gfx::Renderer;
 use horizon_client::graphics::{GpuCullingMode, Graphics};
 use horizon_client::perf_overlay::FrameGraph;
 
+impl super::Game<'_> {
+    /// A different world has a different rendering workload. Apply the initial
+    /// settings before its first frame and discard the previous world's samples.
+    pub(super) fn reset_frame_autotune(&mut self) {
+        self.dynamic_resolution.reset();
+        self.gpu_culling_auto.reset();
+        let g = &self.settings.horizon;
+        if let Some(renderer) = &mut self.renderer {
+            if g.dynamic_resolution {
+                apply_world_post(renderer, g, g.resolution_scale);
+            }
+            if g.gpu_culling == GpuCullingMode::Auto {
+                let _ = renderer.set_gpu_culling(false);
+            }
+        }
+    }
+
+    pub(super) fn frame_autotune_settled(&self) -> bool {
+        self.screen == super::Screen::Playing
+            && self.title.is_none()
+            && self.player.is_some()
+            && self.integrated_starting.is_none()
+            && self.pending_entry.is_none()
+            && self.pack_reload.is_none()
+            && !self.content_reload_busy()
+            && !self.remote_screen_up()
+            && !self.streaming.terrain_loading()
+    }
+}
+
 /// One rendered frame of `r`, its CPU and whole time in milliseconds. `settled`: the player is
 /// in a world that has loaded, the only frames either mode counts (a chunk load's slow frames
 /// would read as a slow scene).

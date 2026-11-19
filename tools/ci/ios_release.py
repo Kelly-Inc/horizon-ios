@@ -2,6 +2,7 @@
 """Audit an unsigned iOS build and prepare its versioned release assets."""
 import argparse
 import hashlib
+import os
 import plistlib
 import re
 import shutil
@@ -11,6 +12,7 @@ import tempfile
 import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath
+from xml.parsers.expat import ExpatError
 
 VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){0,2}\Z")
 PRIVATE_NAMES = {"horizon-resources.json", "horizon-data.bin", "horizon-auth.json",
@@ -35,20 +37,36 @@ def release_version(run, attempt):
     return f"0.1.{patch}", f"{run}.{attempt}"
 
 
+def read_bundle_info(data, path):
+    try:
+        info = plistlib.loads(data)
+    except (ExpatError, ValueError) as error:
+        raise ValueError(f"Unreadable bundle metadata: {path}") from error
+    if not isinstance(info, dict):
+        raise ValueError(f"Bundle metadata must be a dictionary: {path}")
+    identifier = info.get("CFBundleIdentifier")
+    if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*", identifier):
+        raise ValueError(f"Missing or invalid CFBundleIdentifier: {path}")
+    return info
+
+
 def stamp_app(app, run, attempt, commit, client_id):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Invalid source commit")
     version, build = release_version(run, attempt)
     paths = [app / "Info.plist", *sorted((app / "Frameworks").glob("*.framework/Info.plist"))]
-    # Read all metadata before changing any file.
-    records = [(path, plistlib.loads(path.read_bytes())) for path in paths]
-    for path, info in records:
+    # Read and validate all metadata before changing any file.
+    records = []
+    for path in paths:
+        info = read_bundle_info(path.read_bytes(), path)
         info["CFBundleShortVersionString"] = version
         info["CFBundleVersion"] = build
         if path == app / "Info.plist":
             info["HorizonBuildCommit"] = commit
             info["HorizonMSAClientID"] = client_id
-        path.write_bytes(plistlib.dumps(info))
+        records.append((path, plistlib.dumps(info)))
+    for path, data in records:
+        path.write_bytes(data)
     return version, build
 
 
@@ -123,6 +141,25 @@ def bundle_executable(bundle, info, binaries, file_type, label):
     return binary[1]
 
 
+def verify_native_game(archive, executable):
+    # The Objective-C placeholder is also a valid unsigned ARM64 Mach-O.
+    # The Rust engine uses both strings for its native launcher dlsym call.
+    markers = {
+        b"horizon_launcher_present\0",
+        b"Frameworks/HorizonLauncherKit.framework/HorizonLauncherKit",
+    }
+    overlap = max(map(len, markers)) - 1
+    tail = b""
+    with archive.open(executable.as_posix()) as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            chunk = tail + block
+            markers = {marker for marker in markers if marker not in chunk}
+            if not markers:
+                return
+            tail = chunk[-overlap:]
+    raise ValueError("App executable is missing the Rust game's native launcher bridge")
+
+
 def audit_payload_layout(paths, app):
     # Installers may unpack on case-insensitive or normalization-insensitive volumes.
     # Check implicit directories too: Assets/a and assets/b need not be ZIP entries
@@ -165,8 +202,12 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
                     or name.startswith(".env")
                     or parts & {"_codesignature", "xcuserdata", "saves", "logs"}):
                 raise ValueError("The IPA contains signing material, private files or game assets")
-            if stat.S_ISLNK(entry.external_attr >> 16):
+            file_type = stat.S_IFMT(entry.external_attr >> 16)
+            if file_type == stat.S_IFLNK:
                 raise ValueError("The IPA contains a symbolic link")
+            expected_type = stat.S_IFDIR if entry.is_dir() else stat.S_IFREG
+            if file_type not in (0, expected_type):
+                raise ValueError(f"Unexpected IPA entry file type: {path}")
             for component in (path, *path.parents):
                 if component.suffix == ".framework":
                     framework_paths.add(component)
@@ -179,11 +220,11 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
             if len(path.parts) == 3 and path.parts[1].endswith(".app") and path.name == "Info.plist":
                 if entry.file_size > 1 << 20:
                     raise ValueError("Oversized app Info.plist")
-                infos.append((path.parent, plistlib.loads(archive.read(entry))))
+                infos.append((path.parent, read_bundle_info(archive.read(entry), path)))
             if path.name == "Info.plist" and path.parent.suffix == ".framework":
                 if entry.file_size > 1 << 20:
                     raise ValueError("Oversized framework Info.plist")
-                frameworks[path.parent] = plistlib.loads(archive.read(entry))
+                frameworks[path.parent] = read_bundle_info(archive.read(entry), path)
         if archive.testzip() is not None:
             raise ValueError("The IPA contains a corrupt ZIP entry")
         if len(infos) != 1:
@@ -200,6 +241,9 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
         if expected_minimum_os is not None and app_minimum != expected_minimum_os:
             raise ValueError("IPA MinimumOSVersion does not match the configured iOS deployment target")
         required = bundle_executable(app, info, binaries, 2, "app")
+        executable_mode = archive.getinfo((app / info["CFBundleExecutable"]).as_posix()).external_attr >> 16
+        if not stat.S_ISREG(executable_mode) or not executable_mode & stat.S_IXUSR:
+            raise ValueError("The IPA app executable must be a regular file with owner execute permission")
         if app_minimum is not None and required > app_minimum:
             raise ValueError("App executable requires a newer iOS version than MinimumOSVersion")
         version, build = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
@@ -213,6 +257,7 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
             # The engine opens this exact relative path at runtime.
             if launcher is None or launcher.get("CFBundleExecutable") != launcher_name:
                 raise ValueError("Missing HorizonLauncherKit launcher framework at the expected path")
+            verify_native_game(archive, app / info["CFBundleExecutable"])
         if expected_client_id is not None:
             if not expected_client_id or info.get("HorizonMSAClientID") != expected_client_id:
                 raise ValueError("IPA Microsoft client ID does not match the build configuration")
@@ -243,6 +288,8 @@ def audit(ipa, expected_commit=None, expected_version=None, *,
 
 def prepare(ipa, output, expected_commit, expected_version=None, *,
             require_launcher=False, expected_client_id=None, expected_minimum_os=None):
+    import fcntl
+
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ios-release-", dir=output) as staging:
         staged_ipa = Path(staging) / "artifact.ipa"
@@ -258,11 +305,34 @@ def prepare(ipa, output, expected_commit, expected_version=None, *,
         target = output / f"Horizon-iOS-{version}-build{build}-unsigned.ipa"
         checksum = target.with_suffix(target.suffix + ".sha256")
         staged_checksum.write_text(f"{digest}  {target.name}\n", encoding="utf-8")
-        # Both files are ready. If publication stops between the renames, the
-        # IPA may be present without a checksum, but never with the old one.
-        checksum.unlink(missing_ok=True)
-        staged_ipa.replace(target)
-        staged_checksum.replace(checksum)
+        # A concurrent preparation may target the same version/build pair.
+        # Hold the directory lock only while publishing, and let close release
+        # it even on error. No sidecar lock file needs cleanup after interruption.
+        directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            # Both files are ready. If publication stops between the renames, the
+            # IPA may be present without a checksum, but never with the old one.
+            previous_checksum = Path(staging) / "previous.sha256"
+            if checksum.is_dir() and not checksum.is_symlink():
+                raise IsADirectoryError(f"Checksum destination is a directory: {checksum}")
+            try:
+                checksum.replace(previous_checksum)
+            except FileNotFoundError:
+                pass
+            try:
+                staged_ipa.replace(target)
+            except OSError as error:
+                # The old IPA is still in place, so its checksum is still valid.
+                if previous_checksum.exists() or previous_checksum.is_symlink():
+                    try:
+                        previous_checksum.replace(checksum)
+                    except OSError as restore_error:
+                        error.add_note(f"Could not restore the previous checksum: {restore_error}")
+                raise
+            staged_checksum.replace(checksum)
+        finally:
+            os.close(directory_fd)
     return {"ipa": str(target), "checksum": str(checksum), "version": version, "build": build}
 
 

@@ -1,5 +1,5 @@
 {
-  "horizon.import.game_files_only": "The automatic download did not contain game files.",
+  "horizon.import.game_files_only": "This archive does not contain prepared game files.",
   "horizon.no_resources.title": "No prepared game files",
   "horizon.no_resources.prepare": "Prepare them with horizon-prepare --prepare, or pass --resources <folder>.",
   "horizon.no_resources.looked_in": "No prepared game files in %s",
@@ -326,6 +326,7 @@
   "horizon.mods.switch.registries": "adds blocks, items or other registry entries",
   "horizon.mods.switch.restart": "Restart the game to apply %s: they add blocks, items or world generation.",
   "horizon.shader_options.profile": "Profile",
+  "horizon.shader_options.save_error": "Could not save shader options for %s. %s",
   "horizon.agent.copy_details": "Copy Connection Details",
   "horizon.multiplayer.join": "Join",
   "horizon.multiplayer.cancel_reconnecting": "Cancel Reconnecting",
@@ -744,6 +745,7 @@
   "How textures are sampled: sharper at a slant with Anisotropic.": "How textures are sampled: sharper at a slant with Anisotropic.",
   "How far Anisotropic filtering goes. Higher is sharper at a slant.": "How far Anisotropic filtering goes. Higher is sharper at a slant.",
   "Only with Anisotropic texture filtering.": "Only with Anisotropic texture filtering.",
+  "Only with the default resource pack.": "Only with the default resource pack.",
   "Shader Packs...": "Shader Packs...",
   "Picks a shader pack, Horizon's or a shaders/ folder one, and sets its options.": "Picks a shader pack, Horizon's or a shaders/ folder one, and sets its options.",
   "Reuses the pack shadow map when sun, view and world match. Off by default.": "Reuses the pack shadow map when sun, view and world match. Off by default.",

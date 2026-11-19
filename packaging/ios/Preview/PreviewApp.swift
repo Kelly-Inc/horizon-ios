@@ -18,16 +18,32 @@ private enum PreviewEngine {
     static var owner: String?
     static var committed = false
 
-    static func reset() { phase = nil; owner = nil; committed = false }
+    static var cleaningUpCache = false
+
+    static func reset() {
+        phase = nil
+        owner = nil
+        committed = false
+        cleaningUpCache = ProcessInfo.processInfo.environment["PREVIEW_HOLD_CLEANUP"] == "1"
+    }
+    static var alternateGameFiles: Bool {
+        ProcessInfo.processInfo.environment["PREVIEW_ALTERNATE_GAME_FILES"] == "1"
+    }
     static var currentPhase: String {
-        phase ?? (ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" ? "waiting" : "title")
+        phase ?? (alternateGameFiles || ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1"
+                  ? "waiting" : "title")
     }
     static func reply(_ line: String) -> [String: Any]? {
         let words = line.split(separator: " ", maxSplits: 1)
         guard let command = words.first else { return nil }
         let id = words.count == 2 ? String(words[1]) : nil
         switch command {
-        case "launcher-state": return ["phase": currentPhase, "version": "26.3"]
+        case "launcher-state":
+            if ProcessInfo.processInfo.environment["PREVIEW_REJECTED_GAME_FILES"] == "1" {
+                return ["phase": "needs_files", "version": "26.3", "reason": "The installed resource manifest is damaged."]
+            }
+            return ["phase": currentPhase, "version": "26.3", "game_files_present": alternateGameFiles,
+                    "cache_cleanup_in_progress": cleaningUpCache]
         case "launcher-start":
             owner = id
             committed = committed || currentPhase == "world"
@@ -56,6 +72,8 @@ private enum PreviewEngine {
 }
 
 private var finishPreviewImport: (() -> Void)?
+private var pendingPreviewInitialStates: [() -> Void] = []
+private var previewInitialStateReleased = false
 
 private let previewSubmit: HorizonSubmit = { pointer, context, done in
     let line = pointer.map { String(cString: $0) } ?? ""
@@ -70,11 +88,20 @@ private let previewSubmit: HorizonSubmit = { pointer, context, done in
         return
     }
 #endif
+    if line == "launcher-state", ProcessInfo.processInfo.environment["PREVIEW_HOLD_INITIAL_STATE"] == "1",
+       !previewInitialStateReleased {
+        pendingPreviewInitialStates.append {
+            #"{"phase":"waiting","version":"26.3"}"#.withCString { done(context, $0) }
+        }
+        return
+    }
     let response: [String: Any]
     if let engine = PreviewEngine.reply(line) { response = engine }
     else if let options = PreviewOptions.reply(line) { response = options }
     else { switch line {
     case "launcher-state": response = ["phase": ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" ? "waiting" : "title", "version": "26.3"]
+    case "download-state" where ProcessInfo.processInfo.environment["PREVIEW_DOWNLOAD_PRESENTATION"] == "1":
+        response = ["phase": "failed", "error": "Download interrupted"]
     case "game-files-source":
         if let url = ProcessInfo.processInfo.environment["PREVIEW_GAME_FILES_URL"] {
             response = ["url": url, "version": "26.3"]
@@ -82,8 +109,10 @@ private let previewSubmit: HorizonSubmit = { pointer, context, done in
             response = ["error": "Automatic downloads are disabled in the preview."]
         }
     case _ where line.hasPrefix("import-game-files "):
+        let argument = String(line.dropFirst("import-game-files ".count))
+        let payload = try? JSONDecoder().decode([String: String].self, from: Data(argument.utf8))
         if ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1",
-           let bytes = try? Data(contentsOf: URL(fileURLWithPath: String(line.dropFirst("import-game-files ".count)))),
+           let bytes = try? Data(contentsOf: URL(fileURLWithPath: payload?["path"] ?? argument)),
            bytes == Data("horizon-download-fixture".utf8) {
             try? FileManager.default.createDirectory(at: GameFolder.resources, withIntermediateDirectories: true)
             try? Data("{}".utf8).write(to: GameFolder.resources.appendingPathComponent("horizon-resources.json"))
@@ -103,7 +132,7 @@ private let previewSubmit: HorizonSubmit = { pointer, context, done in
             ["folder": "islands", "name": "The Islands", "mode": "survival", "version": "26.3", "last_played": Date().timeIntervalSince1970 * 1000 - 172800000]
         ]]
     case "servers": response = ["servers": [["index": 0, "name": "Hypixel", "address": "mc.hypixel.net"]]]
-    case "server-ping mc.hypixel.net": response = ["motd": "§6§lHypixel Network §8[§c1.8 / 26.3§8]\n§f§lSKYBLOCK §r§dHalloween Event", "online": 9813, "max": 200000, "version": "Java Edition", "ms": 79]
+    case "server-ping mc.hypixel.net": response = ["ok": true, "motd": "§6§lHypixel Network §8[§c1.8 / 26.3§8]\n§f§lSKYBLOCK §r§dHalloween Event", "online": 9813, "max": 200000, "version": "Java Edition", "ms": 79]
     default: response = ["ok": true]
     }
     }
@@ -116,6 +145,7 @@ private let previewSubmit: HorizonSubmit = { pointer, context, done in
 #endif
 struct LauncherPreview: App {
     @State private var previewNotice = false
+    @State private var previewGalleryStaged = false
     init() {
         PreviewEngine.reset()
         for key in ["HORIZON_HOME", "HORIZON_LAUNCHER_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
@@ -126,6 +156,18 @@ struct LauncherPreview: App {
         }
         if ProcessInfo.processInfo.environment["PREVIEW_MISSING_FILES"] == "1" {
             try? FileManager.default.removeItem(at: GameFolder.resources)
+        }
+        if ProcessInfo.processInfo.environment["PREVIEW_REJECTED_GAME_FILES"] == "1" {
+            try? FileManager.default.createDirectory(at: GameFolder.resources, withIntermediateDirectories: true)
+            try? Data("{}".utf8).write(to: GameFolder.resources.appendingPathComponent("horizon-resources.json"))
+        }
+        try? FileManager.default.removeItem(at: GameFolder.screenshots.appendingPathComponent("Preview refreshed screenshot.png"))
+        let galleryFixture = GameFolder.screenshots.appendingPathComponent("Preview unreadable screenshot.png")
+        if ProcessInfo.processInfo.environment["PREVIEW_UNREADABLE_SCREENSHOT"] == "1" {
+            try? FileManager.default.createDirectory(at: GameFolder.screenshots, withIntermediateDirectories: true)
+            try? Data("not a PNG".utf8).write(to: galleryFixture, options: .atomic)
+        } else {
+            try? FileManager.default.removeItem(at: galleryFixture)
         }
         Theme.registerFonts()
         Bridge.submit = previewSubmit
@@ -153,10 +195,33 @@ struct LauncherPreview: App {
                 } message: { Text("The worlds and server entry here are sample data for reviewing the interface. This preview does not start the game.") }
                 .frame(width: ProcessInfo.processInfo.environment["PREVIEW_WIDTH"].flatMap(Double.init).map { CGFloat($0) })
                 .overlay(alignment: .bottomLeading) {
-                    if ProcessInfo.processInfo.environment["PREVIEW_HOLD_IMPORT"] == "1" {
+                    if ProcessInfo.processInfo.environment["PREVIEW_GALLERY_REFRESH"] == "1" {
+                        Button(previewGalleryStaged ? "Fixture screenshot added" : "Add fixture screenshot") {
+                            try? FileManager.default.createDirectory(at: GameFolder.screenshots, withIntermediateDirectories: true)
+                            let file = GameFolder.screenshots.appendingPathComponent("Preview refreshed screenshot.png")
+                            if (try? Data("preview screenshot fixture".utf8).write(to: file, options: .atomic)) != nil {
+                                previewGalleryStaged = true
+                            }
+                        }
+                        .accessibilityIdentifier("fixture-add-gallery-screenshot")
+                        .padding(.leading, 20).padding(.bottom, 110)
+                    } else if ProcessInfo.processInfo.environment["PREVIEW_HOLD_IMPORT"] == "1" {
                         Button("Finish fixture import") { finishPreviewImport?() }
                             .accessibilityIdentifier("fixture-finish-import")
                             .padding(.leading, 20).padding(.bottom, 110)
+                    } else if ProcessInfo.processInfo.environment["PREVIEW_HOLD_CLEANUP"] == "1" {
+                        Button("Finish fixture cleanup") { PreviewEngine.cleaningUpCache = false }
+                            .accessibilityIdentifier("fixture-finish-cleanup")
+                            .padding(.leading, 20).padding(.bottom, 110)
+                    } else if ProcessInfo.processInfo.environment["PREVIEW_HOLD_INITIAL_STATE"] == "1" {
+                        Button("Release initial game state") {
+                            previewInitialStateReleased = true
+                            let pending = pendingPreviewInitialStates
+                            pendingPreviewInitialStates.removeAll()
+                            pending.forEach { $0() }
+                        }
+                        .accessibilityIdentifier("fixture-release-game-state")
+                        .padding(.leading, 20).padding(.bottom, 110)
                     }
                 }
             }
@@ -201,7 +266,8 @@ private final class NativeGestureFixtureController: UIViewController {
     }
     @objc private func frame() {
         guard view.bounds.width > 0 else { return }
-        let displayScale = view.window?.screen.scale ?? UIScreen.main.scale
+        // The gesture bridge and winit both use the render view’s pixel density.
+        let displayScale = view.contentScaleFactor
         let geometry = TouchEditorGeometry(size: view.bounds.size, displayScale: displayScale, limit: 0)
         output.frame = CGRect(x: view.bounds.width * 0.35, y: 50, width: view.bounds.width * 0.55, height: 120)
         target.frame = CGRect(x: view.bounds.width / 2 - 40, y: view.bounds.height - 20 * geometry.pointsPerUnit, width: 80, height: 20 * geometry.pointsPerUnit)
@@ -256,6 +322,7 @@ private final class OrientationFixtureSceneDelegate: NSObject, UIWindowSceneDele
 private final class OrientationFixtureGameController: UIViewController {
     var launcherVisible = false
     private var firstAppearance = true
+    private let gameLabel = UILabel()
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         launcherVisible ? .allButUpsideDown : .landscape
     }
@@ -268,21 +335,28 @@ private final class OrientationFixtureGameController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
-        let label = UILabel()
-        label.text = "Game fixture"
-        label.accessibilityIdentifier = "orientation-game-root"
-        label.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(label)
-        NSLayoutConstraint.activate([label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-                                     label.centerYAnchor.constraint(equalTo: view.centerYAnchor)])
+        gameLabel.text = "Game fixture"
+        gameLabel.accessibilityIdentifier = "orientation-game-root"
+        gameLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(gameLabel)
+        NSLayoutConstraint.activate([gameLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                                     gameLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor)])
     }
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        if !firstAppearance, ProcessInfo.processInfo.environment["PREVIEW_DOWNLOAD_PRESENTATION"] == "1" {
+            gameLabel.accessibilityValue = UIApplication.shared.isIdleTimerDisabled ? "Idle timer disabled" : "Idle timer enabled"
+        }
         guard firstAppearance else { return }
         firstAppearance = false
         turn(view.window?.windowScene, to: .landscape)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            _ = horizonLauncherPresent(previewSubmit)
+            if ProcessInfo.processInfo.environment["PREVIEW_DOWNLOAD_PRESENTATION"] == "1" {
+                UIApplication.shared.isIdleTimerDisabled = true
+                _ = horizonDownloadPresent(previewSubmit)
+            } else {
+                _ = horizonLauncherPresent(previewSubmit)
+            }
         }
     }
 }

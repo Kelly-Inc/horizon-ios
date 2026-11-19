@@ -485,24 +485,29 @@ pub struct VideoMode {
 impl VideoMode {
     /// `VideoMode.read`: the JSON object `write` makes; any other string is None.
     pub fn read(text: &str) -> Option<Self> {
-        let number = |key: &str| -> Option<f64> {
-            let at = text.find(&format!("\"{key}\""))? + key.len() + 2;
-            let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
-            let end = rest
-                .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
-                .unwrap_or(rest.len());
-            rest[..end].parse().ok()
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let fields = value.as_object()?;
+        let number = |key: &str| fields.get(key)?.as_f64();
+        let integer = |key: &str, minimum: i32| {
+            let value = number(key)?;
+            (value.fract() == 0.0 && (f64::from(minimum)..=f64::from(i32::MAX)).contains(&value))
+                .then_some(value as i32)
         };
-        if !text.trim_start().starts_with('{') {
+        let refresh_rate = number("refresh_rate")? as f32;
+        if !refresh_rate.is_finite() || refresh_rate <= 0.0 {
             return None;
         }
+        let red_bits = integer("red_bits", 0)?;
+        let green_bits = integer("green_bits", 0)?;
+        let blue_bits = integer("blue_bits", 0)?;
+        red_bits.checked_add(green_bits)?.checked_add(blue_bits)?;
         Some(Self {
-            width: number("width")? as i32,
-            height: number("height")? as i32,
-            red_bits: number("red_bits")? as i32,
-            green_bits: number("green_bits")? as i32,
-            blue_bits: number("blue_bits")? as i32,
-            refresh_rate: number("refresh_rate")? as f32,
+            width: integer("width", 1)?,
+            height: integer("height", 1)?,
+            red_bits,
+            green_bits,
+            blue_bits,
+            refresh_rate,
         })
     }
 
@@ -556,47 +561,72 @@ pub fn monitor_video_modes(monitor: &winit::monitor::MonitorHandle) -> Vec<Video
         .collect()
 }
 
-/// The video modes of the window's monitor, listed once per monitor. Listing them takes tens of
-/// milliseconds on Windows, and settings apply at every step of a dragged slider: listing them
-/// each time made the slider stutter.
+/// Cache mode enumeration until the monitor or its desktop mode changes.
+/// Listing the modes can stall a dragged settings slider on Windows.
 #[derive(Debug)]
 pub struct VideoModeList<M = winit::monitor::MonitorHandle> {
     listed: Option<M>,
+    desktop_mode: Option<([u32; 2], Option<u32>)>,
 }
 
 impl<M> Default for VideoModeList<M> {
     fn default() -> Self {
-        Self { listed: None }
+        Self {
+            listed: None,
+            desktop_mode: None,
+        }
+    }
+}
+
+impl VideoModeList {
+    pub fn refresh_monitor(
+        &mut self,
+        monitor: Option<winit::monitor::MonitorHandle>,
+    ) -> Option<Vec<VideoMode>> {
+        let desktop_mode = monitor.as_ref().map(|monitor| {
+            let size = monitor.size();
+            ([size.width, size.height], monitor.refresh_rate_millihertz())
+        });
+        self.refresh(monitor, desktop_mode, monitor_video_modes)
     }
 }
 
 impl<M: PartialEq> VideoModeList<M> {
-    /// The modes of `monitor` when it is not the monitor listed last, else `None` (the list
-    /// stands). No monitor lists none.
-    pub fn refresh(
+    /// Return a replacement list when the observed display changes.
+    fn refresh(
         &mut self,
         monitor: Option<M>,
+        desktop_mode: Option<([u32; 2], Option<u32>)>,
         list: impl FnOnce(&M) -> Vec<VideoMode>,
     ) -> Option<Vec<VideoMode>> {
-        if monitor.is_some() && monitor == self.listed {
+        if monitor.is_some() && monitor == self.listed && desktop_mode == self.desktop_mode {
             return None;
         }
         let modes = monitor.as_ref().map(list).unwrap_or_default();
         self.listed = monitor;
+        self.desktop_mode = desktop_mode;
         Some(modes)
     }
 }
 
-/// `Monitor.currentMode`: the monitor's desktop mode; winit has no such query, so the mode of
-/// the monitor's own size with the highest refresh rate and depth.
+/// `Monitor.currentMode`: infer the desktop mode from the reported size and refresh rate.
 fn monitor_current_mode(
     monitor: &winit::monitor::MonitorHandle,
 ) -> Option<winit::monitor::VideoModeHandle> {
     let size = monitor.size();
+    let desktop_refresh = monitor.refresh_rate_millihertz();
     monitor
         .video_modes()
         .filter(|m| m.size() == size)
-        .max_by_key(|m| (m.refresh_rate_millihertz(), m.bit_depth()))
+        .max_by_key(|m| {
+            desktop_mode_priority(m.refresh_rate_millihertz(), m.bit_depth(), desktop_refresh)
+        })
+}
+
+fn desktop_mode_priority(refresh: u32, depth: u16, current: Option<u32>) -> (bool, u32, u16) {
+    // Some backends do not expose the desktop rate or list its exact match.
+    // In that case, keep the fastest mode at the same size as a fallback.
+    (current == Some(refresh), refresh, depth)
 }
 
 /// `window.set_fullscreen(Some(fullscreen))`. On Windows a maximized window leaves its maximized
@@ -786,6 +816,20 @@ mod tests {
     }
 
     #[test]
+    fn desktop_rate_is_preferred_when_the_saved_mode_is_unavailable() {
+        let modes = [(60_000, 24), (144_000, 30), (60_000, 30), (120_000, 24)];
+        let choose = |current| {
+            modes
+                .into_iter()
+                .max_by_key(|&(refresh, depth)| desktop_mode_priority(refresh, depth, current))
+        };
+        assert_eq!(choose(Some(60_000)), Some((60_000, 30)));
+        assert_eq!(choose(Some(120_000)), Some((120_000, 24)));
+        assert_eq!(choose(Some(75_000)), Some((144_000, 30)));
+        assert_eq!(choose(None), Some((144_000, 30)));
+    }
+
+    #[test]
     fn video_mode_round_trips_the_options_json() {
         let mode = VideoMode {
             width: 1920,
@@ -803,6 +847,21 @@ mod tests {
         assert_eq!(VideoMode::read(&text), Some(mode));
         assert_eq!(VideoMode::read("1920x1080"), None);
         assert_eq!(VideoMode::read(r#"{"width":1}"#), None);
+    }
+    #[test]
+    fn malformed_or_unrepresentable_saved_video_modes_are_ignored() {
+        let valid = r#"{"width":1920,"height":1080,"red_bits":8,"green_bits":8,"blue_bits":8,"refresh_rate":59.94}"#;
+        assert_eq!(VideoMode::read(valid).unwrap().refresh_rate, 59.94);
+        assert!(VideoMode::read(valid.trim_end_matches('}')).is_none());
+        for (from, to) in [
+            ("1920", "1920.5"),
+            ("1080", "-1"),
+            ("59.94", "1e99"),
+            ("59.94", "0"),
+            (r#""red_bits":8"#, r#""red_bits":2147483647"#),
+        ] {
+            assert!(VideoMode::read(&valid.replace(from, to)).is_none(), "{to}");
+        }
     }
     #[test]
     fn refresh_rate_label_is_whole_or_two_decimals() {
@@ -1102,11 +1161,31 @@ mod tests {
             listings += 1;
             vec![mode(*monitor)]
         };
-        assert_eq!(list.refresh(Some(1), &mut modes), Some(vec![mode(1)]));
-        assert_eq!(list.refresh(Some(1), &mut modes), None);
-        assert_eq!(list.refresh(Some(2), &mut modes), Some(vec![mode(2)]));
-        assert_eq!(list.refresh(None, &mut modes), Some(vec![]));
-        assert_eq!(list.refresh(Some(2), &mut modes), Some(vec![mode(2)]));
+        assert_eq!(list.refresh(Some(1), None, &mut modes), Some(vec![mode(1)]));
+        assert_eq!(list.refresh(Some(1), None, &mut modes), None);
+        assert_eq!(list.refresh(Some(2), None, &mut modes), Some(vec![mode(2)]));
+        assert_eq!(list.refresh(None, None, &mut modes), Some(vec![]));
+        assert_eq!(list.refresh(Some(2), None, &mut modes), Some(vec![mode(2)]));
         assert_eq!(listings, 3);
     }
+
+    #[test]
+    fn changing_the_desktop_mode_refreshes_the_same_monitor_once() {
+        let mut cache = VideoModeList::default();
+        let mut calls = 0;
+        let mut list = |_: &u32| {
+            calls += 1;
+            Vec::new()
+        };
+        for mode in [
+            ([1920, 1080], Some(60_000)),
+            ([1920, 1080], Some(120_000)),
+            ([2560, 1440], Some(120_000)),
+        ] {
+            assert!(cache.refresh(Some(1), Some(mode), &mut list).is_some());
+            assert!(cache.refresh(Some(1), Some(mode), &mut list).is_none());
+        }
+        assert_eq!(calls, 3);
+    }
+
 }

@@ -2,7 +2,10 @@ import XCTest
 import UIKit
 
 final class LauncherLayoutTests: XCTestCase {
-    private func launch(signedIn: Bool, optionsResponse: String? = nil, gameFilesURL: String? = nil, holdImport: Bool = false) -> XCUIApplication {
+    private func launch(signedIn: Bool, optionsResponse: String? = nil, gameFilesURL: String? = nil,
+                        holdImport: Bool = false, holdInitialState: Bool = false,
+                        alternateGameFiles: Bool = false, holdCleanup: Bool = false,
+                        rejectedGameFiles: Bool = false, unreadableScreenshot: Bool = false, galleryRefresh: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         let root = NSTemporaryDirectory() + "horizon-native-" + UUID().uuidString
         app.launchEnvironment = ["PREVIEW_SIGNED_IN": signedIn ? "1" : "0",
@@ -16,10 +19,63 @@ final class LauncherLayoutTests: XCTestCase {
             app.launchEnvironment["PREVIEW_GAME_FILES_URL"] = gameFilesURL
         }
         if holdImport { app.launchEnvironment["PREVIEW_HOLD_IMPORT"] = "1" }
+        if holdInitialState {
+            app.launchEnvironment["PREVIEW_HOLD_INITIAL_STATE"] = "1"
+            app.launchEnvironment["PREVIEW_MISSING_FILES"] = "1"
+        }
+        if alternateGameFiles {
+            app.launchEnvironment["PREVIEW_ALTERNATE_GAME_FILES"] = "1"
+            app.launchEnvironment["PREVIEW_MISSING_FILES"] = "1"
+        }
+        if holdCleanup { app.launchEnvironment["PREVIEW_HOLD_CLEANUP"] = "1" }
+        if rejectedGameFiles { app.launchEnvironment["PREVIEW_REJECTED_GAME_FILES"] = "1" }
+        if unreadableScreenshot { app.launchEnvironment["PREVIEW_UNREADABLE_SCREENSHOT"] = "1" }
+        if galleryRefresh { app.launchEnvironment["PREVIEW_GALLERY_REFRESH"] = "1" }
         app.launch()
         XCTAssertTrue(app.buttons["launcher-play-button"].waitForExistence(timeout: 15))
         return app
     }
+    func testGalleryRefreshButtonRescansNewScreenshotFiles() {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let app = launch(signedIn: false, galleryRefresh: true)
+        app.buttons.matching(NSPredicate(format: "label == %@", "Settings")).firstMatch.tap()
+        let gallery = app.buttons["Screenshots"].firstMatch
+        for _ in 0..<8 where !gallery.isHittable { app.swipeUp() }
+        XCTAssertTrue(gallery.isHittable)
+        gallery.tap()
+
+        let screenshot = app.buttons["gallery-screenshot-Preview refreshed screenshot.png"]
+        let scroll = app.scrollViews.matching(identifier: "gallery-scroll").firstMatch
+        XCTAssertTrue(scroll.waitForExistence(timeout: 8))
+        XCTAssertFalse(screenshot.exists)
+        let add = app.buttons["fixture-add-gallery-screenshot"]
+        add.tap()
+        XCTAssertEqual(add.label, "Fixture screenshot added")
+        XCTAssertFalse(screenshot.exists)
+        app.buttons["Refresh screenshots"].tap()
+        XCTAssertTrue(screenshot.waitForExistence(timeout: 8))
+    }
+
+    func testUnreadableScreenshotShowsAnErrorAndCanBeClosed() {
+        XCUIDevice.shared.orientation = .landscapeLeft
+        let app = launch(signedIn: false, unreadableScreenshot: true)
+        app.buttons.matching(NSPredicate(format: "label == %@", "Settings")).firstMatch.tap()
+        let gallery = app.buttons["Screenshots"].firstMatch
+        for _ in 0..<8 where !gallery.isHittable { app.swipeUp() }
+        XCTAssertTrue(gallery.isHittable)
+        gallery.tap()
+
+        let screenshot = app.buttons["gallery-screenshot-Preview unreadable screenshot.png"]
+        XCTAssertTrue(screenshot.waitForExistence(timeout: 8))
+        screenshot.tap()
+        let unavailable = app.staticTexts["Couldn’t open this screenshot."]
+        XCTAssertTrue(unavailable.waitForExistence(timeout: 8))
+        app.buttons["Try again"].tap()
+        XCTAssertTrue(unavailable.waitForExistence(timeout: 8))
+        app.buttons["Close screenshot"].tap()
+        XCTAssertTrue(screenshot.waitForExistence(timeout: 8))
+    }
+
     func testLogsExportPresentsFileSavePicker() {
         XCUIDevice.shared.orientation = .landscapeLeft
         let app = launch(signedIn:false)
@@ -65,7 +121,7 @@ final class LauncherLayoutTests: XCTestCase {
         hotbar.coordinate(withNormalizedOffset:CGVector(dx:0.5,dy:0.5)).press(forDuration:0.6)
         expectation(for:NSPredicate(format:"label CONTAINS %@","2:1:4"),evaluatedWith:events)
         waitForExpectations(timeout:5)
-        XCTAssertTrue(events.label.contains("2:3:4"))
+        XCTAssertTrue(events.label.contains("2:3:4"), "events \(events.label), hotbar \(hotbar.frame)")
     }
 
     func testAddBindAndReloadCustomButton() {
@@ -258,6 +314,48 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertFalse(app.alerts["Launcher UI preview"].exists)
     }
 
+    func testPlayWaitsForInitialGameFileStatus() {
+        let app = launch(signedIn: false, holdInitialState: true)
+        let play = app.buttons["launcher-play-button"]
+        XCTAssertFalse(play.isEnabled, "Play must not start the engine while the initial file status is unknown")
+        let unavailable = app.descendants(matching: .any)["launcher-startup-status-error"].firstMatch
+        XCTAssertTrue(unavailable.waitForExistence(timeout: 12))
+        XCTAssertEqual(play.label, "Game status unavailable")
+        XCTAssertFalse(play.isEnabled)
+        app.buttons["fixture-release-game-state"].tap()
+        expectation(for: NSPredicate(format: "enabled == true AND label == 'Game files needed'"),
+                    evaluatedWith: play)
+        waitForExpectations(timeout: 10)
+        XCTAssertFalse(unavailable.exists)
+        play.tap()
+        XCTAssertTrue(app.navigationBars["Game files needed"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.alerts["Launcher UI preview"].exists)
+    }
+
+    func testPlayWaitsUntilCacheCleanupFinishes() {
+        let app = launch(signedIn: false, alternateGameFiles: true, holdCleanup: true)
+        let play = app.buttons["launcher-play-button"]
+        expectation(for: NSPredicate(format: "enabled == false AND label == 'Finishing cleanup…'"),
+                    evaluatedWith: play)
+        waitForExpectations(timeout: 8)
+        app.buttons["fixture-finish-cleanup"].tap()
+        expectation(for: NSPredicate(format: "enabled == true AND label == 'Play'"), evaluatedWith: play)
+        waitForExpectations(timeout: 8)
+        play.tap()
+        XCTAssertTrue(app.alerts["Launcher UI preview"].waitForExistence(timeout: 8))
+    }
+
+    func testGameFilesOutsideDocumentsAllowPlayWithoutStartingDownload() {
+        let app = launch(signedIn: false, alternateGameFiles: true)
+        let play = app.buttons["launcher-play-button"]
+        expectation(for: NSPredicate(format: "enabled == true AND label == 'Play'"), evaluatedWith: play)
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(app.buttons["launcher-download-game-files"].exists)
+        XCTAssertFalse(app.otherElements["launcher-automatic-download-error"].exists)
+        play.tap()
+        XCTAssertTrue(app.alerts["Launcher UI preview"].waitForExistence(timeout: 8))
+    }
+
     func testPreviewPlayUsesOwnedStartupAndPresentationCommit() {
         let app = launch(signedIn: false)
         let play = app.buttons["launcher-play-button"]
@@ -265,6 +363,26 @@ final class LauncherLayoutTests: XCTestCase {
         play.tap()
         XCTAssertTrue(app.alerts["Launcher UI preview"].waitForExistence(timeout: 10))
         XCTAssertFalse(app.alerts["Something went wrong"].exists)
+    }
+
+    func testRecoveryKeepsTheOriginalEngineErrorAfterARepairDownloadFails() {
+        let app = launch(signedIn: false, rejectedGameFiles: true)
+        let repair = app.buttons["launcher-download-game-files"]
+        XCTAssertTrue(repair.waitForExistence(timeout: 8))
+        XCTAssertEqual(repair.label, "Reinstall game files")
+        for _ in 0..<4 where !repair.isHittable { app.swipeUp() }
+        repair.tap()
+        let failure = app.staticTexts["Automatic downloads are disabled in the preview."].firstMatch
+        XCTAssertTrue(failure.waitForExistence(timeout: 8))
+
+        let play = app.buttons["launcher-play-button"]
+        for _ in 0..<4 where !play.isHittable { app.swipeDown() }
+        play.tap()
+        XCTAssertTrue(app.navigationBars["Game files needed"].waitForExistence(timeout: 5))
+        let reason = app.staticTexts["launcher-game-files-engine-problem"]
+        XCTAssertTrue(reason.exists)
+        if reason.exists { XCTAssertEqual(reason.label, "The installed resource manifest is damaged.") }
+        XCTAssertTrue(failure.exists)
     }
 
     func testFirstRunDownloadFailureKeepsRetryAndManualFallbackAvailable() throws {
@@ -284,6 +402,16 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertTrue(app.buttons["launcher-download-game-files"].isEnabled)
         app.buttons["Use a download link instead"].tap()
         XCTAssertTrue(app.staticTexts["Link"].firstMatch.waitForExistence(timeout: 5))
+        launcherNavigationButton("Settings", in: app).tap()
+        let chooseFile = app.buttons["launcher-import-prepared-files"]
+        XCTAssertTrue(chooseFile.waitForExistence(timeout: 5))
+        for _ in 0..<5 where !chooseFile.isHittable { app.swipeUp() }
+        XCTAssertTrue(chooseFile.isHittable)
+        chooseFile.tap()
+        let cancelPicker = app.buttons["Cancel"].firstMatch
+        XCTAssertTrue(cancelPicker.waitForExistence(timeout: 12), app.debugDescription)
+        cancelPicker.tap()
+        XCTAssertTrue(chooseFile.isEnabled)
     }
 
     func testOversizedAutomaticArchiveStopsBeforeImport() throws {
@@ -364,10 +492,15 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertEqual(field.value as? String, "TrailRider")
         app.buttons["Cancel"].tap()
     }
+    private func launcherNavigationButton(_ title: String, in app: XCUIApplication) -> XCUIElement {
+        let sidebarButton = app.buttons["launcher-nav-" + title.lowercased()]
+        return sidebarButton.exists ? sidebarButton : app.tabBars.buttons[title]
+    }
+
     func testLauncherSettingsKeepOnlyGameFilesAndAbout() {
         let app = launch(signedIn: false, optionsResponse: "error")
-        app.tabBars.buttons["Settings"].tap()
-        XCTAssertTrue(app.staticTexts["Game files"].waitForExistence(timeout: 8))
+        launcherNavigationButton("Settings", in: app).tap()
+        XCTAssertTrue(app.staticTexts["Game files"].firstMatch.waitForExistence(timeout: 8))
         XCTAssertTrue(app.staticTexts["About"].exists)
         for title in ["Video", "Sound", "Controls", "Input", "iPad keyboard + pointer lock"] {
             XCTAssertFalse(app.staticTexts[title].exists)
@@ -375,23 +508,39 @@ final class LauncherLayoutTests: XCTestCase {
         XCTAssertFalse(app.buttons["settings-retry"].exists)
     }
 
-    func testNativeTabBarHasOnlyThreeDestinationsAndNavigates() {
+    func testLauncherNavigationHasOnlyThreeDestinationsAndNavigates() {
         let app = launch(signedIn: false)
         let bar = app.tabBars.firstMatch
-        XCTAssertTrue(bar.waitForExistence(timeout: 5))
-        XCTAssertEqual(bar.buttons.count, 3)
-        XCTAssertFalse(bar.buttons["Worlds"].exists)
-        XCTAssertFalse(bar.buttons["Servers"].exists)
+        if bar.exists {
+            XCTAssertEqual(bar.buttons.count, 3)
+            XCTAssertFalse(bar.buttons["Worlds"].exists)
+            XCTAssertFalse(bar.buttons["Servers"].exists)
+        } else {
+            let sidebar = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "launcher-nav-"))
+            XCTAssertEqual(sidebar.count, 3, app.debugDescription)
+            XCTAssertFalse(sidebar["launcher-nav-worlds"].exists)
+            XCTAssertFalse(sidebar["launcher-nav-servers"].exists)
+        }
         XCTAssertFalse(app.otherElements["launcher-floating-dock"].exists)
         XCTAssertFalse(app.staticTexts["All Worlds"].exists)
         XCTAssertFalse(app.staticTexts["Jump back in"].exists)
-        for page in ["Packs", "Settings", "Play"] {
-            let button = bar.buttons[page]
-            XCTAssertTrue(button.isHittable); button.tap()
-            XCTAssertTrue(bar.buttons[page].isSelected)
+        let destinations = [
+            ("Packs", app.staticTexts["Find on Modrinth"]),
+            ("Settings", app.staticTexts["Game files"].firstMatch),
+            ("Play", app.buttons["launcher-play-button"]),
+        ]
+        for (page, marker) in destinations {
+            let button = launcherNavigationButton(page, in: app)
+            XCTAssertTrue(button.isHittable)
+            if !bar.exists { XCTAssertGreaterThanOrEqual(button.frame.height, 44) }
+            button.tap()
+            XCTAssertTrue(marker.waitForExistence(timeout: 5), "Expected the \(page) page")
+            XCTAssertTrue(button.isSelected)
         }
         let image = XCTAttachment(screenshot: app.screenshot())
-        image.name = "Native three-tab navigation"; image.lifetime = .keepAlways; add(image)
+        image.name = "Launcher navigation"
+        image.lifetime = .keepAlways
+        add(image)
     }
 
     func testAccountControlIsCircularAndLibraryRoutesAreAbsent() {

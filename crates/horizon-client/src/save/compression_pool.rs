@@ -39,6 +39,7 @@ pub struct CompressionPool {
 
 impl Drop for CompressionPool {
     fn drop(&mut self) {
+        let _queue = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         self.inner.shutdown.store(true, Ordering::Relaxed);
         self.inner.wake.notify_all();
     }
@@ -66,9 +67,11 @@ impl CompressionPool {
         });
         for i in 0..workers {
             let worker_weak = Arc::downgrade(&inner);
-            let _ = std::thread::Builder::new()
-                .name(format!("horizon-save-compression-{i}"))
-                .spawn(move || worker_loop(worker_weak));
+            // `Record::tag()` can enter a wasm mod, which needs the guest stack.
+            let _ =
+                horizon_guest_stack::spawn(format!("horizon-save-compression-{i}"), move || {
+                    worker_loop(worker_weak)
+                });
         }
         Self { inner, workers }
     }
@@ -82,7 +85,9 @@ impl CompressionPool {
             return;
         }
         if count == 1 || self.workers == 0 {
-            work(0);
+            for i in 0..count {
+                work(i);
+            }
             return;
         }
         let batch = Arc::new(Batch {
@@ -178,16 +183,19 @@ pub fn compress_records_with_pool(
     }
     let compression = Compression::selected();
     let compress = move |record: &Record| {
-        if let Record::Chunk(_, encoding, _) | Record::Proto(_, encoding) = record {
-            encoding
-                .biomes
-                .ensure_saveable()
-                .map_err(io::Error::other)?;
-        }
-        record
-            .tag()
-            .map(|tag| ChunkRecord::from_nbt(&tag, compression, timestamp, Limits::saved()))
-            .transpose()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Record::Chunk(_, encoding, _) | Record::Proto(_, encoding) = record {
+                encoding
+                    .biomes
+                    .ensure_saveable()
+                    .map_err(io::Error::other)?;
+            }
+            record
+                .tag()
+                .map(|tag| ChunkRecord::from_nbt(&tag, compression, timestamp, Limits::saved()))
+                .transpose()
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("chunk compression worker panicked")))
     };
     if count < MIN_PARALLEL_CHUNKS || pool.workers() == 0 {
         return records.iter().map(|(_, r)| compress(r)).collect();
@@ -199,8 +207,7 @@ pub fn compress_records_with_pool(
     let recs = Arc::clone(&records_arc);
     let res_lock = Arc::clone(&results);
     pool.run(count, move |i| {
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compress(&recs[i])))
-            .unwrap_or_else(|_| Err(io::Error::other("chunk compression worker panicked")));
+        let res = compress(&recs[i]);
         res_lock.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(res);
     });
 
@@ -216,4 +223,17 @@ pub fn compress_records(
     timestamp: u32,
 ) -> Vec<io::Result<Option<ChunkRecord>>> {
     compress_records_with_pool(records, timestamp, pool())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compression_pool_without_workers_processes_every_job_in_order() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let output = seen.clone();
+        CompressionPool::new(0).run(4, move |index| output.lock().unwrap().push(index));
+        assert_eq!(*seen.lock().unwrap(), [0, 1, 2, 3]);
+    }
 }

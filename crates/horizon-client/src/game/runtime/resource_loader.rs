@@ -194,6 +194,13 @@ pub(super) enum LoaderMsg {
     Done(std::result::Result<Loaded, String>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorldFolder {
+    Existing,
+    New,
+    OpenOrCreate,
+}
+
 pub(super) enum PendingWorldEntry {
     Local {
         folder: String,
@@ -201,6 +208,7 @@ pub(super) enum PendingWorldEntry {
         seed: Option<i64>,
         creative: bool,
         create: Option<Box<horizon_client::title::WorldOptions>>,
+        world_folder: WorldFolder,
         /// A title-screen action reports recoverable access errors in that UI.
         from_title: bool,
     },

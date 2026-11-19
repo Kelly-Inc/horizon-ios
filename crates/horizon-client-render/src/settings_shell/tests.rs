@@ -840,3 +840,13 @@ fn the_right_button_steps_no_choice_as_vanillas_cycle_button() {
     );
     assert!(shell.screen.pressed.is_empty());
 }
+
+#[test]
+fn slider_keeps_its_position_with_no_steps_or_invalid_track_width() {
+    assert_eq!(slider_step(0.5, Some(0), 100.0, false), 0.5);
+    assert_eq!(slider_step(0.5, Some(0), 100.0, true), 0.5);
+    assert_eq!(slider_step(0.5, None, f32::NAN, true), 0.5);
+    assert_eq!(slider_step(0.5, Some(4), 100.0, false), 0.25);
+    assert_eq!(slider_step(0.5, Some(4), 100.0, true), 0.75);
+    assert!(slider_step(f32::NAN, Some(4), 100.0, true).is_nan());
+}

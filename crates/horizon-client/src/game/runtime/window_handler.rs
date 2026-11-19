@@ -205,11 +205,13 @@ impl Game<'_> {
         {
             self.pad.keyboard_took_over = true;
         }
-        if let WindowEvent::MouseInput { state, button, .. } = &event {
+        if let WindowEvent::MouseInput { state, button, .. } = &event
+            && let Some(buttons) = self.pointer_buttons_mut()
+        {
             if *state == ElementState::Pressed {
-                self.physical_buttons.insert(*button);
+                buttons.insert(*button);
             } else {
-                self.physical_buttons.remove(button);
+                buttons.remove(button);
             }
         }
         let mouse = if !self.pad_synthetic_input()
@@ -231,11 +233,16 @@ impl Game<'_> {
             }
         }
         if mouse.is_some()
+            && !self.touch_synthetic_input()
             && let WindowEvent::MouseInput { state, button, .. } = &event
         {
             self.mod_mappings_button(*button, *state == ElementState::Pressed);
         }
         let resized = matches!(event, WindowEvent::Resized(_));
+        if resized && self.touch_on_phone() {
+            // The AirPlay surface stays valid when the guest's device changes size.
+            self.cancel_touch_and_release_mouse();
+        }
         self.handle_window_event_inner(event_loop, event);
         if resized {
             self.notify_window_resize();
@@ -244,6 +251,18 @@ impl Game<'_> {
         self.settle_title_mode();
         if let Some((button, pressed, modifiers)) = mouse {
             self.native_mouse_button_post(button, pressed, modifiers);
+        }
+    }
+
+    pub(super) fn pointer_buttons_mut(
+        &mut self,
+    ) -> Option<&mut std::collections::HashSet<MouseButton>> {
+        if self.touch_synthetic_input() {
+            Some(&mut self.touch.window_buttons)
+        } else if self.pad_synthetic_input() {
+            None
+        } else {
+            Some(&mut self.physical_buttons)
         }
     }
 
@@ -262,6 +281,8 @@ impl Game<'_> {
         self.pad_close_output();
         if let Err(e) = self.save_for_exit() {
             log::warn!("Horizon: failed to save the world on exit: {e}");
+            // Native termination may reach this path without a close request.
+            self.error.get_or_insert(e);
         }
         self.finish_profile();
         // The client's last moment: its world is left and saved, its options and
@@ -275,6 +296,7 @@ impl Game<'_> {
     /// winit's `about_to_wait`: what happens between frames (stop requests, the closing
     /// save, world entry, the control socket, pads), then the next frame.
     pub(super) fn idle(&mut self, event_loop: &dyn EventLoopCtl) {
+        self.poll_screenshot_capture();
         self.poll_retired_far_terrain();
         self.poll_retired_skin_workers();
         self.poll_recording_workers();
@@ -312,6 +334,7 @@ impl Game<'_> {
             return;
         }
         if let Err(error) = horizon_client::spans::time("world_entry", || self.resume_world_entry())
+            && !self.show_world_preparation_error(error.as_ref())
         {
             self.error = Some(error);
             self.exit_on_error(event_loop);
@@ -503,9 +526,13 @@ impl ApplicationHandler for Game<'_> {
         }
         // Only native window input changes players. Controller menus, touch translation and
         // agent input call the inherent handler on the client that already owns the input.
+        let accepts_guest_input = self.accepts_splitscreen_input();
         if let Some(guest) = &mut self.splitscreen_guest {
             if splitscreen::guest_input(&event) {
-                guest.window_event(event_loop, id, event);
+                // During teardown neither client owns a new phone input.
+                if accepts_guest_input {
+                    guest.window_event(event_loop, id, event);
+                }
                 return;
             }
             if splitscreen::shared_event(&event) {
@@ -568,8 +595,18 @@ impl ApplicationHandler for Game<'_> {
             });
         }
     }
-    fn device_event(&mut self, event_loop: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, id: DeviceId, event: DeviceEvent) {
         if horizon_ios_launcher::covered() {
+            return;
+        }
+        let accepts_guest_input = self.accepts_splitscreen_input();
+        if let Some(guest) = &mut self.splitscreen_guest {
+            if accepts_guest_input {
+                guest.device_event(event_loop, id, event);
+            }
+            return;
+        }
+        if self.splitscreen.guest && (self.title.is_some() || self.remote.is_none()) {
             return;
         }
         if matches!(

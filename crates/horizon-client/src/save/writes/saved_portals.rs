@@ -53,14 +53,19 @@ impl SaveDir {
         biomes: &Biomes,
         is_portal: impl Fn(BlockStateId) -> bool,
     ) -> Arc<[BlockPos]> {
-        let writes = match self.outstanding.portals.0.lock() {
-            Ok(kept) => {
-                if let Some(found) = kept.chunks.get(&(x, z)) {
-                    return found.clone();
+        let writes = {
+            // A submission publishes pending data before invalidating the cache.
+            // Hold its lock for cache lookup only, never for a disk read.
+            let submission = self.writer.lock();
+            match (submission, self.outstanding.portals.0.lock()) {
+                (Ok(_), Ok(kept)) => {
+                    if let Some(found) = kept.chunks.get(&(x, z)) {
+                        return found.clone();
+                    }
+                    kept.writes
                 }
-                kept.writes
+                _ => u64::MAX,
             }
-            Err(_) => u64::MAX,
         };
         // A read that failed finds none now, but isn't kept: the next search reads it again.
         let (found, confirmed): (Arc<[BlockPos]>, bool) =
@@ -134,6 +139,22 @@ mod tests {
         chunk.set(1, 70, 2, obsidian.0);
         write(&save, &chunk);
         assert!(found(&save).is_empty());
+        std::thread::scope(|scope| {
+            let submission = save.writer.lock().unwrap();
+            use std::sync::mpsc::{self, RecvTimeoutError};
+            let (send, recv) = mpsc::channel();
+            let (ready, started) = mpsc::channel();
+            let (save, found) = (&save, &found);
+            scope.spawn(move || {
+                ready.send(()).unwrap();
+                send.send(found(save)).unwrap();
+            });
+            started.recv().unwrap();
+            let early = recv.recv_timeout(std::time::Duration::from_millis(20));
+            drop(submission);
+            assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+            assert!(recv.recv().unwrap().is_empty());
+        });
         // A portal lit and saved after a search: the next search reads the chunk again.
         chunk.set(1, 71, 2, portal.0);
         write(&save, &chunk);

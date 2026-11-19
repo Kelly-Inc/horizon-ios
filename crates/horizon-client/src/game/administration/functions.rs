@@ -689,9 +689,9 @@ impl Game<'_> {
             });
         }
     }
-    pub(super) fn save_schedule(&self) {
+    pub(super) fn save_schedule(&self) -> horizon_client::Result<()> {
         if !self.fns.loaded || self.remote.is_some() {
-            return;
+            return Ok(());
         }
         let mut events = self.fns.schedule.clone();
         events.sort_by_key(|e| (e.time, e.seq));
@@ -716,15 +716,16 @@ impl Game<'_> {
             })
             .collect();
         if events.is_empty() && !self.schedule_path().exists() {
-            return;
+            return Ok(());
         }
-        let _ = save::write_dat(
+        save::write_dat(
             &self.schedule_path(),
             Tag::compound([
                 ("data", Tag::compound([("events", Tag::List(list))])),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]),
-        );
+        )
+        .map_err(|e| format!("could not save scheduled functions: {e}").into())
     }
 
     // ---- ticking -----------------------------------------------------------------
@@ -2395,7 +2396,8 @@ mod tests {
                 super::super::native_world_read::block_in_tag(stone, "reload_test:candidate"),
                 old_tag
             );
-            game.save_datapack_settings();
+            game.save_datapack_settings()
+                .expect("write the data-pack selection before testing rollback");
             let settings = std::fs::read(root.join("datapacks.json")).unwrap();
             let enabled = game.fns.enabled.clone();
             let context = game.loop_context.clone();
@@ -2580,7 +2582,7 @@ mod tests {
                 time: 1000,
                 seq: 1,
             });
-            game.save_schedule();
+            game.save_schedule().unwrap();
             game.fns.schedule.clear();
             assert!(game.run_command("datapack disable \"file/test\""));
             assert!(game.fns.schedule.is_empty());

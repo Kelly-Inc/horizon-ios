@@ -10,62 +10,94 @@ public func horizonLauncherPresent(_ submit: HorizonSubmit?) -> Bool {
     Diagnostics.record("Launcher presented")
     Bridge.submit = submit
     Theme.registerFonts()
-    DispatchQueue.main.async { present(attempts: 20) }
+    DispatchQueue.main.async { present() }
     return true
 }
 
 // Presentation requests can overlap while the Rust bridge acknowledges them.
 private var presentationPending = false
 
-private func present(attempts: Int) {
-    guard let root = gameViewController(), root.view.window != nil else {
-        // Not on screen yet: try again shortly, for a couple of seconds at most.
-        if attempts > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { present(attempts: attempts - 1) }
-        }
-        // Do not leave the resource worker waiting forever if UIKit could not present.
-        else { Task { _ = await Bridge.send("launcher-start") } }
-        return
-    }
-    // Already up: a second request (Quit Game pressed twice) changes nothing.
-    if root is LauncherHostingController || presentationPending {
-        return
-    }
-    TouchGestureBridge.shared.attach(to: root.view)
+@MainActor
+private func present() {
+    // Reserve the whole attempt, including time spent waiting for a window.
+    guard !presentationPending,
+          !gamePresentationStack().contains(where: { $0 is LauncherHostingController }) else { return }
     presentationPending = true
-    let host = LauncherHostingController(rootView: AnyView(EmptyView()))
-    host.rootView = AnyView(
-        HomeView(onPlay: { [weak host] in
-            guard let host else { return }
-            GameAudio.shared.start()
-            let scene = host.view.window?.windowScene
-            host.dismiss(animated: true) {
-                Task { @MainActor in
-                    _ = await Bridge.send("launcher-visible false")
-                    turn(scene, to: .landscape)
+    Task { @MainActor in
+        let root = await prepareLauncherPresentation(
+            attempts: 21,
+            presenter: {
+                guard let root = gameViewController(), root.viewIfLoaded?.window != nil,
+                      !root.isBeingPresented, !root.isBeingDismissed else { return nil }
+                return root
+            },
+            setCovered: { visible in
+                let answer = await Bridge.send("launcher-visible \(visible)")
+                return answer.acknowledged && answer.error == nil
+            },
+            pause: { try? await Task.sleep(nanoseconds: 100_000_000) },
+            startGame: {
+                let answer = await Bridge.send("launcher-start")
+                if answer.acknowledged, answer.error == nil {
+                    GameAudio.shared.start()
                 }
             }
-        })
-
-    )
-    host.modalPresentationStyle = .fullScreen
-    host.modalPresentationCapturesStatusBarAppearance = true
-    host.modalTransitionStyle = .crossDissolve
-    Task { @MainActor in
-        // iOS 16 can retain the game's landscape geometry if presentation and
-        // rotation race the underlying controller's supported-mask change.
-        _ = await Bridge.send("launcher-visible true")
-        guard root.view.window != nil else {
+        )
+        guard let root else {
             presentationPending = false
-            _ = await Bridge.send("launcher-visible false")
             return
         }
+        TouchGestureBridge.shared.attach(to: root.view)
+        let host = LauncherHostingController(rootView: AnyView(EmptyView()))
+        host.rootView = AnyView(
+            HomeView(onPlay: { [weak host] in
+                guard let host else { return }
+                GameAudio.shared.start()
+                let scene = host.view.window?.windowScene
+                host.dismiss(animated: true) {
+                    Task { @MainActor in
+                        _ = await Bridge.send("launcher-visible false")
+                        turn(scene, to: .landscape)
+                    }
+                }
+            })
+        )
+        host.modalPresentationStyle = .fullScreen
+        host.modalPresentationCapturesStatusBarAppearance = true
+        host.modalTransitionStyle = .crossDissolve
         TouchGestureBridge.shared.suspend()
         root.present(host, animated: false) {
             presentationPending = false
             turn(host.view.window?.windowScene, to: UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait)
         }
     }
+}
+
+/// An acknowledgement can arrive after UIKit has replaced the presenting
+/// window. Retry with its replacement, or let the game start without a launcher.
+@MainActor
+func prepareLauncherPresentation(
+    attempts: Int,
+    presenter: () -> UIViewController?,
+    setCovered: (Bool) async -> Bool,
+    pause: () async -> Void,
+    startGame: () async -> Void
+) async -> UIViewController? {
+    var requestedCover = false
+    for attempt in 0..<attempts {
+        if let root = presenter() {
+            // Set the underlying controller's orientation mask before UIKit presents.
+            requestedCover = true
+            guard await setCovered(true) else { break }
+            if presenter() === root { return root }
+        }
+        if attempt + 1 < attempts { await pause() }
+    }
+    await startGame()
+    // A failed reply does not rule out a late visibility change in the engine.
+    // Queue the reversal after the fallback start so the game can be revealed.
+    if requestedCover { _ = await setCovered(false) }
+    return nil
 }
 
 /// Ask the scene to turn to `orientations` now, rather than when the phone is next moved.
@@ -84,18 +116,29 @@ func turn(_ scene: UIWindowScene?, to orientations: UIInterfaceOrientationMask) 
     }
 }
 
-/// The view controller of winit's window: the one the launcher is presented from.
+/// The topmost view controller in the game window.
 func gameViewController() -> UIViewController? {
+    gamePresentationStack().last
+}
+
+/// Includes the launcher or download overlay even while it presents a sheet.
+func gamePresentationStack() -> [UIViewController] {
     let windows = UIApplication.shared.connectedScenes
         .filter { $0.session.role == .windowApplication }
         .compactMap { $0 as? UIWindowScene }
         .flatMap(\.windows)
     let window = windows.first(where: \.isKeyWindow) ?? windows.first
-    var top = window?.rootViewController
-    while let presented = top?.presentedViewController {
-        top = presented
+    return presentationStack(from: window?.rootViewController)
+}
+
+func presentationStack(from root: UIViewController?) -> [UIViewController] {
+    var controllers: [UIViewController] = []
+    var next = root
+    while let controller = next {
+        controllers.append(controller)
+        next = controller.presentedViewController
     }
-    return top
+    return controllers
 }
 
 /// The launcher stands upright, as the design does; the game under it is held sideways by its own view

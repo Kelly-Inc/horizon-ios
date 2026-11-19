@@ -932,6 +932,8 @@ impl ApplicationHandler for Split<'_> {
             .chain(self.guests.iter().map(|g| g.game.framerate_limit()))
             .max()
             .unwrap_or(60);
+        #[cfg(target_os = "ios")]
+        self.host.publish_frame_rate(limit);
         let refresh_hz = self
             .surfaces
             .get(windows::paced_surface(
@@ -961,6 +963,8 @@ impl Game<'_> {
     pub(super) fn release_keyboard_mouse(&mut self) {
         // A routing handoff is not a real window key event (`InputEvent.Key`).
         self.physical_keys.clear();
+        self.debug_keys.reset();
+        self.set_window_ime(false);
         // Only what the keyboard held, and a script acting as it: this player's pad keeps its
         // presses.
         let mut released = self
@@ -994,7 +998,7 @@ impl Game<'_> {
         self.inventory_pick_release();
         self.loom_release();
         self.creative_screen.release();
-        self.ui.options.release();
+        self.finish_interrupted_option_drag();
         self.dragging = false;
         self.stats_release();
         self.world_options_release();
@@ -1005,5 +1009,8 @@ impl Game<'_> {
         }
         self.capture(false);
         self.keyboard_mouse = false;
+        if self.screen == crate::game::Screen::GameModeSwitcher {
+            self.close_gamemode_switcher(false);
+        }
     }
 }

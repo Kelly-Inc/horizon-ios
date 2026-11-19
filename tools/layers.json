@@ -32,9 +32,11 @@
     "horizon-client-core": "engine",
     "horizon-client-input": "engine",
     "horizon-client-lib": "engine",
+    "horizon-client-gameplay": "engine",
     "horizon-client-render": "engine",
     "horizon-command": "engine",
     "horizon-core": "engine",
+    "horizon-gameplay": "engine",
     "horizon-items": "engine",
     "horizon-narrator": "engine",
     "horizon-perf-format": "engine",
@@ -130,6 +132,10 @@
       "horizon-guest-stack",
       "horizon-java-properties"
     ],
+    "pending": {
+      "_doc": "Engine crates that still take a non-portable crate, until the types they need move down. Entries only go away.",
+      "horizon-gameplay": ["horizon-client-lib"]
+    },
     "forbidden": [
       "arboard",
       "cpal",

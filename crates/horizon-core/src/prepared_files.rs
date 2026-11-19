@@ -57,6 +57,17 @@ fn holds_file(name: &str) -> bool {
     holds_folder(name) && !name.ends_with(".ogg")
 }
 
+fn reads_from_cache(name: &str) -> bool {
+    // The preparer can repair a namespace's sound registry and samples
+    // without changing horizon-resources.json. Read both from disk so an
+    // otherwise valid cache never hides a newly installed registry.
+    let sound_registry = name
+        .strip_prefix("assets/")
+        .and_then(|path| path.split_once('/'))
+        .is_some_and(|(_, path)| path == "sounds.json");
+    holds_file(name) && !sound_registry
+}
+
 /// Whether `dir` (from the root) is one of the folders this holds, or under one.
 fn holds_folder(dir: &str) -> bool {
     FOLDERS
@@ -272,10 +283,10 @@ pub fn find(path: &Path) -> Option<(Arc<PreparedFiles>, String)> {
 /// `path`'s bytes: from its prepared root's data file when that holds it,
 /// where a file the data file doesn't have is missing (`NotFound`, without
 /// asking the disk: a texture's `.mcmeta` or LabPBR maps, mostly absent);
-/// else from the disk.
+/// else from the disk. Sound registries use disk alongside their samples.
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
     match find(path) {
-        Some((files, rel)) if holds_file(&rel) => files
+        Some((files, rel)) if reads_from_cache(&rel) => files
             .read(&rel)
             .unwrap_or_else(|| Err(io::ErrorKind::NotFound.into())),
         _ => fs::read(path),
@@ -301,7 +312,7 @@ pub fn files_under(dir: &Path) -> Option<Vec<String>> {
 /// a header, without reading the whole file.
 pub fn read_head(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     match find(path) {
-        Some((files, rel)) if holds_file(&rel) => files
+        Some((files, rel)) if reads_from_cache(&rel) => files
             .read_head(&rel, max)
             .unwrap_or_else(|| Err(io::ErrorKind::NotFound.into())),
         _ => {
@@ -832,6 +843,33 @@ mod tests {
     /// Under a root with a file, a file it holds reads from it and a file it
     /// doesn't is missing even when the disk has one now; a file outside its
     /// folders, or a sound, reads from the disk.
+    #[test]
+    fn repaired_sound_registries_are_visible_with_existing_prepared_cache() {
+        let root = root("repaired-sound-registries");
+        let vanilla = root.join("assets/minecraft/sounds.json");
+        let extra = root.join("assets/example/sounds.json");
+        fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        fs::write(&extra, b"{}").unwrap();
+        write(&root).unwrap();
+        let cache = open(&root).unwrap();
+        assert!(cache.read("assets/minecraft/sounds.json").is_none());
+        assert_eq!(
+            cache.read("assets/example/sounds.json").unwrap().unwrap(),
+            b"{}"
+        );
+
+        let repaired = br#"{"step":{"sounds":["step"]}}"#;
+        fs::write(&vanilla, repaired).unwrap();
+        fs::write(&extra, repaired).unwrap();
+        assert_eq!(read(&vanilla).unwrap(), repaired);
+        assert_eq!(read(&extra).unwrap(), repaired);
+        assert_eq!(read_head(&vanilla, 8).unwrap(), &repaired[..8]);
+        assert_eq!(read_head(&extra, 8).unwrap(), &repaired[..8]);
+        assert!(Arc::ptr_eq(&cache, &open(&root).unwrap()));
+        invalidate(&root);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn read_takes_the_file_for_what_it_holds() {
         let root = root("read");

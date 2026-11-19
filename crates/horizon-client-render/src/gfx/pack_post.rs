@@ -5326,7 +5326,7 @@ impl PackPost {
         if let Err(error) = checked(device, || self.resize_targets(device, size)) {
             self.complete = false;
             self.notes
-                .push(format!("Shader targets could not resize: {error}"));
+                .insert(0, format!("Shader targets could not resize: {error}"));
             return Ok(ResizeState::Failed);
         }
         Ok(ResizeState::Ready)

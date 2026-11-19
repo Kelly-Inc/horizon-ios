@@ -102,6 +102,7 @@ pub struct Counters {
 pub struct ConnReader {
     memory: bool,
     stream: Stream,
+    read_deadline: Option<Instant>,
     /// Bytes read: `buffer[start..end]` are not consumed yet, and reads go
     /// straight into `buffer[end..]`.
     buffer: Vec<u8>,
@@ -181,16 +182,23 @@ impl Connection {
     }
 
     pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Self> {
+        let deadline = Instant::now() + timeout;
         let addrs: Vec<_> = (host, port)
             .to_socket_addrs()
             .map_err(|e| Error::new(format!("Unknown host {host}: {e}")))?
             .collect();
-        Self::connect_addresses(host, addrs, timeout)
+        Self::connect_addresses(host, addrs, deadline)
     }
     /// Connect through Minecraft's SRV redirect. Status requests still use the
     /// original address in their handshake (`ServerStatusPinger.pingServer`).
     pub fn connect_server(host: &str, port: u16, timeout: Duration) -> Result<Self> {
-        Self::connect_server_with_address(host, port, timeout).map(|(connection, _, _)| connection)
+        Self::connect_server_until(host, port, Instant::now() + timeout)
+    }
+
+    /// Connect using the time left for a status exchange.
+    pub fn connect_server_until(host: &str, port: u16, deadline: Instant) -> Result<Self> {
+        let resolved = crate::resolver::resolve(host, port)?;
+        Self::connect_addresses(host, resolved.addresses, deadline)
     }
     /// `ConnectScreen.startConnecting`: login handshakes use the resolved host
     /// and port, including an SRV redirect, rather than the status request's address.
@@ -199,22 +207,23 @@ impl Connection {
         port: u16,
         timeout: Duration,
     ) -> Result<(Self, String, u16)> {
+        let deadline = Instant::now() + timeout;
         let resolved = crate::resolver::resolve(host, port)?;
-        let connection = Self::connect_addresses(host, resolved.addresses, timeout)?;
+        let connection = Self::connect_addresses(host, resolved.addresses, deadline)?;
         Ok((connection, resolved.host, resolved.port))
     }
     /// Each address starts once the earlier ones fail or [`ATTEMPT_DELAY`] after the last
     /// start, alongside those still trying, and the first to connect wins: a dead address
     /// in a round-robin set costs 250 ms instead of the whole timeout.
-    fn connect_addresses(host: &str, addrs: Vec<SocketAddr>, timeout: Duration) -> Result<Self> {
-        Self::connect_addresses_with(host, addrs, timeout, |addr, timeout| {
+    fn connect_addresses(host: &str, addrs: Vec<SocketAddr>, deadline: Instant) -> Result<Self> {
+        Self::connect_addresses_with(host, addrs, deadline, |addr, timeout| {
             TcpStream::connect_timeout(&addr, timeout)
         })
     }
     fn connect_addresses_with<F>(
         host: &str,
         addrs: Vec<SocketAddr>,
-        timeout: Duration,
+        deadline: Instant,
         connect: F,
     ) -> Result<Self>
     where
@@ -225,13 +234,22 @@ impl Connection {
         let mut errors: Vec<Option<std::io::Error>> = addrs.iter().map(|_| None).collect();
         let (mut started, mut pending) = (0, 0);
         loop {
+            if deadline <= Instant::now() {
+                return Err(Error::timed_out());
+            }
             if let Some(&addr) = addrs.get(started) {
                 let (send, index) = (send.clone(), started);
                 let connect = connect.clone();
                 let spawned = std::thread::Builder::new()
                     .name("horizon-connect".into())
                     .spawn(move || {
-                        let _ = send.send((index, connect(addr, timeout)));
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        let result = if remaining.is_zero() {
+                            Err(std::io::ErrorKind::TimedOut.into())
+                        } else {
+                            connect(addr, remaining)
+                        };
+                        let _ = send.send((index, result));
                     });
                 match spawned {
                     Ok(_) => pending += 1,
@@ -245,13 +263,14 @@ impl Connection {
                 }
                 break;
             }
-            let reply = if started < addrs.len() {
-                match recv.recv_timeout(ATTEMPT_DELAY) {
-                    Ok(reply) => reply,
-                    Err(_) => continue,
-                }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let delay = if started < addrs.len() {
+                remaining.min(ATTEMPT_DELAY)
             } else {
-                recv.recv().expect("a sender is held here")
+                remaining
+            };
+            let Ok(reply) = recv.recv_timeout(delay) else {
+                continue;
             };
             pending -= 1;
             match reply {
@@ -282,6 +301,7 @@ impl Connection {
             reader: ConnReader {
                 memory,
                 stream,
+                read_deadline: None,
                 buffer: Vec::new(),
                 start: 0,
                 end: 0,
@@ -393,7 +413,20 @@ impl ConnReader {
     /// Read exactly `len` bytes as they are, with no framing.
     pub fn read_raw(&mut self, len: usize) -> Result<Vec<u8>> {
         let mut out = vec![0u8; len];
-        self.stream.read_exact(&mut out)?;
+        if self.read_deadline.is_none() {
+            self.stream.read_exact(&mut out)?;
+            return Ok(out);
+        }
+        let mut remaining = out.as_mut_slice();
+        while !remaining.is_empty() {
+            self.apply_read_deadline()?;
+            match self.stream.read(remaining) {
+                Ok(0) => return Err(Error::end_of_stream()),
+                Ok(n) => remaining = &mut remaining[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(out)
     }
     /// Block until a whole packet arrives: (id, payload).
@@ -523,6 +556,7 @@ impl ConnReader {
     /// Read once from the stream into the buffer, with room for at least
     /// `frame` bytes of unconsumed data (a whole frame, once its length is known).
     fn fill(&mut self, frame: usize) -> Result<()> {
+        self.apply_read_deadline()?;
         let mut stream = std::mem::replace(&mut self.stream, Stream::Detached);
         let read = self.fill_from(&mut stream, frame);
         self.stream = stream;
@@ -576,6 +610,22 @@ impl ConnReader {
     pub fn closer(&self) -> Result<Closer> {
         Ok(Closer(self.stream.try_clone()?))
     }
+    /// Cap blocking reads at one deadline, even when data arrives in pieces.
+    pub fn set_read_deadline(&mut self, deadline: Instant) {
+        self.read_deadline = Some(deadline);
+    }
+
+    fn apply_read_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.read_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::timed_out());
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        Ok(())
+    }
+
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         Ok(self.stream.set_read_timeout(timeout)?)
     }
@@ -733,6 +783,28 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn status_read_deadline_applies_to_raw_and_framed_reads() {
+        let (client, server) = Pipe::pair();
+        let mut client = Connection::local(client);
+        let mut server = Connection::local(server);
+        client
+            .reader
+            .set_read_deadline(Instant::now() + Duration::from_secs(5));
+        server.writer.write_raw(&[255]).unwrap();
+        assert_eq!(client.reader.read_raw(1).unwrap(), [255]);
+        server.send(&[0]).unwrap();
+
+        client.reader.set_read_deadline(Instant::now());
+        assert!(client.reader.read_raw(1).unwrap_err().is_timed_out());
+        assert!(client.recv().unwrap_err().is_timed_out());
+
+        client
+            .reader
+            .set_read_deadline(Instant::now() + Duration::from_secs(5));
+        assert_eq!(client.recv().unwrap(), (0, Vec::new()));
+    }
+
+    #[test]
     fn ipv4_first_keeps_each_familys_order() {
         let a = |s: &str| s.parse::<SocketAddr>().unwrap();
         let resolved = vec![
@@ -778,8 +850,12 @@ mod tests {
         let v4_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let v6 = v6_listener.local_addr().unwrap();
         let v4 = v4_listener.local_addr().unwrap();
-        let c =
-            Connection::connect_addresses("test", vec![v6, v4], Duration::from_secs(5)).unwrap();
+        let c = Connection::connect_addresses(
+            "test",
+            vec![v6, v4],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(peer(&c), v4);
     }
 
@@ -794,8 +870,12 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let c = Connection::connect_addresses("test", vec![v6, closed], Duration::from_secs(5))
-            .unwrap();
+        let c = Connection::connect_addresses(
+            "test",
+            vec![v6, closed],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(peer(&c), v6);
     }
 
@@ -815,7 +895,7 @@ mod tests {
         let c = Connection::connect_addresses_with(
             "test",
             vec![dead, live],
-            Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(10),
             move |addr, timeout| {
                 if addr == dead {
                     entered.store(true, Ordering::SeqCst);
@@ -838,6 +918,26 @@ mod tests {
     }
 
     #[test]
+    fn pending_address_cannot_extend_the_connection_deadline() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 25565));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Arc::new(Mutex::new(wait));
+        let start = Instant::now();
+        let result = Connection::connect_addresses_with(
+            "test",
+            vec![addr, addr],
+            start + Duration::from_millis(100),
+            move |_, _| {
+                let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(3));
+                Err(std::io::ErrorKind::ConnectionRefused.into())
+            },
+        );
+        drop(release);
+        assert!(result.err().unwrap().is_timed_out());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     #[ignore = "daily"]
     fn every_failure_reports_the_first_address() {
         let closed = |_| {
@@ -847,7 +947,7 @@ mod tests {
                 .unwrap()
         };
         let error = |host, addrs| {
-            Connection::connect_addresses(host, addrs, Duration::from_secs(5))
+            Connection::connect_addresses(host, addrs, Instant::now() + Duration::from_secs(5))
                 .err()
                 .unwrap()
                 .to_string()

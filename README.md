@@ -8,7 +8,7 @@ This community mobile port combines native Metal rendering with a SwiftUI launch
 
 > Unofficial Minecraft software. Not approved by or associated with Mojang or Microsoft. Minecraft's code and assets belong to their respective owners; Minecraft assets are not included in this repository. Use Horizon with your own licensed copy of Minecraft: Java Edition.
 
-[Builds](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml) · [Releases](https://github.com/heyskylo/horizon-ios/releases) · [Report an issue](https://github.com/heyskylo/horizon-ios/issues) · [Upstream Horizon](https://github.com/horizon-rust/horizon)
+[Builds](https://github.com/Kelly-Inc/horizon-ios/actions/workflows/ios.yml) · [Releases](https://github.com/Kelly-Inc/horizon-ios/releases) · [Report an issue](https://github.com/Kelly-Inc/horizon-ios/issues) · [Upstream Horizon](https://github.com/horizon-rust/horizon)
 
 ## On iPad
 
@@ -30,7 +30,7 @@ Lighting and appearance vary with shader packs and settings.
 
 The deployment target is **iOS/iPadOS 16.0 or later** on ARM64 devices. That is a minimum build target, not a guarantee that every supported device can run every world or shader pack. Available memory and GPU capabilities matter.
 
-1. Check [Releases](https://github.com/heyskylo/horizon-ios/releases) for published IPAs, or open a successful run of the [iOS build workflow](https://github.com/heyskylo/horizon-ios/actions/workflows/ios.yml).
+1. Check [Releases](https://github.com/Kelly-Inc/horizon-ios/releases) for published IPAs, or open a successful run of the [iOS build workflow](https://github.com/Kelly-Inc/horizon-ios/actions/workflows/ios.yml).
 2. For a workflow build, download the **`horizon-ios-game-<attempt>`** artifact for the build you want and extract **`Horizon-game-unsigned.ipa`**. GitHub may require sign-in to download artifacts, and older artifacts expire.
 3. Sign the IPA with your own compatible signing setup, then install it on your iPhone or iPad.
 
@@ -42,7 +42,7 @@ The deployment target is **iOS/iPadOS 16.0 or later** on ARM64 devices. That is 
 
 Online mode servers require a Microsoft account that owns Minecraft: Java Edition, with multiplayer permitted for that account.
 
-The mobile launcher downloads a prepared ZIP from the [source configured in the build](crates/horizon-client/src/import/download.rs). If setup fails, **Settings → Game files** offers a retry and a custom link for a prepared ZIP. If the engine rejects installed files, choose **Reinstall game files**. Microsoft sign-in on iOS sets up your game session. To download from Mojang and prepare files, use the desktop launcher and then [transfer the prepared ZIP](docs/native-client.md#carry-your-game-files-to-a-phone).
+The mobile launcher downloads a prepared ZIP from the [source configured in the build](crates/horizon-client/src/import/download.rs). If setup fails, **Settings → Game files** lets you retry, choose a prepared ZIP from Files, or enter its download link. If the engine rejects installed files, choose **Reinstall game files**. Microsoft sign-in on iOS sets up your game session. To download from Mojang and prepare files, use the desktop launcher and then [transfer the prepared ZIP](docs/native-client.md#carry-your-game-files-to-a-phone).
 
 ## Resource packs and shaders
 
@@ -60,7 +60,7 @@ The game's saves, options and pack folders live in the app's Documents directory
 - Java mod `.jar` files do not run directly in this app. Horizon's own mod systems are separate; the mobile launcher does not provide the desktop launcher's native-mod build workflow.
 - Simulator results are useful for UI and regression work, but do not establish performance or compatibility on a physical device.
 
-For recent investigated issues and validation scope, see the [bug-sweep report](docs/ios/item-integrity-sweep.md). Report new problems in [this mobile fork's issue tracker](https://github.com/heyskylo/horizon-ios/issues).
+For recent investigated issues and validation scope, see the [bug-sweep report](docs/ios/item-integrity-sweep.md). Report new problems in [this mobile fork's issue tracker](https://github.com/Kelly-Inc/horizon-ios/issues).
 
 ## Report a bug
 
@@ -80,7 +80,7 @@ For input problems, mention whether you were using touch, a controller, or a key
 You need a Mac with **Xcode 26 or newer and the iOS 26+ SDK**, Rust stable, the iOS ARM64 target, and [XcodeGen](https://github.com/yonaskolb/XcodeGen). The app's deployment target remains iOS 16; the newer SDK is needed to build the native launcher.
 
 ```sh
-git clone https://github.com/heyskylo/horizon-ios.git
+git clone https://github.com/Kelly-Inc/horizon-ios.git
 cd horizon-ios
 rustup target add aarch64-apple-ios
 brew install xcodegen
@@ -111,6 +111,6 @@ How Horizon is run (the council, theme groups and their leads, the Horizon Team,
 
 ## Credits and license
 
-This fork builds on [Horizon](https://github.com/horizon-rust/horizon), created by **Ludovic Marie** and the Horizon contributors. The iOS/iPadOS port is developed in [heyskylo/horizon-ios](https://github.com/heyskylo/horizon-ios) by its maintainers and contributors.
+This fork builds on [Horizon](https://github.com/horizon-rust/horizon), created by **Ludovic Marie** and the Horizon contributors. The iOS/iPadOS port is developed in [Kelly-Inc/horizon-ios](https://github.com/Kelly-Inc/horizon-ios) by its maintainers and contributors.
 
 Original project code is licensed under [MIT](LICENSE). Dependencies retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).

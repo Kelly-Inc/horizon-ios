@@ -1,4 +1,6 @@
+import CoreFoundation
 import CryptoKit
+import Darwin
 import SwiftUI
 import UIKit
 
@@ -35,24 +37,27 @@ private struct PackFileIntegrity: Sendable {
     private enum Algorithm: Sendable { case sha512, sha1 }
     private let algorithm: Algorithm
     private let expectedHash: String
-    private let expectedSize: Int64
+    let expectedSize: Int64
 
     init?(metadata: [String: Any]) {
-        guard let size = metadata["size"] as? Int, size > 0,
-              let hashes = metadata["hashes"] as? [String: String] else { return nil }
+        guard let number = metadata["size"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let size = number as? Int64, size > 0,
+              let hashes = metadata["hashes"] as? [String: Any] else { return nil }
         let algorithm: Algorithm = hashes["sha512"] == nil ? .sha1 : .sha512
         let key = algorithm == .sha512 ? "sha512" : "sha1"
         let length = algorithm == .sha512 ? 128 : 40
-        guard let hash = hashes[key]?.lowercased(), hash.utf8.count == length,
+        guard let hash = (hashes[key] as? String)?.lowercased(), hash.utf8.count == length,
               hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
         self.algorithm = algorithm
         expectedHash = hash
-        expectedSize = Int64(size)
+        expectedSize = size
     }
 
     func matches(_ url: URL) throws -> Bool {
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
+        guard try file.seekToEnd() == UInt64(expectedSize) else { return false }
+        try file.seek(toOffset: 0)
         var sha512 = SHA512()
         var sha1 = Insecure.SHA1()
         var count: Int64 = 0
@@ -83,28 +88,80 @@ final class PackStore: ObservableObject {
     @Published private(set) var installed: [PackKind: [String]] = [:]
 
     typealias Fetch = @MainActor (URL) async -> Any?
-    typealias Transfer = @MainActor (URLRequest) async throws -> (URL, URLResponse)
+    typealias Transfer = @MainActor (URLRequest, Int64) async throws -> (URL, URLResponse)
     private let fetch: Fetch
     private let transfer: Transfer
     private let folder: (PackKind) -> URL
     private var searchRevision: UInt64 = 0
     init(fetch: @escaping Fetch = { await PackStore.get($0) },
-         transfer: @escaping Transfer = { try await URLSession.shared.download(for: $0) },
+         transfer: @escaping Transfer = { try await PackStore.transferArchive($0, expectedSize: $1) },
          folder: @escaping (PackKind) -> URL = { $0.folder }) {
         self.fetch = fetch
         self.transfer = transfer
         self.folder = folder
+        _ = ArchiveStaging.packs
     }
 
     private static let api = "https://api.modrinth.com/v2"
+    // Matches MAX_ARCHIVE_BYTES for the engine's shaders/ ZIP loader.
+    private static let maximumShaderArchiveBytes: Int64 = 512 << 20
+    // Each page can own a separate store. Final checks must account for packs
+    // published by any store while a checksum is being computed.
+    private static var installedRevision: UInt64 = 0
+
+    /// Stop at the advertised file size, even when HTTP omits Content-Length.
+    nonisolated static func transferArchive(_ request: URLRequest, expectedSize: Int64) async throws -> (URL, URLResponse) {
+        var request = request
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        defer { bytes.task.cancel() }
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw PackError("The pack server refused the download.")
+        }
+        let mismatch = PackError("The downloaded pack did not match Modrinth's checksum or size. Try downloading it again.")
+        let encoding = http.value(forHTTPHeaderField: "Content-Encoding")?.lowercased()
+        if encoding == nil || encoding == "identity",
+           http.expectedContentLength >= 0, http.expectedContentLength != expectedSize {
+            throw mismatch
+        }
+        try Task.checkCancellation()
+        let file = ArchiveStaging.packs.nextFile()
+        guard FileManager.default.createFile(atPath: file.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: file)
+            defer { try? handle.close() }
+            let blockSize = 64 * 1024
+            var block = Data()
+            block.reserveCapacity(blockSize)
+            var received: Int64 = 0
+            for try await byte in bytes {
+                guard received < expectedSize else { throw mismatch }
+                received += 1
+                block.append(byte)
+                if block.count == blockSize {
+                    try Task.checkCancellation()
+                    try handle.write(contentsOf: block)
+                    block.removeAll(keepingCapacity: true)
+                }
+            }
+            try Task.checkCancellation()
+            guard received == expectedSize else { throw mismatch }
+            try handle.write(contentsOf: block)
+            try handle.close()
+            return (file, response)
+        } catch {
+            try? FileManager.default.removeItem(at: file)
+            throw error
+        }
+    }
 
     func search(_ kind: PackKind, query: String) async {
         guard !Task.isCancelled else { return }
         searchRevision &+= 1
         let revision = searchRevision
         searching = true
-        failed = nil
-        results = []
         defer { if revision == searchRevision { searching = false } }
         var parts = URLComponents(string: "\(Self.api)/search")!
         parts.queryItems = [
@@ -116,13 +173,17 @@ final class PackStore: ObservableObject {
         guard let url = parts.url else { return }
         let response = await fetch(url)
         guard revision == searchRevision, !Task.isCancelled else { return }
-        guard let json = response as? [String: Any], let hits = json["hits"] as? [[String: Any]] else {
+        guard let json = response as? [String: Any], let hits = json["hits"] as? [Any] else {
+            results = []
             failed = "Modrinth didn't answer. Check the connection and try again."
             return
         }
-        failed = nil
-        results = hits.compactMap { hit in
-            guard let id = hit["project_id"] as? String, let title = hit["title"] as? String else { return nil }
+        var seen = Set<String>()
+        let matches: [ModrinthProject] = hits.compactMap { value in
+            guard let hit = value as? [String: Any],
+                  let id = hit["project_id"] as? String, !id.isEmpty,
+                  let title = hit["title"] as? String, !title.isEmpty,
+                  seen.insert(id).inserted else { return nil }
             return ModrinthProject(
                 id: id, kind: kind, title: title, summary: hit["description"] as? String ?? "",
                 author: hit["author"] as? String ?? "", downloads: hit["downloads"] as? Int ?? 0,
@@ -130,12 +191,15 @@ final class PackStore: ObservableObject {
                 gameVersions: hit["versions"] as? [String] ?? []
             )
         }
+        results = matches
+        failed = !hits.isEmpty && matches.isEmpty ? "Modrinth returned unreadable search results." : nil
     }
 
-    /// What a download put in the pack folder: the file's name, and a word when it was made for another version.
+    /// The installed file and whether an existing copy matched.
     struct Installed {
         let file: String
         let note: String?
+        let reused: Bool
     }
 
     private struct Download {
@@ -145,17 +209,54 @@ final class PackStore: ObservableObject {
         let note: String?
     }
 
+    private static func verify(_ file: URL, using integrity: PackFileIntegrity) async throws -> Bool {
+        let verification = Task.detached(priority: .utility) { try integrity.matches(file) }
+        return try await withTaskCancellationHandler {
+            try await verification.value
+        } onCancel: {
+            verification.cancel()
+        }
+    }
+
+    private static func matchingCopy(of download: Download, in directory: URL) async throws -> URL? {
+        let manager = FileManager.default
+        let stem = (download.name as NSString).deletingPathExtension
+        let numbered = (try? manager.contentsOfDirectory(atPath: directory.path)) ?? []
+        let names = [download.name] + numbered.filter { name in
+            isNumberedArchive(name, for: stem)
+        }.sorted()
+
+        for name in names {
+            try Task.checkCancellation()
+            let file = directory.appendingPathComponent(name)
+            guard let before = try? manager.attributesOfItem(atPath: file.path),
+                  before[.type] as? FileAttributeType == .typeRegular,
+                  let inode = before[.systemFileNumber] as? NSNumber,
+                  (try? await verify(file, using: download.integrity)) == true else { continue }
+            try Task.checkCancellation()
+            guard let after = try? manager.attributesOfItem(atPath: file.path),
+                  after[.type] as? FileAttributeType == .typeRegular,
+                  after[.systemFileNumber] as? NSNumber == inode,
+                  after[.modificationDate] as? Date == before[.modificationDate] as? Date,
+                  after[.size] as? NSNumber == before[.size] as? NSNumber else { continue }
+            return file
+        }
+        return nil
+    }
+
     private static func chooseDownload(_ versions: [[String: Any]], project: ModrinthProject,
                                        version: String) -> Result<Download, PackError> {
         let releases = versions.map { release in
-            (files: release["files"] as? [[String: Any]] ?? [],
-             games: release["game_versions"] as? [String] ?? [])
+            let files = (release["files"] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+            let games = (release["game_versions"] as? [Any])?.compactMap { $0 as? String } ?? []
+            return (files: files, games: games)
         }
         let matching = releases.filter { $0.games.contains(version) }
         let others = releases.filter { !$0.games.contains(version) }
         let attachmentTypes = ["required-resource-pack", "optional-resource-pack",
                                "sources-jar", "dev-jar", "javadoc-jar", "signature"]
         var missingIntegrity = false
+        var oversizedShader = false
 
         // Keep Modrinth's release order within each compatibility group.
         for release in matching + others {
@@ -167,20 +268,88 @@ final class PackStore: ObservableObject {
                       url.scheme?.lowercased() == "https", url.host != nil,
                       let name = file["filename"] as? String,
                       !name.contains("/"), !name.contains("\\"), !name.hasPrefix("."),
+                      !name.utf8.contains(0),
                       name.lowercased().hasSuffix(".zip") else { continue }
                 guard let integrity = PackFileIntegrity(metadata: file) else {
                     missingIntegrity = true
                     continue
                 }
+                if project.kind == .shader, integrity.expectedSize > maximumShaderArchiveBytes {
+                    oversizedShader = true
+                    continue
+                }
                 let made = release.games.last ?? "another version"
                 let note = release.games.contains(version) ? nil
                     : "It was made for Minecraft \(made), so it may not look right on \(version)."
-                return .success(Download(name: name, url: url, integrity: integrity, note: note))
+                let filename = name.utf8.count <= Int(NAME_MAX)
+                    ? name
+                    : archiveName(stem: (name as NSString).deletingPathExtension, suffix: ".zip")
+                return .success(Download(name: filename, url: url, integrity: integrity, note: note))
             }
+        }
+        if oversizedShader {
+            return .failure(PackError("The shader pack exceeds the engine’s 512 MiB archive limit."))
         }
         return .failure(PackError(missingIntegrity
             ? "Modrinth did not provide a valid checksum and size for this pack."
             : "\(project.title) has no file to download."))
+    }
+
+    /// Leave room for the collision suffix on filesystems that limit a name's UTF-8 bytes.
+    nonisolated private static func numberedArchive(stem: String, number: Int) -> String {
+        archiveName(stem: stem, suffix: " (\(number)).zip")
+    }
+
+    nonisolated private static func archiveName(stem: String, suffix: String) -> String {
+        let available = Int(NAME_MAX) - suffix.utf8.count
+        var prefix = ""
+        var bytes = 0
+        for character in stem {
+            let size = String(character).utf8.count
+            guard bytes + size <= available else { break }
+            prefix.append(character)
+            bytes += size
+        }
+        return (prefix.isEmpty ? "Pack" : prefix) + suffix
+    }
+
+    nonisolated private static func isNumberedArchive(_ name: String, for stem: String) -> Bool {
+        guard name.hasSuffix(").zip"), let delimiter = name.range(of: " (", options: .backwards),
+              let number = Int(name[delimiter.upperBound...].dropLast(5)), number >= 2 else { return false }
+        return name == numberedArchive(stem: stem, number: number) || name == "\(stem) (\(number)).zip"
+    }
+
+    /// Commit verified bytes without replacing any path already using the name.
+    nonisolated static func publishArchive(_ verified: URL, preferred: URL) throws -> URL {
+        let manager = FileManager.default
+        let directory = preferred.deletingLastPathComponent()
+        let stem = preferred.deletingPathExtension().lastPathComponent
+        var destination = preferred
+        var source = verified
+        var staged: URL?
+        var suffix = 2
+        defer { if let staged { try? manager.removeItem(at: staged) } }
+
+        while true {
+            try Task.checkCancellation()
+            if renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 {
+                return destination
+            }
+            let failure = errno
+            switch failure {
+            case EEXIST:
+                destination = directory.appendingPathComponent(numberedArchive(stem: stem, number: suffix))
+                suffix += 1
+            case EXDEV where staged == nil:
+                // Keep the cross-volume copy hidden until it can be published atomically.
+                let copy = directory.appendingPathComponent(".horizon-pack-\(UUID().uuidString)")
+                staged = copy
+                try manager.copyItem(at: verified, to: copy)
+                source = copy
+            default:
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+            }
+        }
     }
 
     /// Download `project`'s file for the game's Minecraft version into the project's pack folder.
@@ -195,7 +364,9 @@ final class PackStore: ObservableObject {
         defer { downloading[project.id] = nil }
         let response = await fetch(url)
         guard !Task.isCancelled else { return .failure(cancelled) }
-        guard let versions = response as? [[String: Any]] else {
+        let records = response as? [Any]
+        let versions = records?.compactMap { $0 as? [String: Any] } ?? []
+        guard let records, records.isEmpty || !versions.isEmpty else {
             return .failure(PackError("Could not read the pack's versions from Modrinth. Try again."))
         }
         let candidate: Download
@@ -204,41 +375,45 @@ final class PackStore: ObservableObject {
         case let .failure(error): return .failure(error)
         }
         let integrity = candidate.integrity
+        let directory = folder(project.kind)
         var request = URLRequest(url: candidate.url)
         request.setValue(Self.agent, forHTTPHeaderField: "User-Agent")
         do {
-            let (temporary, response) = try await transfer(request)
+            let installed = try await Self.matchingCopy(of: candidate, in: directory)
+            try Task.checkCancellation()
+            if let installed {
+                reloadInstalled()
+                return .success(Installed(file: installed.lastPathComponent, note: candidate.note, reused: true))
+            }
+            let (temporary, response) = try await transfer(request, integrity.expectedSize)
             defer { try? FileManager.default.removeItem(at: temporary) }
             try Task.checkCancellation()
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 return .failure(PackError("Modrinth refused the download of \(project.title)."))
             }
-            let verification = Task.detached(priority: .utility) { try integrity.matches(temporary) }
-            let matches = try await withTaskCancellationHandler {
-                try await verification.value
-            } onCancel: {
-                verification.cancel()
-            }
+            let matches = try await Self.verify(temporary, using: integrity)
             try Task.checkCancellation()
             guard matches else {
                 return .failure(PackError("The downloaded pack did not match Modrinth's checksum or size. Try downloading it again."))
             }
-            let directory = folder(project.kind)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let original = directory.appendingPathComponent(candidate.name)
-            let stem = original.deletingPathExtension().lastPathComponent
-            var destination = original
-            var suffix = 2
-            while FileManager.default.fileExists(atPath: destination.path) {
-                destination = directory.appendingPathComponent("\(stem) (\(suffix)).zip")
-                suffix += 1
+            while true {
+                let revision = Self.installedRevision
+                let existing = try await Self.matchingCopy(of: candidate, in: directory)
+                try Task.checkCancellation()
+                guard revision == Self.installedRevision else { continue }
+                if let existing {
+                    reloadInstalled()
+                    return .success(Installed(file: existing.lastPathComponent, note: candidate.note, reused: true))
+                }
+                let destination = try Self.publishArchive(temporary, preferred: original)
+                Self.installedRevision &+= 1
+                reloadInstalled()
+                return .success(Installed(file: destination.lastPathComponent, note: candidate.note, reused: false))
             }
-            // Never silently replace a local pack or a different project's ZIP.
-            try FileManager.default.moveItem(at: temporary, to: destination)
-            reloadInstalled()
-            return .success(Installed(file: destination.lastPathComponent, note: candidate.note))
         } catch {
-            return .failure(Task.isCancelled ? cancelled : PackError(error.localizedDescription))
+            return .failure(Task.isCancelled ? cancelled : (error as? PackError ?? PackError(error.localizedDescription)))
         }
     }
 
@@ -249,10 +424,7 @@ final class PackStore: ObservableObject {
             let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
             installed[kind] = names
                 .filter { name in
-                    guard !name.hasPrefix(".") else { return false }
-                    return name.lowercased().hasSuffix(".zip")
-                        || (kind == .shader && name.hasSuffix(".hshader"))
-                        || Self.isFolder(directory.appendingPathComponent(name))
+                    !name.hasPrefix(".") && Self.isPack(directory.appendingPathComponent(name), kind: kind)
                 }
                 .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         }
@@ -261,18 +433,36 @@ final class PackStore: ObservableObject {
     func remove(_ name: String, kind: PackKind) -> String? {
         do {
             try FileManager.default.removeItem(at: folder(kind).appendingPathComponent(name))
+            Self.installedRevision &+= 1
             reloadInstalled()
             return nil
         } catch { return error.localizedDescription }
     }
 
-    private static func isFolder(_ url: URL) -> Bool {
-        var folder: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.path, isDirectory: &folder) && folder.boolValue
+    private static func isPack(_ url: URL, kind: PackKind) -> Bool {
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
+        func type(of path: URL) -> URLResourceValues? {
+            try? path.resolvingSymlinksInPath().resourceValues(forKeys: keys)
+        }
+
+        let entry = type(of: url)
+        if entry?.isRegularFile == true {
+            let ext = url.pathExtension.lowercased()
+            return ext == "zip" || (kind == .shader && ext == "hshader")
+        }
+        guard entry?.isDirectory == true else { return false }
+
+        switch kind {
+        case .resource:
+            return type(of: url.appendingPathComponent("pack.mcmeta"))?.isRegularFile == true
+        case .shader:
+            return type(of: url.appendingPathComponent("shaders"))?.isDirectory == true
+                || type(of: url.appendingPathComponent("horizon-shaders.toml"))?.isRegularFile == true
+        }
     }
 
     /// Modrinth asks every client to name itself.
-    private static let agent = "heyskylo/horizon-ios launcher (github.com/heyskylo/horizon-ios)"
+    private static let agent = "Kelly-Inc/horizon-ios launcher (github.com/Kelly-Inc/horizon-ios)"
 
     private static func get(_ url: URL) async -> Any? {
         var request = URLRequest(url: url)
@@ -297,23 +487,34 @@ final class PackChoices: ObservableObject {
     @Published private(set) var shaderPack: String?
     @Published private(set) var shaderStatus: String?
     @Published private(set) var shaderNotes: [String] = []
+    @Published private(set) var shaderPending = false
 
     typealias Request = @MainActor (String) async -> [String: Any]
     private let request: Request
+    private let packExists: (String, PackKind) -> Bool
     private var shaderKeys: [String: String] = [:]
-    private var locked = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var selectionReadIssues: [PackKind: String] = [:]
+    // The engine has one shader slot even when SwiftUI recreates this page.
+    private static var latestShaderIntent: UUID?
+    private static var locked = false
+    private static var waiters: [CheckedContinuation<Void, Never>] = []
     @Published private(set) var issue: String?
 
-    init(request: @escaping Request = { await Bridge.send($0) }) { self.request = request }
+    init(request: @escaping Request = { await Bridge.send($0) },
+         packExists: @escaping (String, PackKind) -> Bool = { name, kind in
+             FileManager.default.fileExists(atPath: kind.folder.appendingPathComponent(name).path)
+         }) {
+        self.request = request
+        self.packExists = packExists
+    }
 
     private func acquire() async {
-        if !locked { locked = true; return }
-        await withCheckedContinuation { waiters.append($0) }
+        if !Self.locked { Self.locked = true; return }
+        await withCheckedContinuation { Self.waiters.append($0) }
     }
     private func release() {
-        if waiters.isEmpty { locked = false }
-        else { waiters.removeFirst().resume() }
+        if Self.waiters.isEmpty { Self.locked = false }
+        else { Self.waiters.removeFirst().resume() }
     }
 
     func load() async {
@@ -324,46 +525,93 @@ final class PackChoices: ObservableObject {
         if !Task.isCancelled { issue = error }
     }
 
+    /// Observe engine changes while this pack kind is visible, including reload rollback.
+    func followSelection(_ kind: PackKind, interval: Duration = .seconds(1)) async {
+        while !Task.isCancelled {
+            do { try await Task.sleep(for: interval) }
+            catch { return }
+            await acquire()
+            guard !Task.isCancelled else {
+                release()
+                return
+            }
+            let error = kind == .resource ? await readResources() : await readShaders(statusOnly: true)
+            release()
+            guard !Task.isCancelled else { return }
+            if let error {
+                if issue != error { issue = error }
+            } else if let previous = selectionReadIssues[kind], issue == previous {
+                issue = nil
+            }
+            selectionReadIssues[kind] = error
+        }
+    }
+
     private func readResources() async -> String? {
         let answer = await request("options-get resourcePacks")
+        guard !Task.isCancelled else { return nil }
         if let error = answer.error { return error }
         guard let packs = ((answer["options"] as? [String: Any])?["resourcePacks"] as? [String: Any])?["value"] as? [String] else {
             return "The active resource packs could not be read. Try again."
         }
-        resourcePacks = packs
+        if resourcePacks != packs { resourcePacks = packs }
         return nil
     }
 
-    private func readShaders() async -> String? {
-        let shaders = await request("shader-pack list")
+    private func readShaders(
+        requiringKnownSelectionFor name: String? = nil, statusOnly: Bool = false
+    ) async -> String? {
+        let shaders = await request(statusOnly ? "shader-pack-status" : "shader-pack list")
+        guard !Task.isCancelled else { return nil }
         if let error = shaders.error { return error }
         guard let selected = shaders["selected"], selected is NSNull || selected is String else {
             return "The selected shader pack could not be read. Try again."
         }
         var keys: [String: String] = [:]
-        for pack in shaders["packs"] as? [[String: Any]] ?? [] {
+        for case let pack as [String: Any] in shaders["packs"] as? [Any] ?? [] {
             if let name = pack["name"] as? String, let key = pack["key"] as? String {
                 keys[name] = key
             }
         }
-        shaderKeys = keys
-        shaderPack = selected as? String
-        shaderNotes = []
-        shaderStatus = nil
-        if shaderPack != nil {
-            if let runtime = shaders["runtime"] as? [String: Any],
-               let programs = runtime["programs"] as? [String] {
-                shaderStatus = programs.isEmpty ? "No supported effects loaded. Normal rendering is active."
-                    : "Running \(programs.count) shader programs."
-                shaderNotes = runtime["notes"] as? [String] ?? []
+        let selection = selected as? String
+        if statusOnly, let selection, selection.hasPrefix("horizon:"),
+           selection != shaderPack, !shaderKeys.values.contains(selection) {
+            // Status replies omit the mapping from native shader keys to filenames.
+            return await readShaders()
+        }
+        // A stale selection is only ambiguous when the engine also cannot
+        // identify the target file. A listed, different pack is safe to edit.
+        if let name, let selection, selection.hasPrefix("horizon:"),
+           !keys.values.contains(selection), keys[name] == nil {
+            return "The active shader file could not be identified. Try again."
+        }
+        if !statusOnly { shaderKeys = keys }
+        let runtime = shaders["runtime"] as? [String: Any]
+        let programs = runtime?["programs"] as? [String]
+        let pending = selection != nil && programs != nil && runtime?["pending"] as? Bool == true
+        var notes: [String] = []
+        var status: String?
+        if selection != nil {
+            if let runtime, let programs {
+                if pending {
+                    status = "Preparing shader pack. Normal rendering is active."
+                } else {
+                    status = programs.isEmpty ? "No supported effects loaded. Normal rendering is active."
+                        : "Running \(programs.count) shader programs."
+                }
+                notes = runtime["notes"] as? [String] ?? []
             } else {
-                shaderStatus = "Selected. Open a world to load this pack, then return here for its status."
+                status = "Selected. Open a world to load this pack, then return here for its status."
             }
         } else if let failure = shaders["last_disabled"] as? [String: Any],
                   let name = failure["pack"] as? String {
-            shaderStatus = "\(name) was turned off because it could not load."
-            shaderNotes = failure["notes"] as? [String] ?? []
+            status = "\(name) was turned off because it could not load."
+            notes = failure["notes"] as? [String] ?? []
         }
+        if shaderPack != selection { shaderPack = selection }
+        if shaderPending != pending { shaderPending = pending }
+        if shaderStatus != status { shaderStatus = status }
+        if shaderNotes != notes { shaderNotes = notes }
         return nil
     }
 
@@ -371,6 +619,10 @@ final class PackChoices: ObservableObject {
         let resources = await readResources()
         guard !Task.isCancelled else { return nil }
         let shaders = await readShaders()
+        if !Task.isCancelled {
+            selectionReadIssues[.resource] = resources
+            selectionReadIssues[.shader] = shaders
+        }
         return resources ?? shaders
     }
 
@@ -380,21 +632,55 @@ final class PackChoices: ObservableObject {
         return shaderPack == name || shaderPack == shaderKeys[name]
     }
 
-    /// Each mutation reads the latest confirmed state while holding the queue lock. A second toggle
-    /// cannot derive its whole resource-pack list from the cache preceding the first write.
-    func set(_ name: String, kind: PackKind, on: Bool) async -> String? {
-        await acquire()
-        defer { release() }
-        guard !Task.isCancelled else { return nil }
-        let error = await setLocked(name, kind: kind, on: on)
-        if !Task.isCancelled { issue = error }
-        return error
+    func beginShaderSelection(for kind: PackKind) -> UUID? {
+        guard kind == .shader else { return nil }
+        let intent = UUID()
+        Self.latestShaderIntent = intent
+        return intent
     }
 
-    private func setLocked(_ name: String, kind: PackKind, on: Bool) async -> String? {
-        let readError = kind == .resource ? await readResources() : await readShaders()
+    private func isCurrent(_ shaderIntent: UUID?) -> Bool {
+        shaderIntent == nil || shaderIntent == Self.latestShaderIntent
+    }
+
+    /// Each mutation reads confirmed state while holding the queue lock.
+    func set(_ name: String, kind: PackKind, on: Bool, shaderIntent: UUID? = nil) async -> String? {
         guard !Task.isCancelled else { return nil }
+        let intent = shaderIntent ?? beginShaderSelection(for: kind)
+        if case let .failure(error) = await changeSelection(name, kind: kind, on: on, shaderIntent: intent) {
+            return error.message
+        }
+        return nil
+    }
+
+    /// A finished shader download may only activate the selection made when it began.
+    func enableDownloaded(_ name: String, kind: PackKind, shaderIntent: UUID?) async -> Result<Bool, PackError> {
+        guard kind == .resource || shaderIntent != nil else { return .success(false) }
+        return await changeSelection(name, kind: kind, on: true, shaderIntent: shaderIntent)
+    }
+
+    private func changeSelection(
+        _ name: String, kind: PackKind, on: Bool, shaderIntent: UUID?
+    ) async -> Result<Bool, PackError> {
+        await acquire()
+        defer { release() }
+        guard !Task.isCancelled, isCurrent(shaderIntent) else { return .success(false) }
+        let error = await setLocked(name, kind: kind, on: on, shaderIntent: shaderIntent)
+        guard !Task.isCancelled, isCurrent(shaderIntent) else { return .success(false) }
+        issue = error
+        if let error { return .failure(PackError(error)) }
+        return .success(true)
+    }
+
+    private func setLocked(
+        _ name: String, kind: PackKind, on: Bool, shaderIntent: UUID? = nil,
+        requireSuccessfulWrite: Bool = false
+    ) async -> String? {
+        let readError = kind == .resource ? await readResources() : await readShaders(requiringKnownSelectionFor: on ? nil : name)
+        guard !Task.isCancelled, isCurrent(shaderIntent) else { return nil }
         if let readError { return readError }
+        // A queued toggle can run after deletion, even though its row is gone.
+        if on && !packExists(name, kind) { return "That pack is no longer installed." }
         // Off is a global engine command for shaders. Never use it to
         // disable a different shader that became active while this waited.
         guard isOn(name, kind: kind) != on else { return nil }
@@ -412,24 +698,36 @@ final class PackChoices: ObservableObject {
                   let selection = String(data: data, encoding: .utf8) else { return "That shader name can't be saved." }
             answer = await request("shader-pack-set \(selection)")
         }
-        if let error = answer.error { return error }
-        // Confirm the result before another mutation, or a deletion, can use it.
-        let error = kind == .resource ? await readResources() : await readShaders()
-        if let error { return error }
-        guard isOn(name, kind: kind) == on else { return "The pack change was not confirmed. Try again." }
+        guard !Task.isCancelled else { return nil }
+        // Read back after errors, but deletion requires a confirmed write.
+        let writeError = answer.error
+        let error = kind == .resource ? await readResources() : await readShaders(requiringKnownSelectionFor: on ? nil : name)
+        let selected = answer["selected"]
+        let confirmed = answer.acknowledged || (kind == .shader && (selected is String || selected is NSNull))
+        if requireSuccessfulWrite, writeError != nil || !confirmed {
+            return writeError ?? "The game did not confirm the pack change."
+        }
+        if let error { return writeError ?? error }
+        guard isOn(name, kind: kind) == on else {
+            return writeError ?? "The pack change was not confirmed. Try again."
+        }
         return nil
     }
 
     /// Hold the same lock through disable + confirmation + deletion. Failed/unknown disable state
     /// leaves the file intact. The closure allows a focused test without changing real pack folders.
     func remove(_ name: String, kind: PackKind, delete: () -> String?) async -> String? {
+        guard !Task.isCancelled else { return nil }
+        // Deleting a file does not replace a pending selection of another
+        // shader. A queued activation of this file still checks that it exists.
         await acquire()
         defer { release() }
         guard !Task.isCancelled else { return nil }
-        let readError = kind == .resource ? await readResources() : await readShaders()
+        let readError = kind == .resource ? await readResources() : await readShaders(requiringKnownSelectionFor: name)
         guard !Task.isCancelled else { return nil }
         if let readError { issue = readError; return readError }
-        if isOn(name, kind: kind), let error = await setLocked(name, kind: kind, on: false) {
+        if isOn(name, kind: kind),
+           let error = await setLocked(name, kind: kind, on: false, requireSuccessfulWrite: true) {
             if !Task.isCancelled { issue = error }
             return error
         }
@@ -450,9 +748,10 @@ struct PacksPage: View {
     @State private var kind = PackKind.resource
     @State private var query = ""
     @State private var notice: String?
+    @State private var requestedDownloads: Set<String> = []
 
     var body: some View {
-        let visibleResults = store.results.filter { $0.kind == kind }
+        let visibleResults = store.searching ? [] : store.results.filter { $0.kind == kind }
         VStack(alignment: .leading, spacing: 16) {
             Picker("Kind", selection: $kind) {
                 ForEach(PackKind.allCases) { Text($0.title).tag($0) }
@@ -480,17 +779,27 @@ struct PacksPage: View {
                 Text("Compatibility varies by pack and settings. Check the runtime notes for unsupported features or loading errors.")
                     .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
             }
-            if let failed = store.failed {
-                Label(failed, systemImage: "wifi.exclamationmark").font(Theme.sans(12)).foregroundStyle(Theme.warn)
-            }
-            if store.searching && visibleResults.isEmpty {
+            if store.searching {
                 ProgressView().tint(Theme.accentText).frame(maxWidth: .infinity).padding(24)
+            } else if let failed = store.failed {
+                Label(failed, systemImage: "wifi.exclamationmark").font(Theme.sans(12)).foregroundStyle(Theme.warn)
+                SecondaryButton(title: "Try again", icon: "arrow.clockwise") {
+                    Task { await store.search(kind, query: query) }
+                }
+            } else if visibleResults.isEmpty {
+                EmptyNote(icon: "magnifyingglass", text: "No packs found.")
             }
             VStack(spacing: 0) {
                 ForEach(visibleResults) { project in
-                    ProjectRow(project: project, progress: store.downloading[project.id],
+                    ProjectRow(project: project,
+                               progress: store.downloading[project.id] ?? (requestedDownloads.contains(project.id) ? 0 : nil),
                                version: link.version) {
-                        Task { await download(project) }
+                        guard requestedDownloads.insert(project.id).inserted else { return }
+                        let intent = choices.beginShaderSelection(for: project.kind)
+                        Task {
+                            defer { requestedDownloads.remove(project.id) }
+                            await download(project, shaderIntent: intent)
+                        }
                     }
                     if project != visibleResults.last {
                         Divider().overlay(Theme.border).padding(.leading, 70)
@@ -507,6 +816,9 @@ struct PacksPage: View {
         }
         .task(id: link.canList) {
             if link.canList { await choices.load() }
+        }
+        .task(id: link.canList ? kind : nil) {
+            if link.canList { await choices.followSelection(kind) }
         }
         .alert("Packs", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK", role: .cancel) {}
@@ -532,8 +844,9 @@ struct PacksPage: View {
                             get: { choices.isOn(name, kind: rowKind) },
                             set: { on in
                                 Haptics.tap()
+                                let intent = choices.beginShaderSelection(for: rowKind)
                                 Task {
-                                    if let error = await choices.set(name, kind: rowKind, on: on) {
+                                    if let error = await choices.set(name, kind: rowKind, on: on, shaderIntent: intent) {
                                         notice = error
                                     }
                                 }
@@ -567,7 +880,7 @@ struct PacksPage: View {
         }
     }
 
-    private func download(_ project: ModrinthProject) async {
+    private func download(_ project: ModrinthProject, shaderIntent: UUID?) async {
         guard !Task.isCancelled else { return }
         Haptics.tap()
         let result = await store.install(project, version: link.version)
@@ -576,17 +889,18 @@ struct PacksPage: View {
         case let .success(installed):
             Haptics.done()
             let name = installed.file
+            let status = installed.reused ? "\(name) is already installed" : "\(name) is downloaded"
             var said: String
             if link.canList {
-                let error = await choices.set(name, kind: project.kind, on: true)
+                let activation = await choices.enableDownloaded(name, kind: project.kind, shaderIntent: shaderIntent)
                 guard !Task.isCancelled else { return }
-                if let error {
-                    said = "Downloaded \(name), but it couldn't be switched on: \(error)"
-                } else {
-                    said = "\(name) is downloaded and on."
+                switch activation {
+                case .success(true): said = "\(status) and on."
+                case .success(false): said = "\(status)."
+                case let .failure(error): said = "\(status). Could not switch it on. \(error.message)"
                 }
             } else {
-                said = "\(name) is downloaded. Switch it on in a moment."
+                said = "\(status). Switch it on in a moment."
             }
             if let note = installed.note {
                 said += " " + note

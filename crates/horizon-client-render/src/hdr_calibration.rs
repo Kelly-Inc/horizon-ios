@@ -207,6 +207,9 @@ impl Calibration {
     }
     /// Puts the slider on its step nearest `position`.
     fn set(&mut self, position: f32) {
+        if !position.is_finite() {
+            return;
+        }
         let step = self.current();
         let steps = step.steps() as f32;
         self.values[self.step] = step.nits_at((position * steps).round().clamp(0.0, steps) as u32);
@@ -396,6 +399,18 @@ mod tests {
     /// At the default GUI scale of the game's first window (854 x 480 at 2).
     fn picture(c: &Calibration) -> Picture {
         c.picture(&font(), (427.0, 240.0))
+    }
+
+    #[test]
+    fn calibration_keeps_the_current_step_when_input_is_non_finite() {
+        let mut settings = Settings::default();
+        settings.horizon.hdr_black_level = 15;
+        let mut calibration = Calibration::new(&settings, &NONE);
+        let previous = calibration.values;
+        for position in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            calibration.set(position);
+            assert_eq!(calibration.values, previous);
+        }
     }
 
     #[test]

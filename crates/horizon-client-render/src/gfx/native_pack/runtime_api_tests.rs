@@ -35,6 +35,7 @@ fn checked_current_api_builds_post_tonemap_and_linear_variants() {
     let terrain = TerrainShape {
         globals: &empty,
         flat: None,
+        looks: None,
         sprites: [1.0; 2],
         sprite_views: &[],
         format: wgpu::TextureFormat::Rgba8Unorm,
@@ -146,7 +147,6 @@ fn checked_current_api_builds_post_tonemap_and_linear_variants() {
         (&color_view, &depth_view, &current.frame.surface_view),
         &screen_view,
         [4, 4],
-        true,
         None,
         None,
     );

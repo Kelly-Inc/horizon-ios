@@ -226,16 +226,21 @@ fn compiled_guest_runs_in_actual_game_roots_on_guest_stack() {
                 };
                 let wire_hits = Arc::new(AtomicUsize::new(0));
                 if !trap {
-                    game.remote.as_ref().unwrap().session.start_recording(
-                        super::tests::WireReceipt {
-                            stopped: std::sync::atomic::AtomicBool::new(false),
-                            channel: "raw_probe:receipt",
-                            expected: Arc::new(bytes.clone()),
-                            hits: wire_hits.clone(),
-                            observed: None,
-                        },
-                        |_| {},
-                    );
+                    game.remote
+                        .as_ref()
+                        .unwrap()
+                        .session
+                        .start_recording(
+                            super::tests::WireReceipt {
+                                stopped: std::sync::atomic::AtomicBool::new(false),
+                                channel: "raw_probe:receipt",
+                                expected: Arc::new(bytes.clone()),
+                                hits: wire_hits.clone(),
+                                observed: None,
+                            },
+                            |_| {},
+                        )
+                        .expect("attach the Wasm payload receipt recorder");
                 }
                 let host: &mut dyn mod_api::ClientHost = game;
                 assert_eq!(

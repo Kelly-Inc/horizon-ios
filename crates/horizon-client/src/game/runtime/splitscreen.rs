@@ -8,7 +8,7 @@
 //! (game/screens.rs); the second player leaving the world, the first leaving theirs, or the AirPlay display
 //! going away ends it too.
 use super::{Game, UiResources};
-use horizon_client::{Result, audio::Audio, hud::HudAtlas};
+use horizon_client::{Result, audio::Audio, held::Source, hud::HudAtlas};
 use std::time::Instant;
 use winit::{application::ApplicationHandler, event::WindowEvent};
 
@@ -43,6 +43,7 @@ impl<'a> Game<'a> {
             && self.pending_save.is_none()
             && self.title.is_none()
             && !horizon_ios_launcher::covered()
+            && horizon_airplay::display_connected()
             && self.on_airplay()
     }
 
@@ -103,9 +104,31 @@ impl<'a> Game<'a> {
         self.remote.is_none() || self.title.is_some() || self.error.is_some()
     }
 
+    fn splitscreen_stopping(&self, guest: &Game<'_>, request: Option<bool>) -> bool {
+        request == Some(false)
+            || guest.splitscreen_left()
+            || self.integrated.is_none()
+            || self.pending_save.is_some()
+            || horizon_ios_launcher::covered()
+            || !horizon_airplay::display_connected()
+    }
+
+    pub(super) fn accepts_splitscreen_input(&self) -> bool {
+        self.splitscreen_guest
+            .as_deref()
+            .is_some_and(|guest| !self.splitscreen_stopping(guest, self.splitscreen.request))
+    }
+
     fn end_splitscreen(&mut self) {
         if let Some(server) = &self.integrated {
             server.leave_splitscreen();
+        }
+        if self.splitscreen.active {
+            // UIKit's gesture bridge belongs to the phone, not either client.
+            // Drop the departing guest's gestures before the host gets it back.
+            self.cancel_touch_for_reload();
+            #[cfg(target_os = "ios")]
+            self.suspend_system_keyboard();
         }
         self.splitscreen.active = false;
         horizon_airplay::phone_shows_game(false);
@@ -117,7 +140,10 @@ impl<'a> Game<'a> {
     }
     /// Release the memory connection before dropping its renderer and client state.
     pub(super) fn stop_splitscreen(&mut self) {
-        if let Some(mut guest) = self.splitscreen_guest.take() {
+        self.splitscreen.request = None;
+        let guest = self.splitscreen_guest.take();
+        let had_guest = guest.is_some();
+        if let Some(mut guest) = guest {
             guest.clear_lod();
             self.retired_far_terrain
                 .append(&mut guest.retired_far_terrain);
@@ -126,6 +152,8 @@ impl<'a> Game<'a> {
             if let Some(mut remote) = guest.remote.take() {
                 remote.session.disconnect();
             }
+        }
+        if had_guest || self.splitscreen.active {
             self.end_splitscreen();
         }
     }
@@ -145,13 +173,11 @@ impl<'a> Game<'a> {
 
 /// Starts and ends the second player, once a frame after both games' own.
 pub(super) fn update<'a>(host: &mut Game<'a>, guest: &mut Option<Box<Game<'a>>>) {
+    let was_active = host.splitscreen.active;
     let request = host.splitscreen.request.take();
-    if guest.is_some()
-        && (request == Some(false)
-            || guest.as_ref().is_some_and(|g| g.splitscreen_left())
-            || host.integrated.is_none()
-            || host.pending_save.is_some()
-            || !host.on_airplay())
+    if guest
+        .as_deref()
+        .is_some_and(|guest| host.splitscreen_stopping(guest, request))
     {
         // Dropping the guest closes its connection, and the server sees the player leave.
         if let Some(mut second) = guest.take() {
@@ -173,14 +199,27 @@ pub(super) fn update<'a>(host: &mut Game<'a>, guest: &mut Option<Box<Game<'a>>>)
         match host.splitscreen_guest() {
             Ok(g) => {
                 *guest = Some(Box::new(g));
-                // The phone hands over every held input; no finger or menu drag survives it.
+                // The phone takes its touch, keyboard and mouse inputs to the guest.
+                // The host's controller and its held mappings stay with the host.
+                host.cancel_touch_for_reload();
                 host.touch = Default::default();
-                host.keys.clear();
                 host.physical_keys.clear();
-                host.left = false;
-                host.right = false;
+                host.debug_keys.reset();
+                #[cfg(target_os = "ios")]
+                host.suspend_system_keyboard();
+                host.physical_buttons.clear();
+                for key in host.keys.release_source(Source::Keyboard) {
+                    if let Err(e) = host.mapped_key(key, false, false, key, Source::Keyboard) {
+                        log::warn!("Horizon: splitscreen: releasing input: {e}");
+                    }
+                }
+                host.update_modifiers(winit::keyboard::ModifiersState::empty());
+                host.left &= host.input_holds("key.attack");
+                host.right &= host.input_holds("key.use");
                 host.reset_inventory_clicks();
-                host.stop_mining();
+                if !host.left {
+                    host.stop_mining();
+                }
                 host.splitscreen.active = true;
                 if let Some(server) = &host.integrated {
                     server.set_paused(false);
@@ -192,12 +231,22 @@ pub(super) fn update<'a>(host: &mut Game<'a>, guest: &mut Option<Box<Game<'a>>>)
             }
         }
     }
+    if was_active != host.splitscreen.active {
+        // Publish the TV layout before the guest asks for its lower surface.
+        host.sync_airplay();
+    }
     if let Some(g) = guest {
         // The phone shows the guest's menus and also takes over gameplay if the
         // lower AirPlay surface is unavailable.
-        let half = horizon_airplay::second_screen().filter(|_| g.touch_playing());
+        // The new surface blocks input until it presents. Using the input
+        // gate here would switch away before that first frame can arrive.
+        let half = horizon_airplay::second_screen()
+            .filter(|_| !g.reload_blocks_input() && g.touch_world_unobstructed());
         super::airplay::sync(g.renderer.as_mut(), g.window.as_ref(), &mut g.airplay, half);
-        let on_display = g.on_airplay();
+        // Keep the guest's phone cover and controls hidden until the lower
+        // surface has actually shown the current frame.
+        let on_display = super::airplay::presentation(g.renderer.as_ref())
+            == horizon_airplay::Presentation::Presented;
         horizon_airplay::phone_shows_game(!on_display);
         let buttons = on_display.then(|| g.phone_buttons());
         horizon_airplay::phone_controls(buttons.as_deref());

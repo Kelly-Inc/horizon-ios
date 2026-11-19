@@ -313,6 +313,14 @@ impl Title {
             if std::mem::take(&mut self.open_after_mods_backup) {
                 return self.mods_backup_done(world, result);
             }
+            // A failure from the follow-up action takes priority over the backup toast.
+            self.pending_toast = Some(match result {
+                Ok((_, bytes)) => WorldToast::Created {
+                    folder: folder.clone(),
+                    bytes,
+                },
+                Err(error) => WorldToast::Failed(error),
+            });
             if std::mem::take(&mut self.restore_after_backup) {
                 // `makeBackupAndShowToast(..).thenAcceptAsync(..)` in attemptRestore: the restore
                 // runs, backup failed or not.
@@ -331,11 +339,6 @@ impl Title {
             {
                 self.open_request = Some(folder);
             }
-            let toast = match result {
-                Ok((_, bytes)) => WorldToast::Created { folder, bytes },
-                Err(error) => WorldToast::Failed(error),
-            };
-            self.pending_toast = Some(toast);
         }
     }
 }

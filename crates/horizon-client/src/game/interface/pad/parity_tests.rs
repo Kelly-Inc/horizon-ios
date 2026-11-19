@@ -274,6 +274,34 @@ fn the_mouse_letting_go_leaves_what_the_pad_holds_and_back() {
 
 #[test]
 #[ignore = "daily"]
+fn a_rebound_mouse_button_and_the_pad_hold_movement_independently() {
+    use winit::event::{DeviceId, ElementState, WindowEvent};
+
+    playing(|game| {
+        game.captured = true;
+        game.settings.keys.set("key.forward", "key.mouse.left");
+        let key = KeyCode::KeyW;
+        game.keys.press(key, Source::Pad);
+        for state in [ElementState::Pressed, ElementState::Released] {
+            game.handle_window_event_inner(
+                &NoEventLoop,
+                WindowEvent::MouseInput {
+                    device_id: DeviceId::dummy(),
+                    state,
+                    button: MouseButton::Left,
+                },
+            );
+            assert_eq!(
+                game.keys.held_by(&key, Source::Keyboard),
+                state == ElementState::Pressed
+            );
+            assert!(game.keys.held_by(&key, Source::Pad));
+        }
+    });
+}
+
+#[test]
+#[ignore = "daily"]
 fn a_release_from_a_screen_can_not_strand_the_pads_attack() {
     playing(|game| {
         // The mouse went down in play, and came up where the mappings didn't hear it.

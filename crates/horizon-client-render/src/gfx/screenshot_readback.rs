@@ -1,26 +1,43 @@
 //! Screenshot GPU waits happen on a worker; the owning thread receives mutable pixels.
 use super::screenshot::{HdrScreenshot, PendingScreenshot};
-use super::{Result, ScreenshotRequest, hdr10_to_rgb16, padded_row, square_downscale};
+use super::{
+    Result, ScreenshotFailure, ScreenshotRequest, hdr10_to_rgb16, padded_row, square_downscale,
+};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
+
+const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) struct Reader {
     pub device: wgpu::Device,
     pub config: wgpu::SurfaceConfiguration,
+    pub submission: wgpu::SubmissionIndex,
+}
+
+fn wait_for_mapping(
+    receiver: Receiver<std::result::Result<(), wgpu::BufferAsyncError>>,
+    deadline: Instant,
+) -> Result<()> {
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| format!("screenshot buffer mapping: {error}"))?
+        .map_err(|error| error.to_string().into())
 }
 impl Reader {
     /// The pixels `copy_frame` read back into `buffer`, 4 bytes each, row after row.
-    fn read_frame(&self, buffer: &wgpu::Buffer) -> Result<Vec<[u8; 4]>> {
+    fn read_frame(&self, buffer: &wgpu::Buffer, deadline: Instant) -> Result<Vec<[u8; 4]>> {
         let (sender, receiver) = std::sync::mpsc::channel();
         buffer.map_async(wgpu::MapMode::Read, .., move |r| {
             let _ = sender.send(r);
         });
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| e.to_string())?;
-        receiver
-            .recv()
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(self.submission.clone()),
+                timeout: Some(deadline.saturating_duration_since(Instant::now())),
+            })
+            .map_err(|error| format!("the screenshot frame didn't finish on the GPU: {error}"))?;
+        wait_for_mapping(receiver, deadline)?;
         let (width, height, row) = (
             self.config.width as usize,
             self.config.height as usize,
@@ -42,12 +59,13 @@ impl Reader {
         buffer: &wgpu::Buffer,
         hdr_buffer: Option<&wgpu::Buffer>,
     ) -> Result<PendingScreenshot> {
+        let deadline = Instant::now() + READBACK_TIMEOUT;
         let bgra = matches!(
             self.config.format.remove_srgb_suffix(),
             wgpu::TextureFormat::Bgra8Unorm
         );
         let mut pixels = Vec::with_capacity((self.config.width * self.config.height * 4) as usize);
-        for px in self.read_frame(buffer)? {
+        for px in self.read_frame(buffer, deadline)? {
             let (r, b) = if bgra { (px[2], px[0]) } else { (px[0], px[2]) };
             pixels.extend_from_slice(&[r, px[1], b, 255]);
         }
@@ -61,7 +79,7 @@ impl Reader {
             ),
             None => (self.config.width, self.config.height, pixels),
         };
-        let hdr = hdr_buffer.and_then(|buffer| match self.read_frame(buffer) {
+        let hdr = hdr_buffer.and_then(|buffer| match self.read_frame(buffer, deadline) {
             Ok(pixels) => Some(HdrScreenshot {
                 size: [self.config.width, self.config.height],
                 pixels: hdr10_to_rgb16(&pixels),
@@ -84,10 +102,14 @@ type Outcome = std::result::Result<PendingScreenshot, String>;
 
 #[derive(Default)]
 pub(super) struct Readbacks(
-    Vec<Receiver<Outcome>>,
+    Vec<(PathBuf, Receiver<Outcome>)>,
     #[cfg(test)] Vec<std::thread::JoinHandle<()>>,
 );
 impl Readbacks {
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn start(
         &mut self,
         reader: Reader,
@@ -96,6 +118,7 @@ impl Readbacks {
         hdr: Option<wgpu::Buffer>,
     ) -> Result<()> {
         let (sender, receiver) = mpsc::channel();
+        let path = request.path.clone();
         let worker = std::thread::Builder::new()
             .name("Screenshot readback".into())
             .spawn(move || {
@@ -108,18 +131,21 @@ impl Readbacks {
         self.1.push(worker);
         #[cfg(not(test))]
         drop(worker);
-        self.0.push(receiver);
+        self.0.push((path, receiver));
         Ok(())
     }
 
-    pub fn poll(&mut self) -> Option<Outcome> {
-        let outcome = match self.0.first()?.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err("screenshot readback worker stopped".into()),
-        };
-        self.0.remove(0);
-        Some(outcome)
+    pub fn poll(&mut self) -> Option<std::result::Result<PendingScreenshot, ScreenshotFailure>> {
+        for (index, (_, receiver)) in self.0.iter().enumerate() {
+            let outcome = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => Err("screenshot readback worker stopped".into()),
+            };
+            let (path, _) = self.0.remove(index);
+            return Some(outcome.map_err(|message| ScreenshotFailure { path, message }));
+        }
+        None
     }
 }
 
@@ -144,7 +170,42 @@ impl Drop for Readbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    #[test]
+    fn screenshot_does_not_wait_for_a_missing_mapping_callback_after_the_deadline() {
+        let (sender, receiver) = mpsc::channel();
+        let error = wait_for_mapping(receiver, Instant::now()).unwrap_err();
+        assert!(error.to_string().contains("screenshot buffer mapping"));
+        drop(sender);
+
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Ok(())).unwrap();
+        assert!(wait_for_mapping(receiver, Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn failed_and_disconnected_readbacks_keep_their_capture_paths() {
+        let mut readbacks = Readbacks::default();
+        let (icon_tx, icon_rx) = mpsc::channel();
+        let (shot_tx, shot_rx) = mpsc::channel();
+        readbacks.0.push(("icon.png".into(), icon_rx));
+        readbacks.0.push(("screenshot.png".into(), shot_rx));
+        shot_tx.send(Err("GPU readback failed".into())).unwrap();
+        let Some(Err(shot)) = readbacks.poll() else {
+            panic!("a completed capture must not wait for the earlier icon");
+        };
+        assert_eq!(shot.path, PathBuf::from("screenshot.png"));
+        assert_eq!(shot.message, "GPU readback failed");
+        assert!(readbacks.poll().is_none());
+
+        drop(icon_tx);
+        let Some(Err(icon)) = readbacks.poll() else {
+            panic!("expected the disconnected icon readback");
+        };
+        assert_eq!(icon.path, PathBuf::from("icon.png"));
+        assert_eq!(icon.message, "screenshot readback worker stopped");
+        assert!(readbacks.is_empty());
+    }
 
     #[test]
     #[ignore = "daily"]
@@ -186,7 +247,7 @@ mod tests {
         });
         let mut encoder = device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&source, 0, &buffer, 0, bytes.len() as u64);
-        queue.submit([encoder.finish()]);
+        let submission = queue.submit([encoder.finish()]);
         let request = ScreenshotRequest {
             path: path.clone(),
             size: None,
@@ -198,6 +259,7 @@ mod tests {
             .start(
                 Reader {
                     device,
+                    submission,
                     config: wgpu::SurfaceConfiguration {
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                         format: wgpu::TextureFormat::Bgra8Unorm,

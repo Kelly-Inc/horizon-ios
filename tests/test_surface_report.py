@@ -4,6 +4,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -68,8 +69,9 @@ class ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             tool = work / "horizon-stage"
+            calls = work / "calls"
             tool.write_text(f"""#!/bin/bash
-echo "$@" >> {work}/calls
+echo "$@" >> {shlex.quote(str(calls))}
 if [ "$1" = surface ]; then
   case "$2" in *base) [ {base_export} = 0 ] || {{ echo 'unclassified: x' >&2; echo 'horizon-stage surface: unknown key `access`' >&2; exit 1; }};; esac
   case "$2" in *head) [ {head_export} = 0 ] || {{ echo 'horizon-stage surface: a.rs: parse error' >&2; exit 1; }};; esac
@@ -82,7 +84,7 @@ exit {diff_exit}
             tool.chmod(0o755)
             (work / "base").mkdir()
             code, text = surface_report.report(str(tool), work / "base", work / "head", work, gate_on)
-            return code, text, (work / "calls").read_text()
+            return code, text, calls.read_text()
 
     def test_a_base_the_head_tool_cannot_read_passes_with_one_line(self):
         code, text, calls = self.run_report(base_export=1)

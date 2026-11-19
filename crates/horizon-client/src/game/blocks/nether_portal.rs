@@ -1814,15 +1814,16 @@ impl Game<'_> {
             .extend(list.iter().filter_map(arrival_from_tag));
     }
     /// Write the waiting entities when they changed.
-    pub(super) fn save_portal_arrivals(&mut self) {
+    pub(super) fn save_portal_arrivals(&mut self) -> horizon_client::Result<()> {
         if !self.portals.dirty || self.remote.is_some() {
-            return;
+            return Ok(());
         }
         let list = self.portals.arrivals.iter().map(arrival_tag).collect();
         let root = Tag::compound([("arrivals", Tag::List(list))]);
-        if horizon_client::save::write_dat(&self.arrivals_path(), root).is_ok() {
-            self.portals.dirty = false;
-        }
+        horizon_client::save::write_dat(&self.arrivals_path(), root)
+            .map_err(|error| format!("could not save portal arrivals: {error}"))?;
+        self.portals.dirty = false;
+        Ok(())
     }
 }
 

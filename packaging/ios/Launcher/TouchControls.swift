@@ -59,8 +59,10 @@ enum TouchButton: Int, CaseIterable, Codable, Identifiable {
     // not an independently movable touch button.
     func rect(in size: CGSize) -> CGRect {
         let w = size.width, h = size.height
-        let d = min(48, max(26, h * 0.14))
-        let cx = 14 + d, cy = h - 14 - 2 * d - 16
+        let margin = min(14, min(w, h) / 4)
+        let bottom = min(16, h / 4)
+        let d = min(48, max(26, h * 0.14), (w - margin) / 3, (h - margin - bottom) / 3)
+        let cx = margin + d, cy = h - margin - 2 * d - bottom
         let unit = min(w,h) / 768, s = 69.6 * unit, stick = 204.8 * unit
         let right = 0.94878495 * w - s, gap = 2 * unit
         switch self {
@@ -74,7 +76,7 @@ enum TouchButton: Int, CaseIterable, Codable, Identifiable {
         case .leftClick: return CGRect(x:0.7756397*w-s,y:0.8224885*h-s,width:s,height:s)
         case .rightClick: return CGRect(x:0.8756154*w-s,y:0.8178498*h-s,width:s,height:s)
         case .middleClick: return CGRect(x:0.83548373*w-s,y:0.67798775*h-s,width:s,height:s)
-        case .joystick: return CGRect(x:0.02326631*w,y:min(0.9753418*h-stick,h > w ? h-34-stick : h),width:stick,height:stick)
+        case .joystick: return CGRect(x:0.02326631*w,y:min(0.9753418*h-stick,h > w ? h-min(34,h/2)-stick : h),width:stick,height:stick)
         case .perspective: return CGRect(x:98*unit,y:h>w ? 42*unit : 0,width:96*unit,height:40*unit)
         case .chat: return CGRect(x:0,y:42*unit,width:96*unit,height:40*unit)
         case .pause: return CGRect(x:w-3*106.8*unit,y:0,width:104.8*unit,height:39.2*unit)
@@ -98,6 +100,13 @@ struct TouchSize: Codable, Equatable {
     var width: Double
     var height: Double
     var valid: Bool { width.isFinite && height.isFinite && (0.02...0.8).contains(width) && (0.02...0.8).contains(height) }
+
+    var proportionalWidthRange: ClosedRange<Double> {
+        let aspect = width / height
+        let lower = max(0.02, min(0.8, 0.02 * aspect))
+        let upper = max(lower, min(0.8, 0.8 * aspect))
+        return lower...upper
+    }
 }
 
 /// Decode entries independently so a damaged control does not erase its neighbours.
@@ -140,7 +149,12 @@ struct TouchConfiguration: Codable, Equatable {
         forwardLock = field(Bool.self, .forwardLock) ?? false
         showControls = field(Bool.self, .showControls) ?? true
         virtualMouse = field(Bool.self, .virtualMouse) ?? true
-        joystick = field(Bool.self, .joystick) ?? false
+        if !c.contains(.joystick) {
+            // Layouts saved before joystick mode used the directional buttons.
+            joystick = false
+        } else if let saved = field(Bool.self, .joystick) {
+            joystick = saved
+        }
         mouseGestures = field(Bool.self, .mouseGestures) ?? true
         hotbarGestures = field(Bool.self, .hotbarGestures) ?? true
         slideableHotbar = field(Bool.self, .slideableHotbar) ?? false
@@ -177,11 +191,27 @@ struct TouchConfiguration: Codable, Equatable {
         guard let value = opacities[String(button.rawValue)], value.isFinite else { return 1 }
         return min(1,max(0.1,value))
     }
-    mutating func resize(_ button: TouchButton, factor: Double, in size: CGSize) {
-        guard factor.isFinite, factor > 0, min(size.width,size.height) > 0 else { return }
-        let r = rect(button,in:size), unit = min(size.width,size.height)
-        sizes[String(button.rawValue)] = TouchSize(width:min(0.8,max(0.02,r.width*factor/unit)),height:min(0.8,max(0.02,r.height*factor/unit)))
-        move(button,to:CGPoint(x:r.midX,y:r.midY),in:size)
+    func relativeSize(_ button: TouchButton, in canvas: CGSize) -> TouchSize {
+        if let saved = sizes[String(button.rawValue)], saved.valid {
+            return TouchSize(width: saved.width, height: button == .joystick ? saved.width : saved.height)
+        }
+        let unit = min(canvas.width, canvas.height)
+        guard unit.isFinite, unit > 0 else { return TouchSize(width: 0.02, height: 0.02) }
+        let rect = button.rect(in: canvas)
+        return TouchSize(width: rect.width / unit, height: rect.height / unit)
+    }
+
+    mutating func resize(_ button: TouchButton, factor: Double, in canvas: CGSize,
+                         from initial: TouchSize? = nil) {
+        guard factor.isFinite, factor > 0, min(canvas.width, canvas.height) > 0 else { return }
+        let original = initial ?? relativeSize(button, in: canvas)
+        let range = original.proportionalWidthRange
+        let width = min(range.upperBound, max(range.lowerBound, original.width * factor))
+        // Limit the proportional size first, then absorb floating-point roundoff.
+        let height = min(0.8, max(0.02, width / (original.width / original.height)))
+        sizes[String(button.rawValue)] = TouchSize(width: width, height: height)
+        // Keep the chosen anchor. rect() fits it to the current canvas
+        // without saving a temporary shift away from an edge.
     }
     mutating func move(_ button: TouchButton, to point: CGPoint, in size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
@@ -195,7 +225,6 @@ struct TouchConfiguration: Codable, Equatable {
         centres.removeAll()
         sizes.removeAll()
         opacities.removeAll()
-        forwardLock = false
         guard !customButtons.isEmpty else { return }
 
         let appearance = CustomTouchButton()
@@ -203,15 +232,23 @@ struct TouchConfiguration: Codable, Equatable {
         // grid so resetting several buttons does not stack them at one point.
         let columns = Int(ceil(sqrt(Double(customButtons.count))))
         let rows = (customButtons.count + columns - 1) / columns
+        let horizontalSpan = 0.7
+        let verticalSpan = 0.6
+        // Centres are relative to the full canvas, while button size is
+        // relative to its short side. Fit the tighter spacing on either axis.
+        let scale = min(1, 0.9 * horizontalSpan / Double(columns) / appearance.size.width,
+                        0.9 * verticalSpan / Double(rows) / appearance.size.height)
+        let size = TouchSize(width: max(0.02, appearance.size.width * scale),
+                             height: max(0.02, appearance.size.height * scale))
         for index in customButtons.indices {
             let row = index / columns
             let countInRow = min(columns, customButtons.count - row * columns)
             let column = index % columns
             customButtons[index].centre = TouchCentre(
-                x: 0.15 + 0.7 * (Double(column) + 0.5) / Double(countInRow),
-                y: rows == 1 ? 0.75 : 0.25 + 0.6 * (Double(row) + 0.5) / Double(rows)
+                x: 0.15 + horizontalSpan * (Double(column) + 0.5) / Double(countInRow),
+                y: rows == 1 ? 0.75 : 0.25 + verticalSpan * (Double(row) + 0.5) / Double(rows)
             )
-            customButtons[index].size = appearance.size
+            customButtons[index].size = size
             customButtons[index].opacity = appearance.opacity
         }
     }
@@ -351,7 +388,8 @@ private final class TouchEditorController: UIHostingController<AnyView> {
 
 private struct TouchLayoutEditor: View {
     @State private var draft: TouchConfiguration
-    @State private var pinchScale: CGFloat = 1
+    @State private var pinchStart: TouchSize?
+    @GestureState private var isPinching = false
     @State private var dragStart: CGPoint?
     @State private var selected: TouchButton?
     @State private var confirmReset = false
@@ -372,7 +410,7 @@ private struct TouchLayoutEditor: View {
                                               limit: guiOptions.limit, forceUnicode: guiOptions.forceUnicode)
             let gui = metrics.gui
             let scale = metrics.pointsPerUnit
-            let toolbarWidth = min(500.0, max(280.0, width - 32))
+            let toolbar = TouchEditorToolbarGeometry(canvas: geometry.size)
             ZStack(alignment: .topLeading) {
                 Color.black
                 Rectangle().stroke(Color.white.opacity(0.2), lineWidth: 1)
@@ -417,11 +455,14 @@ private struct TouchLayoutEditor: View {
                                 guard let start = dragStart else { return }
                                 draft.move(button, to: CGPoint(x: start.x + value.translation.width / scale, y: start.y + value.translation.height / scale), in: gui)
                             }.onEnded { _ in dragStart = nil })
-                            .simultaneousGesture(MagnificationGesture().onChanged { value in
+                            .simultaneousGesture(MagnificationGesture().updating($isPinching) { _, active, _ in
+                                active = true
+                            }.onChanged { value in
                                 selected = button
-                                draft.resize(button,factor:value / pinchScale,in:gui)
-                                pinchScale = value
-                            }.onEnded { _ in pinchScale = 1 })
+                                let original = pinchStart ?? draft.relativeSize(button, in: gui)
+                                pinchStart = original
+                                draft.resize(button, factor: value, in: gui, from: original)
+                            }.onEnded { _ in pinchStart = nil })
                     }
 
                 ForEach($draft.customButtons) { $custom in
@@ -443,37 +484,53 @@ private struct TouchLayoutEditor: View {
                         .gesture(DragGesture(coordinateSpace: .named("touch-layout-canvas")).onChanged { value in
                             let origin = toolbarStart ?? toolbarCentre ?? CGPoint(x: width / 2, y: height / 2)
                             toolbarStart = origin
-                            toolbarCentre = CGPoint(
-                                x: min(width - toolbarWidth / 2, max(toolbarWidth / 2, origin.x + value.translation.width)),
-                                y: min(height - 80, max(80, origin.y + value.translation.height)))
+                            toolbarCentre = toolbar.fittedCentre(CGPoint(
+                                x: origin.x + value.translation.width,
+                                y: origin.y + value.translation.height))
                         }.onEnded { _ in toolbarStart = nil })
-            HStack(spacing: 20) {
-                Button { finish(nil) } label: { Text("Cancel").frame(minWidth: 50, minHeight: 44) }
-                    .accessibilityIdentifier("touch-editor-cancel")
-                Spacer(minLength: 4)
+            HStack(spacing: toolbar.compact ? 0 : 20) {
+                toolbarAction("Cancel", icon: "xmark", id: "touch-editor-cancel", compact: toolbar.compact) {
+                    finish(nil)
+                }
+                if !toolbar.compact { Spacer(minLength: 4) }
                 Menu {
                     Button("Add custom button") {var button=CustomTouchButton();button.centre=TouchCentre(x:0.5,y:0.75);draft.customButtons.append(button);editingCustom=button.id}
                     ForEach(draft.customButtons) { button in Button(button.name){editingCustom=button.id} }
                     ForEach(draft.buttons) { button in
                         Button(button.title) { selected = button; dragStart = nil }
                     }
-                } label: { Label(selected?.title ?? "Touch Layout", systemImage: "hand.draw") }
-                    .accessibilityIdentifier("touch-editor-select")
-                Spacer(minLength: 4)
-                Button { confirmReset = true } label: { Text("Reset").frame(minWidth: 50, minHeight: 44) }
-                    .accessibilityIdentifier("touch-editor-reset")
-                Button { finish(draft) } label: { Text("Save").fontWeight(.semibold).frame(minWidth: 50, minHeight: 44) }
-                    .accessibilityIdentifier("touch-editor-save")
-            }.padding(.horizontal, 12).frame(height: 54)
+                } label: {
+                    if toolbar.compact {
+                        Image(systemName: "hand.draw")
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .contentShape(Rectangle())
+                    } else {
+                        Label(selected?.title ?? "Touch Layout", systemImage: "hand.draw")
+                    }
+                }
+                .accessibilityLabel(selected?.title ?? "Touch Layout")
+                .accessibilityIdentifier("touch-editor-select")
+                if !toolbar.compact { Spacer(minLength: 4) }
+                toolbarAction("Reset", icon: "arrow.counterclockwise", id: "touch-editor-reset", compact: toolbar.compact) {
+                    confirmReset = true
+                }
+                toolbarAction("Save", icon: "checkmark", id: "touch-editor-save", compact: toolbar.compact) {
+                    finish(draft)
+                }.fontWeight(.semibold)
+            }.padding(.horizontal, toolbar.compact ? 4 : 12).frame(height: 54)
                     if let selected {
+                        let current = draft.relativeSize(selected, in: gui)
+                        let range = current.proportionalWidthRange
                         HStack {
                             Text("Size")
                             Slider(value: Binding(get: {
-                                draft.rect(selected,in:gui).width / min(gui.width,gui.height)
-                            }, set: { value in
-                                let current = draft.rect(selected,in:gui).width
-                                draft.resize(selected,factor:value * min(gui.width,gui.height) / current,in:gui)
-                            }), in:0.02...0.8)
+                                min(range.upperBound, max(range.lowerBound, current.width))
+                            }, set: { width in
+                                // The slider can call its setter repeatedly before the view updates.
+                                let latest = draft.relativeSize(selected, in: gui)
+                                draft.resize(selected, factor: width / latest.width, in: gui)
+                            }), in: range.lowerBound == range.upperBound ? 0.02...0.8 : range)
+                                .disabled(range.lowerBound == range.upperBound)
                                 .accessibilityIdentifier("touch-button-size")
                             Text("Opacity")
                             Slider(value:Binding(get:{ draft.opacity(selected) },set:{ draft.opacities[String(selected.rawValue)] = $0 }),in:0.1...1)
@@ -481,18 +538,21 @@ private struct TouchLayoutEditor: View {
                     }
 
                 }
-                .frame(width: toolbarWidth)
+                .frame(width: toolbar.width)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
                 .position(toolbarCentre ?? CGPoint(x: width / 2, y: height / 2))
                 .zIndex(2)
             }
             .frame(width: width, height: height)
             .coordinateSpace(name: "touch-layout-canvas")
+            .onChange(of: isPinching) { active in
+                if !active { pinchStart = nil }
+            }
             .onChange(of: geometry.size) { _ in
                 toolbarCentre = nil
                 toolbarStart = nil
                 dragStart = nil
-                pinchScale = 1
+                pinchStart = nil
             }
         }
         .ignoresSafeArea()
@@ -511,9 +571,37 @@ private struct TouchLayoutEditor: View {
                 draft.resetLayout()
                 selected = nil
                 dragStart = nil
-                pinchScale = 1
+                pinchStart = nil
             }
         } message: { Text("This resets positions, sizes, and opacity. Custom bindings are kept. Save to keep the changes.") }
+    }
+    private func toolbarAction(_ title: String, icon: String, id: String, compact: Bool,
+                               action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if compact {
+                Image(systemName: icon)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .contentShape(Rectangle())
+            } else {
+                Text(title).frame(minWidth: 50, minHeight: 44)
+            }
+        }
+        .accessibilityLabel(title)
+        .accessibilityIdentifier(id)
+    }
+}
+
+struct TouchEditorToolbarGeometry {
+    let canvas: CGSize
+
+    var width: CGFloat { min(500, canvas.width - min(32, canvas.width / 10)) }
+    var compact: Bool { width < 380 }
+
+    func fittedCentre(_ point: CGPoint) -> CGPoint {
+        let horizontal = width / 2
+        let vertical = min(80, canvas.height / 2)
+        return CGPoint(x: min(canvas.width - horizontal, max(horizontal, point.x)),
+                       y: min(canvas.height - vertical, max(vertical, point.y)))
     }
 }
 
@@ -622,7 +710,6 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     var inputContext: UInt64 = 0
     private var hotbarHold: UILongPressGestureRecognizer?
     private var heldGestureSlot: Int?
-    private var suppressTap = false
 
     init(configuration: @escaping () -> TouchConfiguration = { TouchPreferences.shared.configuration },
          toggleMenuCursor: @escaping () -> Void = {
@@ -649,7 +736,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         let tap = TouchSurfaceTap(target: self, action: #selector(tapped(_:)))
         let double = TouchSurfaceTap(target: self, action: #selector(doubleTapped(_:)))
         double.numberOfTapsRequired = 2
-        let hold = UILongPressGestureRecognizer(target: self, action: #selector(held(_:)))
+        let hold = TouchSurfaceHold(target: self, action: #selector(held(_:)))
         hold.minimumPressDuration = configuration().holdDuration
         hotbarHold = hold
         let keyboard = UILongPressGestureRecognizer(target: self, action: #selector(keyboardHeld(_:)))
@@ -690,7 +777,6 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         customPressed.removeAll()
         pending.removeAll()
         heldGestureSlot = nil
-        suppressTap = false
     }
 
     private func setRecognizersEnabled(_ enabled: Bool) {
@@ -751,7 +837,10 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
                 button.removeFromSuperview()
             }
         }
-        let unit=guiScale/Double(surface.window?.screen.scale ?? UIScreen.main.scale)
+        // Winit uses the render view's scale for its physical pixels. It can
+        // differ from the display scale, including after a display change.
+        let unit = guiScale / Double(surface.contentScaleFactor)
+        var previousButton: CustomTouchView?
         for definition in config.customButtons {
             if let old = customViews[definition.id], old.definition != definition {
                 old.isEnabled = false
@@ -780,9 +869,19 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
                         if self.overflowed { return }
                     }
                 }
-                customViews[definition.id]=button;surface.addSubview(button)
+                customViews[definition.id] = button
+                // The layout order determines which control wins an overlap.
+                // Recreating an edited control must preserve its place.
+                if let previousButton {
+                    surface.insertSubview(button, aboveSubview: previousButton)
+                } else if let first = surface.subviews.first(where: { $0 is CustomTouchView }) {
+                    surface.insertSubview(button, belowSubview: first)
+                } else {
+                    surface.addSubview(button)
+                }
             }
             guard let button=customViews[definition.id] else{continue}
+            previousButton = button
             let hidden = !active || (controlsHidden && !definition.keys.contains(-2) && !definition.keys.contains(-5)) || (playing ? !definition.inGame : !definition.inMenu)
             if hidden {button.release()}
             button.isHidden=hidden
@@ -793,16 +892,16 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     }
     private func point(_ location: CGPoint) -> CGPoint {
         guard let surface, surface.bounds.width > 0, surface.bounds.height > 0 else { return .zero }
-        let factor = Double(surface.window?.screen.scale ?? UIScreen.main.scale) / guiScale
+        let factor = Double(surface.contentScaleFactor) / guiScale
         return CGPoint(x: location.x * factor, y: location.y * factor)
     }
     private func slot(_ location: CGPoint) -> Int {
         guard playing, configuration().hotbarGestures else { return -1 }
         guard let surface else { return -1 }
-        let displayScale = Double(surface.window?.screen.scale ?? UIScreen.main.scale)
+        let displayScale = Double(surface.contentScaleFactor)
         return TouchHotbar.slot(point: CGPoint(x: location.x * displayScale, y: location.y * displayScale),
-                                pixels: CGSize(width: surface.bounds.width * displayScale,
-                                               height: surface.bounds.height * displayScale), scale: guiScale)
+                                pixels: CGSize(width: (surface.bounds.width * displayScale).rounded(),
+                                               height: (surface.bounds.height * displayScale).rounded()), scale: guiScale)
     }
     private func emit(_ kind: Double, phase: Int, location: CGPoint = .zero, slot: Int = -1,
                       modifiers: UIKeyModifierFlags = [], touch: UInt64 = 0) {
@@ -845,8 +944,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         if closeShown && closeRect.contains(p) { return false }
         if keyboardShown && closeRect.offsetBy(dx: -auxiliarySize - 4, dy: 0).contains(p) { return false }
         let candidateSlot = slot(location)
-        suppressTap = false
-        if gestureRecognizer is TouchHotbarTracker { return candidateSlot >= 0 }
+        if gestureRecognizer is TouchHotbarTracker { return configuration.slideableHotbar && candidateSlot >= 0 }
         if let tap = gestureRecognizer as? TouchSurfaceTap, tap.numberOfTapsRequired == 2 {
             return candidateSlot >= 0
         }
@@ -858,7 +956,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
     @objc private func hotbarMoved(_ sender: TouchHotbarTracker) {
-        guard configuration().slideableHotbar, playing else { return }
+        guard configuration().slideableHotbar, playing, [.began, .changed].contains(sender.state) else { return }
         let next = slot(sender.location(in: surface))
         if next >= 0 && (sender.state == .began || next != sender.lastSlot) {
             emit(6, phase: sender.state.rawValue, slot: next, modifiers: sender.modifierFlags)
@@ -866,7 +964,7 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         }
     }
     @objc private func tapped(_ sender: TouchSurfaceTap) {
-        guard sender.state == .recognized, sender.clickEligible, !suppressTap else { return }
+        guard sender.state == .recognized, sender.clickEligible else { return }
         let selectedSlot = sender.hotbarSlot(using: slot) ?? -1
         emit(1, phase: sender.state.rawValue, location: point(sender.location(in: surface)), slot: selectedSlot,
              modifiers: sender.modifierFlags, touch: sender.touchIdentity)
@@ -880,7 +978,11 @@ final class TouchGestureBridge: NSObject, UIGestureRecognizerDelegate {
         guard let surface else { return }
         if sender.state == .began {
             guard active, !discardingInput, !overflowed else { return }
-            suppressTap = true
+            if let touch = (sender as? TouchSurfaceHold)?.finger {
+                for case let tap as TouchSurfaceTap in recognizers {
+                    tap.excludeHeldTouch(touch)
+                }
+            }
             let slot = slot(sender.location(in: surface))
             heldGestureSlot = slot
             emit(2, phase: sender.state.rawValue, slot: slot, modifiers: sender.modifierFlags)
@@ -925,6 +1027,10 @@ final class TouchSurfaceTap: UITapGestureRecognizer {
         tapOrigins.append(p)
         clickRange = CGRect(x: p.x - 2, y: p.y - 2, width: 5, height: 5)
     }
+    func excludeHeldTouch(_ touch: UITouch) {
+        let held = UInt64(UInt(bitPattern: Unmanaged.passUnretained(touch).toOpaque()))
+        if touchIdentity == held { clickEligible = false }
+    }
     func trackTapEnd(_ touches: Set<UITouch>) {
         if let finger, touches.contains(finger) { self.finger = nil }
     }
@@ -955,6 +1061,23 @@ final class TouchSurfaceTap: UITapGestureRecognizer {
     }
 }
 
+/// A one-finger hold prevents that finger's tap without affecting other taps.
+final class TouchSurfaceHold: UILongPressGestureRecognizer {
+    private(set) weak var finger: UITouch?
+
+    func trackHoldStart(_ touch: UITouch) {
+        if finger == nil { finger = touch }
+    }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let touch = touches.first { trackHoldStart(touch) }
+        super.touchesBegan(touches, with: event)
+    }
+    override func reset() {
+        finger = nil
+        super.reset()
+    }
+}
+
 /// Six doubles per recognized input: kind, UIKit phase, x, y, hotbar slot,
 /// and age in seconds. Called on UIKit's main thread by the game frame loop.
 @_cdecl("horizon_touch_gestures_v1")
@@ -978,7 +1101,7 @@ enum TouchHotbar {
               pixels.height >= 20 * scale else { return -1 }
         let width = Int(180 * scale), height = Int(20 * scale)
         let left = Int(pixels.width) / 2 - width / 2
-        guard point.y >= Double(Int(pixels.height) - height),
+        guard point.y >= Double(Int(pixels.height) - height), point.y < pixels.height,
               point.x >= Double(left), point.x < Double(left + width) else { return -1 }
         return min(8, Int((point.x - Double(left)) / Double(width) * 9))
     }

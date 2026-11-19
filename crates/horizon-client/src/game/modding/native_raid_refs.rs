@@ -323,7 +323,12 @@ mod tests {
             let root = std::env::temp_dir().join(format!("raid-early-{}", std::process::id()));
             game.world_root = root.clone();
             assert!(game.raid_command_create([10, 70, 10], 2));
-            game.save_raids();
+            let raids_file = horizon_client::save::dimension_dir(&root, game.dim.id())
+                .join("data/minecraft/raids.dat");
+            std::fs::create_dir_all(&raids_file).unwrap();
+            assert!(game.save_raids().unwrap_err().to_string().contains("could not save raids"));
+            std::fs::remove_dir(&raids_file).unwrap();
+            game.save_raids().unwrap();
             // The world opens again and reads the raids, as `finish_open_world` does.
             game.raiding = Default::default();
             game.read_raids();

@@ -16,55 +16,78 @@ final class Changelog: ObservableObject {
     @Published private(set) var changes: [Change] = []
     @Published private(set) var failed: String?
     @Published private(set) var loading = false
+    typealias Fetch = @MainActor (URLRequest) async throws -> (Data, URLResponse)
+    private let fetch: Fetch
+    private let cache: URL
+    private var generation = UUID()
 
-    static let repository = "heyskylo/horizon-ios"
+    static let repository = "Kelly-Inc/horizon-ios"
     private static let api = URL(string: "https://api.github.com/repos/\(repository)/commits?sha=main&per_page=40")!
-    private static var cache: URL {
+    private static var defaultCache: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("horizon-changelog.json")
     }
 
-    init() {
-        if let data = try? Data(contentsOf: Self.cache) {
-            changes = Self.parse(data)
+    init(fetch: @escaping Fetch = { try await URLSession.shared.data(for: $0) },
+         cache: URL? = nil) {
+        self.fetch = fetch
+        self.cache = cache ?? Self.defaultCache
+        if let data = try? Data(contentsOf: self.cache) {
+            changes = Self.parse(data) ?? []
         }
     }
 
     func load() async {
+        guard !Task.isCancelled else { return }
+        let current = UUID()
+        generation = current
         loading = true
-        defer { loading = false }
+        defer { if generation == current { loading = false } }
         var request = URLRequest(url: Self.api)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await fetch(request)
+            guard generation == current, !Task.isCancelled else { return }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200 else {
                 // 403 is GitHub's hourly limit for requests without an account.
-                failed = status == 403 ? "GitHub asked to wait a while; showing the last list." : "GitHub answered \(status)."
+                if status == 403 || status == 429 {
+                    failed = changes.isEmpty
+                        ? "GitHub asked to wait a while. Try again later."
+                        : "GitHub asked to wait a while. Showing the last list."
+                } else {
+                    failed = "GitHub answered \(status)."
+                }
                 return
             }
-            let parsed = Self.parse(data)
-            if !parsed.isEmpty {
-                changes = parsed
-                failed = nil
-                try? data.write(to: Self.cache)
+            guard let parsed = Self.parse(data) else {
+                failed = "GitHub returned an unreadable changelog."
+                return
             }
+            failed = nil
+            changes = parsed
+            try? data.write(to: cache, options: .atomic)
         } catch {
+            guard generation == current, !Task.isCancelled else { return }
             failed = changes.isEmpty ? error.localizedDescription : "Offline; showing the last list."
         }
     }
 
-    private static func parse(_ data: Data) -> [Change] {
-        guard let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return [] }
+    private static func parse(_ data: Data) -> [Change]? {
+        guard let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
         let dates = ISO8601DateFormatter()
-        return list.compactMap { item in
-            guard let sha = item["sha"] as? String,
+        var recognized = list.isEmpty
+        var seen = Set<String>()
+        let changes: [Change] = list.compactMap { item in
+            guard let sha = item["sha"] as? String, !sha.isEmpty,
                   let commit = item["commit"] as? [String: Any],
                   let message = commit["message"] as? String
             else { return nil }
+            recognized = true
             let when = ((commit["committer"] as? [String: Any])?["date"] as? String).flatMap(dates.date(from:))
             let lines = message.components(separatedBy: "\n")
-            let title = lines.first ?? ""
+            let title = (lines.first ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.hasPrefix("Merge "), !title.isEmpty, seen.insert(sha).inserted else { return nil }
             // The story without its attribution lines.
             let body = lines.dropFirst()
                 .filter { !$0.lowercased().hasPrefix("co-authored-by:") && !$0.hasPrefix("Signed-off-by:") }
@@ -74,11 +97,10 @@ final class Changelog: ObservableObject {
                 .components(separatedBy: "\n\n")
                 .map { $0.replacingOccurrences(of: "\n", with: " ") }
                 .joined(separator: "\n\n")
-            // Merges say nothing a player reads.
-            if title.hasPrefix("Merge ") { return nil }
             return Change(id: sha, title: title, body: body, date: when ?? .distantPast,
                           url: (item["html_url"] as? String).flatMap(URL.init(string:)))
         }
+        return recognized ? changes : nil
     }
 }
 
@@ -97,9 +119,11 @@ struct NewsPage: View {
                     ProgressView().tint(Theme.accentText).frame(maxWidth: .infinity).padding(30)
                 } else {
                     EmptyNote(icon: "sparkles", text: "Nothing to show yet.")
-                    SecondaryButton(title: "Try again", icon: "arrow.clockwise") {
-                        Task { await log.load() }
-                    }
+                }
+            }
+            if !log.loading && (log.failed != nil || log.changes.isEmpty) {
+                SecondaryButton(title: "Try again", icon: "arrow.clockwise") {
+                    Task { await log.load() }
                 }
             }
             ForEach(days) { day in
@@ -120,7 +144,7 @@ struct NewsPage: View {
                 Label("Every change on GitHub", systemImage: "arrow.up.right.square")
                     .font(Theme.sans(13, .semiBold)).foregroundStyle(Theme.accentText)
             }
-            Link(destination: URL(string: "https://github.com/ludovic111/horizon/releases")!) {
+            Link(destination: URL(string: "https://github.com/horizon-rust/horizon/releases")!) {
                 Label("Horizon's desktop releases", systemImage: "arrow.up.right.square")
                     .font(Theme.sans(13, .semiBold)).foregroundStyle(Theme.accentText)
             }

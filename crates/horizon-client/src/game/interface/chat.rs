@@ -2214,9 +2214,9 @@ impl Game<'_> {
     /// Save the clock beside level.dat (Level.write saves the game rules: a
     /// second writer of game_rules.dat could leave it with the rules loaded
     /// when the world opened).
-    pub(super) fn save_world_state(&mut self) {
+    pub(super) fn save_world_state(&mut self) -> horizon_client::Result<()> {
         if self.world_root.as_os_str().is_empty() {
-            return;
+            return Ok(());
         }
         use horizon_core::nbt::Tag;
         // Every clock the world has met is saved; the fields of a clock Horizon does not model
@@ -2274,9 +2274,8 @@ impl Game<'_> {
             ("data", data),
             ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
         ]);
-        if let Err(e) = horizon_client::save::write_dat(&path, root) {
-            log::warn!("the world clocks were not written: {e}");
-        }
+        horizon_client::save::write_dat(&path, root)
+            .map_err(|e| format!("could not save the world clocks: {e}").into())
     }
     /// F1 hides the HUD (see `hud`); the screenshot key still works.
     pub(super) fn toggle_hide_gui(&mut self) {
@@ -2284,22 +2283,36 @@ impl Game<'_> {
     }
     /// F2: ScreenShot.grab into `screenshots/` with vanilla's file name.
     pub(super) fn take_screenshot(&mut self) -> Option<std::path::PathBuf> {
-        if self.screenshot_sequence.is_some() {
+        if self.screenshot_sequence.is_some() || self.pending_screenshot.is_some() {
+            return None;
+        }
+        let renderer = self.renderer.as_mut()?;
+        let replacing = renderer
+            .screenshot
+            .as_ref()
+            .map(|request| request.path.as_path());
+        if !super::screenshot_writer::can_queue_player_screenshot(
+            &self.ui.screenshot_messages,
+            replacing,
+        ) {
             return None;
         }
         let dir = horizon_client::logging::player_dir().join("screenshots");
-        if std::fs::create_dir_all(&dir).is_err() {
-            return None;
-        }
-        let name = screenshot_name(&dir, &self.ui.screenshot_messages);
-        let renderer = self.renderer.as_mut()?;
-        let path = dir.join(name);
+        let name = std::fs::create_dir_all(&dir)
+            .and_then(|()| screenshot_name(&dir, &self.ui.screenshot_messages));
+        let path = match name {
+            Ok(name) => dir.join(name),
+            Err(error) => {
+                self.finish_screenshot(&dir, &Err(error.to_string()), None);
+                return None;
+            }
+        };
         // A second shortcut before rendering replaces the queued frame. Release
         // that request's name: no readback will arrive to finish it.
         if let Some(replaced) = renderer.screenshot.as_ref() {
             self.ui.screenshot_messages.retain(|p| *p != replaced.path);
         }
-        renderer.screenshot = Some(horizon_client::gfx::ScreenshotRequest {
+        renderer.request_screenshot(horizon_client::gfx::ScreenshotRequest {
             path: path.clone(),
             size: None,
             scaled: true,
@@ -2381,16 +2394,26 @@ impl Game<'_> {
             ));
         None
     }
+    pub(super) fn release_screenshot_name(&mut self, path: &std::path::Path) -> bool {
+        let Some(index) = self
+            .ui
+            .screenshot_messages
+            .iter()
+            .position(|name| name == path)
+        else {
+            return false;
+        };
+        self.ui.screenshot_messages.remove(index);
+        true
+    }
+
     /// After a frame: report a finished F2 screenshot in chat.
     pub(super) fn finish_screenshot(
         &mut self,
+        path: &std::path::Path,
         result: &std::result::Result<[u32; 2], String>,
         message: Option<Text>,
     ) {
-        if self.ui.screenshot_messages.is_empty() {
-            return;
-        }
-        let path = self.ui.screenshot_messages.remove(0);
         let message = match result {
             Ok(_) => {
                 log::info!("Saved screenshot to {}", path.display());
@@ -2433,9 +2456,20 @@ pub(super) fn screenshot_cancel_line(message: Option<Text>) -> Text {
     })
 }
 /// `yyyy-MM-dd_HH.mm.ss[_n].png` (Util.getFilenameFormattedDateTime, in local time).
-pub fn screenshot_name(dir: &std::path::Path, pending: &[std::path::PathBuf]) -> String {
+fn screenshot_name(
+    dir: &std::path::Path,
+    pending: &[std::path::PathBuf],
+) -> std::io::Result<String> {
     // Util.getFilenameFormattedDateTime: the local date and time.
     let base = chrono::Local::now().format("%Y-%m-%d_%H.%M.%S").to_string();
+    screenshot_name_at(dir, pending, &base)
+}
+
+fn screenshot_name_at(
+    dir: &std::path::Path,
+    pending: &[std::path::PathBuf],
+    base: &str,
+) -> std::io::Result<String> {
     let mut n = 1;
     loop {
         let name = if n == 1 {
@@ -2444,10 +2478,27 @@ pub fn screenshot_name(dir: &std::path::Path, pending: &[std::path::PathBuf]) ->
             format!("{base}_{n}.png")
         };
         let path = dir.join(&name);
-        if !path.exists() && !pending.contains(&path) {
-            return name;
+        let hdr = horizon_client::gfx::hdr_screenshot_path(&path);
+        // Either half may still exist after the player removes the other.
+        // Treat dangling links as occupied, too.
+        if screenshot_name_available(&path, pending)? && screenshot_name_available(&hdr, pending)? {
+            return Ok(name);
         }
         n += 1;
+    }
+}
+
+fn screenshot_name_available(
+    path: &std::path::Path,
+    pending: &[std::path::PathBuf],
+) -> std::io::Result<bool> {
+    if pending.iter().any(|reserved| reserved == path) {
+        return Ok(false);
+    }
+    match path.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
@@ -2571,8 +2622,8 @@ mod tests {
     fn a_screenshot_being_written_keeps_its_name() {
         let dir = std::env::temp_dir().join(format!("horizon-shots-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let first = screenshot_name(&dir, &[]);
-        let second = screenshot_name(&dir, &[dir.join(&first)]);
+        let first = screenshot_name(&dir, &[]).unwrap();
+        let second = screenshot_name(&dir, &[dir.join(&first)]).unwrap();
         assert_ne!(first, second);
         // Unless the clock turned to the next second in between.
         let same_second = second.starts_with(first.trim_end_matches(".png"));
@@ -2581,6 +2632,47 @@ mod tests {
             "{second}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn screenshot_naming_keeps_an_existing_hdr_copy_and_pending_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = "2026-11-18_12.00.00";
+        let dir = directory.path();
+        let first = dir.join(format!("{base}.png"));
+        let hdr = horizon_client::gfx::hdr_screenshot_path(&first);
+        std::fs::write(hdr, b"earlier hdr screenshot").unwrap();
+
+        assert_eq!(
+            screenshot_name_at(dir, &[], base).unwrap(),
+            format!("{base}_2.png")
+        );
+        let pending = [dir.join(format!("{base}_2.png"))];
+        assert_eq!(
+            screenshot_name_at(dir, &pending, base).unwrap(),
+            format!("{base}_3.png")
+        );
+
+        #[cfg(unix)]
+        {
+            let dangling = dir.join(format!("{base}_3-hdr.png"));
+            std::os::unix::fs::symlink(dir.join("missing.png"), dangling).unwrap();
+            assert_eq!(
+                screenshot_name_at(dir, &pending, base).unwrap(),
+                format!("{base}_4.png")
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_naming_reports_a_blocked_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("screenshots");
+        std::fs::write(&blocked, b"existing file").unwrap();
+
+        let error = screenshot_name_at(&blocked, &[], "capture").unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"existing file");
     }
 
     #[test]

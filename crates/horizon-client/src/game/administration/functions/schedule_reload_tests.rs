@@ -70,7 +70,7 @@ fn a_fired_or_cleared_event_stays_gone_across_a_reload() {
     let (mut game, dir) = schedule_game("gone", &mut resources);
     // A fired event: saved while pending, then run, then reloaded.
     run(&mut game, "schedule function hs:hello 5t");
-    game.save_schedule();
+    game.save_schedule().unwrap();
     let due = game.world.game_time + 5;
     game.world.game_time = due;
     game.run_scheduled_functions();
@@ -81,7 +81,7 @@ fn a_fired_or_cleared_event_stays_gone_across_a_reload() {
     assert_eq!(fired(&game), 1, "a fired event must not come back");
     // A cleared event: saved while pending, then `/schedule clear`-ed.
     run(&mut game, "schedule function hs:hello 100t");
-    game.save_schedule();
+    game.save_schedule().unwrap();
     run(&mut game, "schedule clear hs:hello");
     assert!(game.fns.schedule.is_empty());
     run(&mut game, "reload");
@@ -97,7 +97,7 @@ fn a_pending_event_survives_a_save_and_a_reload() {
     let mut resources = None;
     let (mut game, dir) = schedule_game("pending", &mut resources);
     run(&mut game, "schedule function hs:hello 40t");
-    game.save_schedule();
+    game.save_schedule().unwrap();
     let due = game.world.game_time + 40;
     // A reload keeps the live queue: the event still fires at its time.
     run(&mut game, "reload");
@@ -108,7 +108,7 @@ fn a_pending_event_survives_a_save_and_a_reload() {
     assert!(game.fns.schedule.is_empty());
     // A pending event of a saved world is read back when a session opens it.
     run(&mut game, "schedule function hs:hello 60t");
-    game.save_schedule();
+    game.save_schedule().unwrap();
     let due = game.world.game_time + 60;
     game.fns = Default::default();
     game.ensure_datapacks();

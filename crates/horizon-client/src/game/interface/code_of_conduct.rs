@@ -110,20 +110,7 @@ impl Game<'_> {
         };
         let file = multiplayer::servers_file(&saves());
         let _guard = servers::lock();
-        let (mut list, mut hidden) = servers::load_all(&file);
-        let mut found = false;
-        for entry in list.iter_mut().filter(|s| &s.ip == address) {
-            entry.accepted_code_of_conduct = accepted;
-            found = true;
-        }
-        // Not among the shown entries: the hidden ones (a Direct Connection's).
-        if !found {
-            for entry in hidden.iter_mut().filter(|s| &s.ip == address) {
-                entry.accepted_code_of_conduct = accepted;
-                found = true;
-            }
-        }
-        if found && let Err(e) = servers::save_all(&file, &list, &hidden) {
+        if let Err(e) = servers::update_code_of_conduct(&file, address, accepted) {
             log::warn!("Horizon: could not save {}: {e}", file.display());
         }
     }

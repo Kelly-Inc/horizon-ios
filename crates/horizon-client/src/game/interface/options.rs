@@ -42,45 +42,28 @@ impl Game<'_> {
     pub(super) fn options_control(&mut self, words: &[&str], line: &str) -> Result<Option<Value>> {
         match words[0] {
             "options-get" => {
-                let file = self.settings.to_file();
-                let wanted: Vec<&str> = if words.len() > 1 {
-                    words[1..].to_vec()
-                } else {
-                    horizon_client::options_file::keys()
-                };
-                let mut options = serde_json::Map::new();
-                for key in wanted {
-                    let described = file.describe(key).ok_or_else(|| {
-                        format!("unknown option {key}; options-get lists them all")
-                    })?;
-                    options.insert(key.to_owned(), described);
-                }
+                let options = self.settings.to_file().describe_options(&words[1..])?;
                 Ok(Some(json!({ "options": options })))
             }
             "options-set" => {
-                let key = words.get(1).ok_or("options-set KEY VALUE")?;
-                // The value runs to the end of the line (lists, server names).
-                let value = line
-                    .trim_start()
-                    .strip_prefix("options-set")
-                    .and_then(|rest| rest.trim_start().strip_prefix(key))
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .ok_or("options-set KEY VALUE: missing the value")?;
+                let (key, value) = horizon_client::options_file::parse_set_command(line)?;
                 let narrator = self.settings.narrator();
                 let reduced = self.settings.reduced_debug_info;
-                self.settings = self.settings.with_option(key, value)?;
+                let settings = self.settings.with_option(key, value)?;
+                settings
+                    .save_options(&Self::options_path())
+                    .map_err(|error| format!("Could not save options.txt: {error}"))?;
+                self.settings = settings;
                 if self.settings.reduced_debug_info != reduced {
                     self.debug_entries.invalidate();
                 }
                 // As the options screen applies a change (OptionInstance.set
                 // runs the narrator's onValueUpdate for a new value only).
-                let mut events = vec![Event::Changed];
+                self.apply_changed_options();
                 if self.settings.narrator() != narrator {
-                    events.push(Event::Narrator);
+                    self.narrator_status_changed();
                 }
-                self.handle_option_events(events)?;
-                match *key {
+                match key {
                     "lang" => self.load_language(&self.settings.language.clone()),
                     "resourcePacks" | "incompatibleResourcePacks" => self.reload_packs(),
                     _ => {}
@@ -264,6 +247,24 @@ impl Game<'_> {
             _ => {}
         }
     }
+    /// Save an applied drag when another screen or input owner interrupts it.
+    pub(in crate::game) fn finish_interrupted_option_drag(&mut self) {
+        let mut events = self.ui.options.release();
+        events.retain(|event| match event {
+            Event::ButtonClick => false,
+            Event::Changed => {
+                // Slider movement applied its settings already. Reapplying
+                // every option here could start another resource reload.
+                self.settings.save(&Self::options_path());
+                false
+            }
+            _ => true,
+        });
+        if let Err(error) = self.handle_option_events(events) {
+            log::warn!("Horizon: finishing an interrupted options drag: {error}");
+        }
+    }
+
     pub(super) fn options_mouse(&mut self, pressed: bool, right: bool) -> Result<()> {
         if !pressed {
             if right {
@@ -371,6 +372,16 @@ impl Game<'_> {
         let events = self.ui.options.bind_mouse(&mut self.settings, button);
         self.handle_option_events(events)
     }
+    fn apply_changed_options(&mut self) {
+        self.settings.keys.sync_action_bindings();
+        self.apply_settings();
+        self.switch_mods();
+        self.sync_native_switches();
+        self.sync_pregen_option();
+        self.sync_agent_control();
+        self.ui.options.agent_status = self.agent_status_lines();
+    }
+
     pub(super) fn handle_option_events(&mut self, events: Vec<Event>) -> Result<()> {
         for e in events {
             match e {
@@ -378,13 +389,7 @@ impl Game<'_> {
                 Event::DebugEntriesChanged => self.debug_entries.invalidate(),
                 Event::Changed => {
                     self.settings.save(&Self::options_path());
-                    self.settings.keys.sync_action_bindings();
-                    self.apply_settings();
-                    self.switch_mods();
-                    self.sync_native_switches();
-                    self.sync_pregen_option();
-                    self.sync_agent_control();
-                    self.ui.options.agent_status = self.agent_status_lines();
+                    self.apply_changed_options();
                 }
                 Event::SliderDrag => {
                     self.apply_settings();
@@ -511,13 +516,21 @@ impl Game<'_> {
                         horizon_client::shader_pack_list::scan(&Self::shader_packs_dir());
                 }
                 // Saved; the next frame's `shader_pack_inputs` loads the pick.
-                Event::ShaderPack => self.settings.save(&Self::options_path()),
+                Event::ShaderPack => {
+                    self.settings.save(&Self::options_path());
+                    if super::shader_packs::retry_selected_shader(&self.settings) {
+                        self.reset_shader_selection();
+                    }
+                }
                 Event::OpenShaderOptions => self.open_shader_options(),
                 Event::ShaderOptions => self.save_shader_options(),
-                Event::NativePackOptions(i) => {
-                    if let Some(pack) = self.settings.shader_packs.get(i) {
-                        pack.save_values(&Self::shader_packs_dir());
-                    }
+                Event::NativePackOptions(i, previous) => {
+                    super::shader_packs::persist_native_shader_options(
+                        &mut self.settings,
+                        &mut self.ui.options,
+                        i,
+                        previous,
+                    );
                 }
                 Event::OpenShaderPackFolder => {
                     let dir = Self::shader_packs_dir();
@@ -557,6 +570,21 @@ impl Game<'_> {
         self.ui.chat.rescale(&self.gui.atlas);
         self.creative_screen.forget_items();
     }
+    fn refresh_video_modes(&mut self) -> bool {
+        let Some(window) = &self.window else {
+            return false;
+        };
+        let monitor = window.current_monitor().or_else(|| window.primary_monitor());
+        let Some(modes) = self.video_modes.refresh_monitor(monitor) else {
+            return false;
+        };
+        if self.settings.video_modes == modes {
+            return false;
+        }
+        self.settings.video_modes = modes;
+        true
+    }
+
     /// Window.updateFullscreenIfChanged: only a changed option asks the
     /// window to change, so applying settings never undoes a fullscreen
     /// the compositor set up.
@@ -565,14 +593,8 @@ impl Game<'_> {
         if self.options.split_guest {
             return;
         }
+        self.refresh_video_modes();
         if let Some(w) = self.window.clone() {
-            let monitor = w.current_monitor().or_else(|| w.primary_monitor());
-            if let Some(modes) = self
-                .video_modes
-                .refresh(monitor, horizon_client::window::monitor_video_modes)
-            {
-                self.settings.video_modes = modes;
-            }
             let in_video_screen = self.screen == Screen::Options && self.ui.options.video_open();
             let wanted = self.settings.fullscreen;
             let exclusive = self.settings.file.bool("exclusiveFullscreen");
@@ -721,10 +743,17 @@ impl Game<'_> {
         if self.ui.options.calibration_window.is_some() {
             return;
         }
-        let Some(w) = &self.window else { return };
         if self.options.split_guest {
             return;
         }
+        // A window can move between monitors without changing any option.
+        if self.screen == Screen::Options
+            && self.ui.options.video_open()
+            && self.refresh_video_modes()
+        {
+            self.build_screen();
+        }
+        let Some(w) = &self.window else { return };
         if let Some(now) = self.fullscreen.observe(w.fullscreen().is_some())
             && self.settings.fullscreen != now
         {
@@ -796,28 +825,36 @@ impl Game<'_> {
             self.title.is_none(),
             &mut hooked,
         );
-        let effective = if hooked >= 1 {
+        if hooked >= 1 {
             hooked.min(limit)
         } else {
             limit
-        };
-        #[cfg(target_os = "ios")]
+        }
+    }
+
+    /// Only the frame pacer publishes a rate, after combining the active players' limits.
+    #[cfg(target_os = "ios")]
+    pub(super) fn publish_frame_rate(&self, limit: i32) {
         if let Some(window) = &self.window {
             use winit::platform::ios::WindowExtIOS;
             window.set_preferred_frame_rate(
-                (!horizon_ios_launcher::covered()).then_some(effective.max(1) as u32),
+                (!horizon_ios_launcher::covered()).then_some(limit.max(1) as u32),
             );
         }
-        effective
     }
     /// `Minecraft.runTick`'s frame limiter: `FramerateLimiter.limitDisplayFPS`
     /// below 260 frames per second, sleeping then spin-waiting until the
     /// frame's slot ends (not in scripted frame-count runs).
     pub(super) fn limit_frame(&mut self) {
-        if self.options.frames.is_some() || self.options.paced_by_split {
+        if self.options.frames.is_some() || self.options.paced_by_split || self.splitscreen.guest {
             return;
         }
-        let limit = self.framerate_limit();
+        let mut limit = self.framerate_limit();
+        if let Some(guest) = &self.splitscreen_guest {
+            limit = limit.max(guest.framerate_limit());
+        }
+        #[cfg(target_os = "ios")]
+        self.publish_frame_rate(limit);
         match self.settings.horizon.pacing {
             horizon_client::graphics::Pacing::Precise => {
                 horizon_client::window::end_frame(&mut self.limiter, limit, &mut self.frame_clock)

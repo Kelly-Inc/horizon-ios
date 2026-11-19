@@ -1,3 +1,4 @@
+import CoreFoundation
 import Security
 import SwiftUI
 import UIKit
@@ -41,13 +42,52 @@ struct GameFilesBackgroundTasks {
     )
 }
 
+/// Private download staging. Each static instance cleans only its own files,
+/// once per process, before any attempt can create a new archive.
+struct ArchiveStaging: Sendable {
+    static let gameFiles = Self(prefix: "horizon-download-")
+    static let packs = Self(prefix: "horizon-pack-download-")
+
+    private let prefix: String
+    private let directory: URL
+
+    private init(prefix: String) {
+        self.prefix = prefix
+        directory = FileManager.default.temporaryDirectory
+        Self.removeAbandoned(in: directory, prefix: prefix)
+    }
+
+    func nextFile() -> URL {
+        directory.appendingPathComponent("\(prefix)\(UUID().uuidString).zip")
+    }
+
+    static func removeAbandoned(in directory: URL, prefix: String) {
+        let manager = FileManager.default
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey]
+        guard let entries = try? manager.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: Array(keys)
+        ) else { return }
+        for file in entries {
+            let name = file.deletingPathExtension().lastPathComponent
+            guard file.pathExtension == "zip", name.hasPrefix(prefix),
+                  UUID(uuidString: String(name.dropFirst(prefix.count))) != nil,
+                  let values = try? file.resourceValues(forKeys: keys),
+                  values.isRegularFile == true, values.isSymbolicLink == false else { continue }
+            try? manager.removeItem(at: file)
+        }
+    }
+}
+
 /// Prepared game files downloaded automatically on first launch, or imported from a custom link.
 /// Both routes use the game's checked importer. Raw Java assets are prepared on a computer.
 @MainActor
 final class GameFilesDownload: NSObject, ObservableObject {
     enum State: Equatable {
         case idle
+        case findingSource
         case downloading(received: Int64, total: Int64)
+        case preparingArchive
+        case cancellingArchive
         case installing
         case done(String)
         case failed(String)
@@ -101,6 +141,7 @@ final class GameFilesDownload: NSObject, ObservableObject {
         case (NSURLErrorDomain, NSURLErrorCancelled): kind = "cancelled"
         case (NSURLErrorDomain, -1206 ... -1200): kind = "tls"
         case (NSCocoaErrorDomain, NSFileWriteOutOfSpaceError): kind = "storage_full"
+        case (NSCocoaErrorDomain, NSFileReadTooLargeError): kind = "archive_too_large"
         default: kind = "other"
         }
         var facts = "kind=\(kind) domain=\(domain) code=\(e.code)"
@@ -114,11 +155,15 @@ final class GameFilesDownload: NSObject, ObservableObject {
     // Same packed-ZIP limit as horizon_client::import::MAX_PACKED. Enforce
     // it during transfer, before an oversized archive fills the sandbox.
     private nonisolated static let maximumArchiveBytes: Int64 = 2 << 30
+    private nonisolated static let archiveLimitMessage = "The archive exceeds the 2 GiB game-file limit."
+    private var automaticDownload = false
     private var resourcesOnly = false
-    private var rejectedMarker: GameFolder.ResourceMarker?
-    private var resolvingAutomatic = false
+    private var rejectedMarker: String?
+    private var sourceLookup: Task<[String: Any], Never>?
+    private var stagingCopy: Task<Void, Error>?
     private var attempt = UUID()
     private var session: URLSession?
+    private var retryRequest: URLRequest?
 
     init(importArchive: @escaping ImportArchive = { await Bridge.send($0) },
          automaticSource: @escaping @MainActor () async -> [String: Any] = { await Bridge.send("game-files-source") },
@@ -132,40 +177,34 @@ final class GameFilesDownload: NSObject, ObservableObject {
         self.diagnostic = diagnostic
         self.backgroundTasks = backgroundTasks
         super.init()
+        _ = ArchiveStaging.gameFiles
     }
     private var background: UIBackgroundTaskIdentifier = .invalid
 
     var busy: Bool {
-        if resolvingAutomatic { return true }
-        switch state {
-        case .downloading, .installing: return true
-        default: return false
-        }
+        canCancel || state == .cancellingArchive || state == .installing
     }
 
     var canCancel: Bool {
-        if case .downloading = state { return true }
-        return false
+        switch state {
+        case .findingSource, .downloading, .preparingArchive: return true
+        default: return false
+        }
     }
 
     /// Only automatic setup failures belong in the Play panel. Custom-link and
     /// local-file errors remain in their own setup UI.
     var automaticFailure: String? {
-        guard resourcesOnly, case let .failed(message) = state else { return nil }
+        guard automaticDownload, case let .failed(message) = state else { return nil }
         return message
     }
 
-    /// The importer consumes this private staging file. Keep it outside Documents,
-    /// where startup scans user-provided archives without download intent metadata.
-    private nonisolated static var destination: URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("horizon-download-\(UUID().uuidString).zip")
-    }
-
-    func start() {
+    func start(gameFilesOnly: Bool = false) {
         guard !busy else { return }
         attempt = UUID()
         startedAt = ProcessInfo.processInfo.systemUptime
-        resourcesOnly = false
+        automaticDownload = false
+        resourcesOnly = gameFilesOnly
         trace("custom_start")
         let text = link.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: text), let origin = GameFilesOrigin(url)
@@ -198,29 +237,45 @@ final class GameFilesDownload: NSObject, ObservableObject {
     }
 
     func startAutomatic(replacingRejectedFiles: Bool = false) async {
-        guard !busy else { return }
+        guard !busy, !Task.isCancelled else { return }
         automaticAttempted = true
+        automaticDownload = true
         resourcesOnly = true
         rejectedMarker = replacingRejectedFiles ? GameFolder.resourceMarker(at: GameFolder.resources) : nil
-        resolvingAutomatic = true
         attempt = UUID()
         startedAt = ProcessInfo.processInfo.systemUptime
         let generation = attempt
-        state = .downloading(received: 0, total: 0)
+        receivedBytes = 0
+        expectedBytes = 0
+        state = .findingSource
         trace("source_lookup_start")
-        let answer = await automaticSource()
+        let source = automaticSource
+        let lookup = Task { await source() }
+        sourceLookup = lookup
+        let answer = await withTaskCancellationHandler {
+            await lookup.value
+        } onCancel: {
+            lookup.cancel()
+        }
         guard generation == attempt else { return }
+        sourceLookup = nil
         trace("source_lookup_result has_url=\(answer["url"] is String) has_error=\(answer.error != nil)")
-        resolvingAutomatic = false
-        guard !Task.isCancelled else { trace("source_lookup_cancelled"); state = .idle; return }
+        guard !Task.isCancelled else {
+            // The view stopped observing setup. Its next appearance may try again.
+            automaticAttempted = false
+            trace("source_lookup_cancelled")
+            state = .idle
+            return
+        }
         // A cable/manual import can finish while the source request is pending.
         guard !keepInstalledGameFiles() else {
             trace("already_installed")
             state = .done("Game files are already installed.")
             return
         }
-        guard let text = answer["url"] as? String, let url = URL(string: text),
-              ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
+        // A failed lookup may still include a stale URL. Require success before transferring.
+        guard answer.error == nil, let text = answer["url"] as? String,
+              let url = URL(string: text), GameFilesOrigin(url) != nil else {
             trace("source_lookup_failed detail=\(Diagnostics.redact(answer.error ?? "missing_or_invalid_url"))")
             state = .failed(answer.error ?? "The automatic download is unavailable. Retry or use a download link.")
             return
@@ -235,60 +290,97 @@ final class GameFilesDownload: NSObject, ObservableObject {
         return current != rejectedMarker
     }
 
+    /// Enforce the archive limit on the bytes copied, even if the provider's
+    /// size metadata is missing, stale, or the file changes during hydration.
+    nonisolated static func stageArchive(from source: URL, to destination: URL, maximumBytes: Int64) throws {
+        try Task.checkCancellation()
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        try Data().write(to: destination, options: .withoutOverwriting)
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? output.close() }
+
+        var remaining = maximumBytes
+        while true {
+            try Task.checkCancellation()
+            // Read at most one byte past the limit to distinguish EOF from
+            // an oversized file without writing anything beyond the limit.
+            let readCount = Int(min((1 << 20) - 1, remaining)) + 1
+            guard let bytes = try input.read(upToCount: readCount), !bytes.isEmpty else { return }
+            guard Int64(bytes.count) <= remaining else { throw CocoaError(.fileReadTooLarge) }
+            try output.write(contentsOf: bytes)
+            remaining -= Int64(bytes.count)
+        }
+    }
+
     /// Import through the same resource-only validator as automatic setup.
     func importPreparedFile(_ url: URL) async {
         guard !busy, !Task.isCancelled else { return }
-        resourcesOnly = false
+        automaticDownload = false
         attempt = UUID()
         startedAt = ProcessInfo.processInfo.systemUptime
         trace("file_import_start")
         traceStorage()
         let generation = attempt
         defer {
-            // File-provider hydration runs off the main actor. If its caller is
-            // cancelled while waiting, release this attempt's busy state so
-            // another import can start. Never overwrite a newer attempt.
-            if generation == attempt, Task.isCancelled, state == .installing {
-                trace("file_import_cancelled")
-                state = .idle
+            if generation == attempt {
+                stagingCopy = nil
+                if state == .preparingArchive || state == .cancellingArchive {
+                    trace("file_import_cancelled")
+                    state = .idle
+                }
             }
         }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let local = Self.destination
+        let local = ArchiveStaging.gameFiles.nextFile()
         defer { try? FileManager.default.removeItem(at: local) }
-        state = .installing
+
+        // A provider may still be fetching the ZIP. Keep the preparation
+        // cancellable and hold the security scope until the worker exits.
+        state = .preparingArchive
+        let copy = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            var source = url
+            source.removeAllCachedResourceValues()
+            let values = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard values.isRegularFile == true else { throw DownloadError("Choose a regular ZIP file.") }
+            if let size = values.fileSize, Int64(size) > Self.maximumArchiveBytes {
+                throw CocoaError(.fileReadTooLarge)
+            }
+            try Self.stageArchive(from: source, to: local, maximumBytes: Self.maximumArchiveBytes)
+        }
+        stagingCopy = copy
+        trace("file_copy_start")
         do {
-            // Files providers may need to hydrate a large ZIP. Keep that I/O off
-            // the main actor, and reject oversized files before duplicating them.
-            try await Task.detached(priority: .utility) {
-                var source = url
-                source.removeAllCachedResourceValues()
-                let values = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-                guard values.isRegularFile == true,
-                      let size = values.fileSize, Int64(size) <= Self.maximumArchiveBytes else {
-                    throw CocoaError(.fileReadTooLarge)
-                }
-                try FileManager.default.createDirectory(at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try FileManager.default.copyItem(at: url, to: local)
-            }.value
-            guard generation == attempt, !Task.isCancelled else { return }
+            try await withTaskCancellationHandler {
+                try await copy.value
+            } onCancel: {
+                copy.cancel()
+            }
+            guard generation == attempt, !copy.isCancelled, !Task.isCancelled else { return }
+            stagingCopy = nil
+            // The native importer owns the staged file from here to its reply.
+            state = .installing
             let answer = await importArchive("import-game-files \(local.path)")
             guard generation == attempt else { return }
-            if let error = answer.error { trace("file_import_failed detail=\(Diagnostics.redact(error))"); state = .failed(error); Haptics.failed() }
-            else { trace("file_import_complete files_ready=\(GameFolder.hasGameFiles)"); state = .done(Self.describe(answer)); Haptics.done() }
+            completeImport(answer, resourcesOnly: true, event: "file_import")
         } catch {
-            guard generation == attempt, !Task.isCancelled else { return }
+            guard generation == attempt, !copy.isCancelled, !Task.isCancelled else { return }
             trace("file_import_failed \(Self.errorFacts(error))")
-            state = .failed(error.localizedDescription)
+            state = .failed(Self.fileImportMessage(error))
             Haptics.failed()
         }
     }
 
+    nonisolated static func fileImportMessage(_ error: Error) -> String {
+        guard let error = error as? CocoaError, error.code == .fileReadTooLarge else {
+            return error.localizedDescription
+        }
+        return archiveLimitMessage
+    }
+
     private func begin(url: URL, token: String?) {
-        receivedBytes = 0
-        expectedBytes = 0
-        lastProgressAt = ProcessInfo.processInfo.systemUptime
         // Only the shipped public endpoint gets a name. Custom paths/queries stay private.
         let endpoint = url.host?.lowercased() == "cdn.gayfeet.lol" ? "default-cdn" : "custom"
         trace("transfer_start endpoint=\(endpoint) secure=\(url.scheme?.lowercased() == "https")")
@@ -303,6 +395,14 @@ final class GameFilesDownload: NSObject, ObservableObject {
             self.endBackground()
             self.trace("background_time_expired")
         }
+        retryRequest = request
+        startTransfer(request)
+    }
+
+    private func startTransfer(_ request: URLRequest) {
+        receivedBytes = 0
+        expectedBytes = 0
+        lastProgressAt = ProcessInfo.processInfo.systemUptime
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         session.sessionDescription = String(attempt.uuidString.prefix(8))
         self.session = session
@@ -314,11 +414,18 @@ final class GameFilesDownload: NSObject, ObservableObject {
         // The importer owns the archive once installation begins. Releasing
         // the busy state sooner would let a second operation overlap it.
         guard canCancel else { return }
+        if state == .preparingArchive {
+            stagingCopy?.cancel()
+            state = .cancellingArchive
+            return
+        }
         trace("cancel_requested received=\(receivedBytes) expected=\(expectedBytes)")
         attempt = UUID()
-        resolvingAutomatic = false
+        sourceLookup?.cancel()
+        sourceLookup = nil
         session?.invalidateAndCancel()
         session = nil
+        retryRequest = nil
         state = .idle
         endBackground()
     }
@@ -338,16 +445,31 @@ final class GameFilesDownload: NSObject, ObservableObject {
         let generation = attempt
         session?.finishTasksAndInvalidate()
         session = nil
+        let retry = retryRequest
+        retryRequest = nil
         switch outcome {
         case let .failure(error):
             trace("transfer_failed \(Self.errorFacts(error)) received=\(receivedBytes) expected=\(expectedBytes)")
+            if automaticDownload && keepInstalledGameFiles() {
+                state = .done("Game files are already installed.")
+                break
+            }
+            let networkError = error as NSError
+            if let retry, networkError.domain == NSURLErrorDomain,
+               networkError.code == NSURLErrorNetworkConnectionLost {
+                // Restart the original GET once. A fresh session keeps late
+                // progress from the failed task out of the new transfer.
+                trace("transfer_restarted reason=connection_lost")
+                startTransfer(retry)
+                return
+            }
             state = .failed(error.localizedDescription)
             Haptics.failed()
         case let .success(file):
             trace("transfer_complete received=\(receivedBytes) expected=\(expectedBytes)")
             defer { try? FileManager.default.removeItem(at: file) }
             // A manual/cable import can also finish after the HTTP transfer began.
-            guard !resourcesOnly || !keepInstalledGameFiles() else {
+            guard !automaticDownload || !keepInstalledGameFiles() else {
                 state = .done("Game files are already installed.")
                 break
             }
@@ -355,44 +477,75 @@ final class GameFilesDownload: NSObject, ObservableObject {
             trace("import_start")
             traceStorage()
             let command = resourcesOnly ? "import-game-files" : "import"
-            let answer = await importArchive("\(command) \(file.path)")
-            guard generation == attempt else { return }
-            if let error = answer.error {
-                trace("import_failed detail=\(Diagnostics.redact(error))")
-                state = .failed(error)
-                Haptics.failed()
+            let answer: [String: Any]
+            if automaticDownload {
+                // The native installer repeats the check while holding the home lock.
+                do {
+                    let payload = ["path": file.path, "resource_marker": rejectedMarker ?? "missing"]
+                    let json = String(decoding: try JSONEncoder().encode(payload), as: UTF8.self)
+                    answer = await importArchive("\(command) \(json)")
+                } catch {
+                    answer = ["error": "Horizon could not start the game-file installation."]
+                }
             } else {
-                trace("import_complete files_ready=\(GameFolder.hasGameFiles)")
-                state = .done(Self.describe(answer))
-                Haptics.done()
+                answer = await importArchive("\(command) \(file.path)")
             }
+            guard generation == attempt else { return }
+            completeImport(answer, resourcesOnly: resourcesOnly, event: "import")
         }
         endBackground()
     }
 
-    private static func describe(_ answer: [String: Any]) -> String {
-        let name = answer["name"] as? String ?? ""
-        switch answer["kind"] as? String {
-        case "resources":
-            return GameFolder.hasGameFiles
-                ? "Game files installed. If the game was already running, close Horizon and open it again to use them."
-                : "Game files installed."
+    private func completeImport(_ answer: [String: Any], resourcesOnly: Bool, event: String) {
+        do {
+            let message = try Self.importMessage(answer, resourcesOnly: resourcesOnly)
+            trace("\(event)_complete files_ready=\(GameFolder.hasGameFiles)")
+            state = .done(message)
+            Haptics.done()
+        } catch {
+            let message = error.localizedDescription
+            trace("\(event)_failed detail=\(Diagnostics.redact(message))")
+            state = .failed(message)
+            Haptics.failed()
+        }
+    }
+
+    private static func importMessage(_ answer: [String: Any], resourcesOnly: Bool) throws -> String {
+        if let error = answer.error { throw DownloadError(error) }
+        guard let ok = answer["ok"] as? NSNumber, CFGetTypeID(ok) == CFBooleanGetTypeID(), ok.boolValue,
+              let kind = answer["kind"] as? String else {
+            throw DownloadError("Horizon could not confirm that the archive was installed.")
+        }
+        if kind == "resources" || (resourcesOnly && kind == "resources_already_installed") {
+            guard GameFolder.hasGameFiles else {
+                throw DownloadError("The installed game files are missing. Try installing them again.")
+            }
+            if kind == "resources_already_installed" { return "Game files are already installed." }
+            return "Game files installed. If the game was already running, close Horizon and open it again to use them."
+        }
+        if resourcesOnly {
+            throw DownloadError("This archive did not install game files.")
+        }
+        guard let name = answer["name"] as? String, !name.isEmpty else {
+            throw DownloadError("Horizon could not confirm that the archive was installed.")
+        }
+        switch kind {
         case "world": return "World \(name) added."
         case "resource_pack": return "Resource pack \(name) added."
-        default: return "Installed."
+        default: throw DownloadError("Horizon could not confirm that the archive was installed.")
         }
     }
 }
 
 extension GameFilesDownload: URLSessionDownloadDelegate {
-    /// Keep the authorization header on the same HTTPS origin only.
-    nonisolated static func redirectRequest(_ request: URLRequest, from source: URL?) -> URLRequest {
+    /// Keep HTTPS throughout the download and share credentials only within the same origin.
+    nonisolated static func redirectRequest(_ request: URLRequest, from source: URL?) -> URLRequest? {
+        guard let origin = GameFilesOrigin(source), let target = GameFilesOrigin(request.url),
+              origin.scheme != "https" || target.scheme == "https" else { return nil }
         var request = request
-        if let origin = GameFilesOrigin(source), origin.scheme == "https",
-           origin == GameFilesOrigin(request.url) {
-            return request
+        if origin.scheme != "https" || origin != target {
+            request.setValue(nil, forHTTPHeaderField: "Authorization")
         }
-        request.setValue(nil, forHTTPHeaderField: "Authorization")
         return request
     }
 
@@ -419,7 +572,10 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData _: Int64,
                                 totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         let oversized = totalBytesWritten > Self.maximumArchiveBytes || totalBytesExpectedToWrite > Self.maximumArchiveBytes
-        if oversized { downloadTask.cancel() }
+        if oversized {
+            downloadTask.taskDescription = Self.archiveLimitMessage
+            downloadTask.cancel()
+        }
         Task { @MainActor in
             guard self.session === session else { return }
             self.receivedBytes = totalBytesWritten
@@ -429,23 +585,20 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
                 self.lastProgressAt = now
                 self.trace("transfer_progress received=\(totalBytesWritten) expected=\(max(totalBytesExpectedToWrite, 0)) oversized=\(oversized)")
             }
-            if oversized {
-                self.cancel()
-                self.state = .failed("The archive exceeds the 2 GiB game-file limit.")
-                return
-            }
+            guard !oversized else { return }
             self.state = .downloading(received: totalBytesWritten, total: max(totalBytesExpectedToWrite, 0))
         }
     }
 
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didFinishDownloadingTo location: URL) {
-        // The file at `location` is gone once this returns: move it now, on this queue.
+        // Move the temporary file before this callback returns.
         let outcome: Result<URL, Error>
         let response = downloadTask.response as? HTTPURLResponse
         let status = response?.statusCode ?? 0
-        if downloadTask.countOfBytesReceived > Self.maximumArchiveBytes || downloadTask.countOfBytesExpectedToReceive > Self.maximumArchiveBytes {
-            outcome = .failure(DownloadError("The archive exceeds the 2 GiB game-file limit."))
+        if downloadTask.taskDescription == Self.archiveLimitMessage
+            || downloadTask.countOfBytesReceived > Self.maximumArchiveBytes || downloadTask.countOfBytesExpectedToReceive > Self.maximumArchiveBytes {
+            outcome = .failure(DownloadError(Self.archiveLimitMessage))
         } else if response == nil {
             outcome = .failure(DownloadError("The download did not receive an HTTP response."))
         } else if !(200..<300).contains(status) {
@@ -460,7 +613,16 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
             outcome = .failure(DownloadError("The download server did not send an archive."))
         } else {
             do {
-                let destination = Self.destination
+                // Transfer counters describe the response. Validate the actual
+                // file before asking the engine to open it as an archive.
+                let bytes = try location.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                if bytes == 0 {
+                    throw DownloadError("The download server did not send an archive.")
+                }
+                if let bytes, Int64(bytes) > Self.maximumArchiveBytes {
+                    throw DownloadError(Self.archiveLimitMessage)
+                }
+                let destination = ArchiveStaging.gameFiles.nextFile()
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? FileManager.default.removeItem(at: destination)
                 try FileManager.default.moveItem(at: location, to: destination)
@@ -485,8 +647,9 @@ extension GameFilesDownload: URLSessionDownloadDelegate {
 
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error else { return }
-        let failure: Error = task.countOfBytesReceived > Self.maximumArchiveBytes || task.countOfBytesExpectedToReceive > Self.maximumArchiveBytes
-            ? DownloadError("The archive exceeds the 2 GiB game-file limit.") : error
+        let failure: Error = task.taskDescription == Self.archiveLimitMessage
+            || task.countOfBytesReceived > Self.maximumArchiveBytes || task.countOfBytesExpectedToReceive > Self.maximumArchiveBytes
+            ? DownloadError(Self.archiveLimitMessage) : error
         Task { @MainActor in
             guard self.session === session else { return }
             self.receivedBytes = task.countOfBytesReceived
@@ -551,6 +714,8 @@ struct GameFilesCard: View {
     var missing: Bool
     var repairing = false
     var setupHelp: (() -> Void)? = nil
+    var retryLoader: (() async -> Void)? = nil
+    var offersFileImport = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -560,8 +725,8 @@ struct GameFilesCard: View {
                 Text(missing ? "Game files needed" : "Download game files")
                     .font(Theme.pixel(18)).foregroundStyle(Theme.text)
             }
-            if missing {
-                Text("Horizon downloads and installs the game files automatically. Keep this screen open until setup finishes.")
+            if missing, retryLoader == nil {
+                Text("Keep this screen open until game-file setup finishes.")
                     .font(Theme.sans(12)).foregroundStyle(Theme.textMuted)
             }
             progress
@@ -574,30 +739,42 @@ struct GameFilesCard: View {
                 SecondaryButton(title: "Cancel", action: download.cancel)
                     .disabled(!download.canCancel)
             } else {
-                if missing {
+                if let retryLoader {
+                    PrimaryButton(title: "Retry loading game files", icon: "arrow.clockwise") {
+                        Task { await retryLoader() }
+                    }
+                } else if missing {
                     PrimaryButton(title: repairing ? "Reinstall game files" : "Download game files", icon: "arrow.down") {
                         Task { await download.startAutomatic(replacingRejectedFiles: repairing) }
                     }
                     .accessibilityIdentifier("launcher-download-game-files")
                 }
             }
+            if offersFileImport {
+                PreparedGameFilesPicker(download: download)
+            }
             DisclosureGroup(missing ? "Use a download link instead" : "Download from a link") {
                 Text("""
                 Horizon plays with the files your own Minecraft: Java Edition makes. Prepare them on a computer \
                 (horizon-prepare, then pack them as a zip), put the zip somewhere this phone can reach, such as your \
-                computer on this Wi-Fi or a server of your own, and paste its link. Worlds and resource packs \
-                (.zip) work too.
+                computer on this Wi-Fi or a server of your own, and paste its link.
                 """)
                 .font(Theme.sans(12)).foregroundStyle(Theme.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
+                if !missing {
+                    Text("World and resource pack ZIPs can also be imported from a link.")
+                        .font(Theme.sans(12)).foregroundStyle(Theme.textMuted)
+                }
 
                 Field(title: "LINK", placeholder: "https://example.com/horizon-26.3.zip", text: $download.link,
                       secure: false)
                 Field(title: "ACCESS TOKEN (OPTIONAL)", placeholder: "Sent as a Bearer token", text: $download.token,
                       secure: true)
 
-                PrimaryButton(title: "Download from link", icon: "arrow.down", action: download.start)
-                    .disabled(download.busy || download.link.trimmingCharacters(in: .whitespaces).isEmpty)
+                PrimaryButton(title: "Download from link", icon: "arrow.down") {
+                    download.start(gameFilesOnly: missing)
+                }
+                .disabled(download.busy || download.link.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             Text("You can also send the zip from the game's own screen over Wi-Fi, or drop it into Horizon's folder in the Files app.")
                 .font(Theme.sans(11)).foregroundStyle(Theme.textFaint)
@@ -612,6 +789,8 @@ struct GameFilesCard: View {
         switch download.state {
         case .idle:
             EmptyView()
+        case .findingSource:
+            importProgress("Finding game files…")
         case let .downloading(received, total):
             VStack(alignment: .leading, spacing: 6) {
                 if total > 0 {
@@ -624,11 +803,12 @@ struct GameFilesCard: View {
                     : "\(Self.size(received)) downloaded")
                     .font(Theme.mono(10)).foregroundStyle(Theme.textMuted)
             }
+        case .preparingArchive:
+            importProgress("Preparing archive…")
+        case .cancellingArchive:
+            importProgress("Canceling archive preparation…")
         case .installing:
-            HStack(spacing: 8) {
-                ProgressView().tint(Theme.accent)
-                Text("Unpacking…").font(Theme.mono(10)).foregroundStyle(Theme.textMuted)
-            }
+            importProgress("Unpacking…")
         case let .done(message):
             Label(message, systemImage: "checkmark.circle.fill")
                 .font(Theme.sans(12)).foregroundStyle(Theme.ready)
@@ -638,11 +818,39 @@ struct GameFilesCard: View {
         }
     }
 
+    private func importProgress(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView().tint(Theme.accent)
+            Text(title).font(Theme.mono(10)).foregroundStyle(Theme.textMuted)
+        }
+    }
+
     private static func size(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 }
 
+
+private struct PreparedGameFilesPicker: View {
+    @ObservedObject var download: GameFilesDownload
+    @State private var choosingFile = false
+    @State private var fileIssue: String?
+
+    var body: some View {
+        Button("Choose prepared ZIP") { choosingFile = true }
+            .disabled(download.busy)
+            .accessibilityIdentifier("launcher-import-prepared-files")
+            .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.zip]) { result in
+                switch result {
+                case let .success(url): Task { await download.importPreparedFile(url) }
+                case let .failure(error): fileIssue = error.localizedDescription
+                }
+            }
+            .alert("Couldn’t open game files", isPresented: Binding(
+                get: { fileIssue != nil }, set: { if !$0 { fileIssue = nil } }
+            )) { Button("OK", role: .cancel) {} } message: { Text(fileIssue ?? "") }
+    }
+}
 
 /// Recovery appears on an explicit play/setup request, never over background setup.
 struct GameFilesRecovery: View {
@@ -650,15 +858,21 @@ struct GameFilesRecovery: View {
     let version: String
     let signedIn: Bool
     var repairing = false
+    var engineProblem: String? = nil
+    var retryLoader: (() async -> Void)? = nil
     var configureManually: (() -> Void)? = nil
-    @State private var choosingFile = false
-    @State private var fileIssue: String?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
+                    let reason = engineProblem.flatMap { $0.isEmpty ? nil : $0 }
+                    if let reason {
+                        Text("Horizon could not load the game files.").font(.headline)
+                        Text(reason).foregroundStyle(.secondary).textSelection(.enabled)
+                            .accessibilityIdentifier("launcher-game-files-engine-problem")
+                    }
                     if case let .failed(message) = download.state {
                         Text(download.automaticFailure != nil ? "Automatic file download failed." : "Game-file setup failed.")
                             .font(.headline)
@@ -666,7 +880,7 @@ struct GameFilesRecovery: View {
                         Text("You can retry, or go to Settings → Game files to configure your own files manually.")
                     } else if download.busy {
                         Text("Game files are being set up. You can play when installation finishes.")
-                    } else {
+                    } else if reason == nil {
                         Text("Horizon needs Minecraft game files before you can play, open a world or join a server.")
                     }
                     Text("You can retry automatic setup below, or prepare and transfer the files from a computer.")
@@ -676,7 +890,7 @@ struct GameFilesRecovery: View {
                          ? "Your Microsoft account is signed in here. To prepare game files, also sign in to the Horizon desktop launcher with an account that owns Minecraft: Java Edition."
                          : "On a computer, sign in to the Horizon desktop launcher with a Microsoft account that owns Minecraft: Java Edition.")
                     Text("Choose Download and prepare for Minecraft \(version). The desktop launcher downloads from Mojang and prepares the files for Horizon.")
-                    Text("Signing in on this iPad alone does not download or prepare these files yet. Transfer the prepared files using the steps below.")
+                    Text("Signing in on this device alone does not download or prepare these files yet. Transfer the prepared files using the steps below.")
                         .foregroundStyle(.secondary)
                     Link("Get the Horizon desktop launcher", destination: URL(string: "https://github.com/horizon-rust/horizon/releases")!)
                 }
@@ -690,15 +904,13 @@ struct GameFilesRecovery: View {
                     Text("horizon-client --pack-resources <prepared-folder> --out Horizon-\(version).zip")
                         .font(.footnote.monospaced()).textSelection(.enabled)
                     Text("Replace <prepared-folder> with the folder created by preparation. A Minecraft JAR, world ZIP or resource pack alone cannot replace these files.")
-                    Text("Copy the prepared ZIP into Horizon’s Documents folder using Finder or Apple Devices file sharing. You can also put it at a link this iPad can reach and use Download from link below.")
-                    Button("Choose prepared ZIP") { choosingFile = true }
-                        .disabled(download.busy)
-                        .accessibilityIdentifier("launcher-import-prepared-files")
+                    Text("Copy the prepared ZIP into Horizon’s Documents folder using Finder or Apple Devices file sharing. You can also put it at a link this device can reach and use Download from link below.")
+                    PreparedGameFilesPicker(download: download)
                     Text("Choose the ZIP from Files after transferring it. When installation finishes, return to Play. Your worlds and sign-in are kept.")
-                    Link("Read game-file transfer instructions", destination: URL(string: "https://github.com/heyskylo/horizon-ios/blob/main/docs/native-client.md#carry-your-game-files-to-a-phone")!)
+                    Link("Read game-file transfer instructions", destination: URL(string: "https://github.com/Kelly-Inc/horizon-ios/blob/main/docs/native-client.md#carry-your-game-files-to-a-phone")!)
                 }
                 Section("Automatic setup or download link") {
-                    GameFilesCard(download: download, missing: true, repairing: repairing)
+                    GameFilesCard(download: download, missing: true, repairing: repairing, retryLoader: retryLoader)
                 }
             }
             .navigationTitle("Game files needed")
@@ -709,15 +921,6 @@ struct GameFilesRecovery: View {
                 }
             }
         }
-        .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.zip]) { result in
-            switch result {
-            case let .success(url): Task { await download.importPreparedFile(url) }
-            case let .failure(error): fileIssue = error.localizedDescription
-            }
-        }
-        .alert("Couldn’t open game files", isPresented: Binding(
-            get: { fileIssue != nil }, set: { if !$0 { fileIssue = nil } }
-        )) { Button("OK", role: .cancel) {} } message: { Text(fileIssue ?? "") }
         .accessibilityIdentifier("launcher-game-files-recovery")
     }
 }

@@ -12,7 +12,11 @@ impl Game<'_> {
     /// Whether a text box has focus right now (the fields `ime_commit` can fill).
     pub(super) fn text_field_focused(&mut self) -> bool {
         if self.dialog_open() {
-            return self.dialog_has_text_field();
+            return self.dialog_text_focused();
+        }
+        // A non-text prompt owns focus even when it covers an editable field.
+        if self.prompt_open() {
+            return false;
         }
         if self.screen == Screen::Options {
             return self.ui.options.typing();
@@ -48,37 +52,71 @@ impl Game<'_> {
         }
     }
 
+    pub(super) fn owns_window_ime(&self) -> bool {
+        self.keyboard_mouse
+            && !(cfg!(target_os = "ios") && self.splitscreen.active && !self.splitscreen.guest)
+    }
+
     /// Allow the input method only while a text box has focus.
     pub(super) fn sync_ime(&mut self) {
+        if !self.owns_window_ime() {
+            return;
+        }
         // UIKit keyboard visibility is owned by the mobile keyboard controls;
         // focusing chat alone must not reopen a keyboard the player hid.
         #[cfg(target_os = "ios")]
-        let want = self.system_keyboard_up();
+        let want = {
+            if self.system_keyboard_up() && !self.text_field_focused() {
+                self.suspend_system_keyboard();
+            }
+            self.system_keyboard_up()
+        };
         #[cfg(not(target_os = "ios"))]
         let want = self.text_field_focused();
-        if want != self.ime_allowed
-            && let Some(window) = &self.window
-        {
-            window.set_ime_allowed(want);
-            self.ime_allowed = want;
-            // The field lost the focus (or a new one took it): the composition
-            // and the candidate window's place belong to the old one.
-            self.ime_area = None;
-            if !want {
-                preedit::reset();
-            }
+        let want = want && !self.menu_input_blocked();
+        if want != self.ime_allowed {
+            self.set_window_ime(want);
+        }
+    }
+
+    /// Keep the window, candidate area and cached IME state in sync, including
+    /// keyboard requests made before the next redraw.
+    pub(super) fn set_window_ime(&mut self, allowed: bool) {
+        if !allowed {
+            preedit::reset();
+        }
+        self.ime_area = None;
+        if let Some(window) = &self.window {
+            self.ime_allowed = allowed;
+            window.set_ime_allowed(allowed);
         }
     }
 
     /// `WindowEvent::Ime(Preedit)`: `KeyboardHandler.textEditing`. The text
     /// still being composed is shown under the focused field's caret.
     pub(super) fn ime_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        if self.menu_input_blocked() {
+            preedit::reset();
+            return;
+        }
         let taken = self.text_field_focused();
         let event = PreeditEvent::from_winit(text, cursor);
         // ScreenEvent.Preedit.Pre, then the screen's handler (the focused
         // field takes it), then Preedit.Post when no field did.
         let shown = event.clone().unwrap_or_default();
-        if self.dispatch_preedit_pre_hook(&shown) {
+        let owner = self.key_screen();
+        let canceled = self.dispatch_preedit_pre_hook(&shown);
+        if self.key_screen() != owner || (taken && !self.text_field_focused()) {
+            preedit::reset();
+            return;
+        }
+        if canceled {
+            if !taken {
+                preedit::reset();
+            } else if event.is_none() {
+                // The platform ended the composition even if its screen hook canceled.
+                preedit::set_preedit(None);
+            }
             return;
         }
         preedit::set_preedit(event.filter(|_| taken));
@@ -126,13 +164,17 @@ impl Game<'_> {
     /// input method's candidate window to the caret
     /// (`TextInputManager.setTextInputArea`, in window pixels).
     pub(super) fn flush_ime(&mut self, hud: &mut HudBatch) {
+        if !self.owns_window_ime() {
+            preedit::discard_layout();
+            return;
+        }
         preedit::draw_overlay(hud, &self.gui.atlas);
         let Some([x0, y0, x1, y1]) = preedit::take_text_input_area() else {
             return;
         };
         let scale = hud.scale;
-        let x = (x0 * scale).round() as i32;
-        let y = (y0 * scale).round() as i32;
+        let x = (x0 * scale).round() as i32 + self.view_at[0] as i32;
+        let y = (y0 * scale).round() as i32 + self.view_at[1] as i32;
         let width = (((x1 - x0) * scale).round() as i32).max(1);
         let height = (((y1 - y0) * scale).round() as i32).max(1);
         let area = [x, y, width, height];
@@ -157,20 +199,72 @@ impl Game<'_> {
         if self.menu_input_blocked() {
             return;
         }
-        preedit::mark_committed();
+        // UIKit paste has no composition to finish.
+        if !cfg!(target_os = "ios") || preedit::composing() {
+            preedit::mark_committed();
+        }
         if text.is_empty() {
             return;
         }
         // Dialogs have their own fields; the other topmost prompts take no text.
-        if self.prompt_open() && !self.dialog_open() {
+        let dialog = self.dialog_open();
+        if (dialog && !self.dialog_text_focused()) || (!dialog && self.prompt_open()) {
             return;
         }
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let owner = self.key_screen();
+        let dialog_multiline = dialog && self.dialog_typing_lines();
+        let book_page =
+            !dialog && matches!(self.book, Some(BookScreen::Edit { signing: false, .. }));
+        let text: String = text
+            .chars()
+            .filter(|&c| !c.is_control() || ((book_page || dialog_multiline) && c == '\n'))
+            .collect();
+        if book_page {
+            // Apply the commit as one page edit so it cannot be partially
+            // inserted when the resulting text exceeds the page's line limit.
+            if let Some(text) = self.screen_text_typed(&text)
+                && self.key_screen() == owner
+                && !self.dialog_open()
+                && matches!(self.book, Some(BookScreen::Edit { signing: false, .. }))
+            {
+                self.book_input(None, Some(&text));
+            }
+            return;
+        }
+        if dialog_multiline {
+            if let Some(text) = self.screen_text_typed(&text)
+                && self.key_screen() == owner
+                && self.dialog_typing_lines()
+            {
+                self.dialog_text(&text);
+            }
+            return;
+        }
+        // Command suggestions need only the completed edit unless a mod observes each character.
+        if !dialog
+            && self.screen == Screen::CommandBlock
+            && !mod_api::__private::listened(mod_api::HookId::ScreenCharTypedPre)
+        {
+            self.command_block_type(&text);
+            return;
+        }
         // ScreenEvent.CharacterTyped.Pre: the input method's committed text
         // reaches a text box by characters, as a key's own text does, so the
         // open screen hears of each of them first and a cancelled one never
         // reaches the box.
-        self.screen_text_each(&text, |game, c| game.ime_type(c));
+        let mut encoded = [0; 4];
+        for c in text.chars() {
+            if self.key_screen() != owner {
+                break;
+            }
+            let canceled = self.screen_char_canceled(c);
+            if self.key_screen() != owner {
+                break;
+            }
+            if !canceled {
+                self.ime_type(c.encode_utf8(&mut encoded));
+            }
+        }
     }
 
     /// A committed character into the focused text box.
@@ -178,7 +272,8 @@ impl Game<'_> {
         if !self.text_field_focused() {
             return;
         }
-        if self.dialog_type(text) {
+        if self.dialog_open() {
+            self.dialog_text(text);
             return;
         }
         if self.title_input_active()

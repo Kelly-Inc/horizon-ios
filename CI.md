@@ -24,7 +24,7 @@ Never in Git. CI downloads the archive the game itself downloads (`https://cdn.g
 
 ## Artifacts on your machine
 ```sh
-scripts/fetch-artifacts.sh            # this branch's newest green linux + ios-sim runs -> ci-artifacts/latest/<workflow>
+scripts/fetch-artifacts.sh            # this branch's newest successful iOS build -> ci-artifacts/latest/ios
 scripts/fetch-artifacts.sh main ios   # another branch / workflow
 scripts/open-screenshots.sh
 ```

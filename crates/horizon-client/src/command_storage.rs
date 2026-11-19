@@ -45,11 +45,11 @@ impl CommandStorage {
         }
         s
     }
-    pub fn save(&mut self, root: &Path) {
+    pub fn save(&mut self, root: &Path) -> crate::Result<()> {
         if !self.dirty {
-            return;
+            return Ok(());
         }
-        self.dirty = false;
+        let mut result = Ok(());
         for (namespace, map) in &self.namespaces {
             let contents: Compound = map
                 .iter()
@@ -64,10 +64,13 @@ impl CommandStorage {
                     ),
                     ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
                 ]),
-            ) {
-                log::warn!("command storage {namespace} was not written: {e}");
+            ) && result.is_ok()
+            {
+                result = Err(format!("could not save command storage {namespace}: {e}").into());
             }
         }
+        self.dirty = result.is_err();
+        result
     }
     /// `get`: an empty compound when unset.
     pub fn get(&self, id: &str) -> Tag {
@@ -123,7 +126,12 @@ mod tests {
         assert_eq!(s.get("minecraft:x"), Tag::Compound(Compound::new()));
         s.set("minecraft:x", parse_snbt("{a:1}").unwrap().0);
         s.set("my:pack/y", parse_snbt("{b:[1,2]}").unwrap().0);
-        s.save(&dir);
+        let blocked = file(&dir, "minecraft");
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(s.save(&dir).is_err());
+        assert!(s.dirty);
+        std::fs::remove_dir(&blocked).unwrap();
+        s.save(&dir).unwrap();
         let back = CommandStorage::load(&dir);
         assert_eq!(back.get("x"), parse_snbt("{a:1}").unwrap().0);
         assert_eq!(back.get("my:pack/y"), parse_snbt("{b:[1,2]}").unwrap().0);

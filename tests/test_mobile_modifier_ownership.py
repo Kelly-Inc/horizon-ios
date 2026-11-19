@@ -23,7 +23,7 @@ def program():
         ('actions', 'crates/horizon-client-input/src/actions.rs'),
         ('keymapping', 'crates/horizon-client-input/src/keymapping.rs'),
     ))
-    methods = '\n'.join(method(game, name) for name in ('sync_toggle', 'heal_hold_latches', 'mapped_key', 'toggle_held_elsewhere', 'input_holds'))
+    methods = '\n'.join(method(game, name) for name in ('sync_toggle', 'heal_hold_latches', 'non_keyboard_holds_modifier_mapping', 'mapped_key', 'toggle_held_elsewhere', 'input_holds'))
     helpers = '\n'.join(method(game, name) for name in ('studio_replay_shortcut', 'studio_freecam_movement_key'))
     methods += '\nfn touch_sneak(&mut self, down:bool)->Result<()> { self.mapped_key(KeyCode::ShiftLeft,down,false,KeyCode::ShiftLeft,Source::Touch) }'
     actions = (ROOT / 'crates/horizon-client-input/src/actions.rs').read_text()

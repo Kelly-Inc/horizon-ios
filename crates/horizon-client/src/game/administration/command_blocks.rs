@@ -964,7 +964,7 @@ impl Game<'_> {
             dispatcher: super::chat::chat_tree(&self.remote),
             registries: &self.ui.registries,
         };
-        s.command.type_text(&m, &c, &allowed);
+        s.command.type_commit(&m, &c, &allowed);
         self.command_block_screen = Some(s);
     }
     /// The edit screen's Done: a server's client sends the packet, the

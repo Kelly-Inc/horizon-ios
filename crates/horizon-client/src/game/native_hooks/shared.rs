@@ -140,6 +140,10 @@ impl Game<'_> {
     /// What `set_screen` does once the hooks have answered: `screen` opens,
     /// and the mod `owner`'s own screen when one answered `ModScreen`.
     fn apply_screen(&mut self, screen: Screen, owner: Option<&str>) {
+        #[cfg(target_os = "ios")]
+        if self.screen != screen {
+            self.reset_system_keyboard_for_screen();
+        }
         self.screen = screen;
         if let Some(owner) = owner {
             self.native_mod_screen = Some(owner.to_owned());
@@ -903,18 +907,25 @@ impl Game<'_> {
         ]
     }
     pub(super) fn track_drag_button(&mut self, button: MouseButton, pressed: bool) {
-        // Any release ends the drag, as vanilla's `MouseHandler.onButton` clears `activeButton`:
-        // left down, right down, left up sends no drag while right is still held.
-        self.drag_button = pressed.then_some(button);
+        // A release ends the drag for its input source, even if another button stays held.
+        let drag = if self.touch_synthetic_input() {
+            &mut self.touch_drag_button
+        } else {
+            &mut self.drag_button
+        };
+        *drag = pressed.then_some(button);
     }
     pub(super) fn screen_mouse_dragged(&self, previous: (f32, f32)) -> ScreenMousePre {
         if self.pad_synthetic_input() || self.cursor == previous {
             return ScreenMousePre::NotFired;
         }
-        let Some(button) = self
-            .drag_button
-            .filter(|b| self.physical_buttons.contains(b))
-        else {
+        // A touch drag must use the synthetic press, not a connected mouse.
+        let (drag, buttons) = if self.touch_synthetic_input() {
+            (self.touch_drag_button, &self.touch.window_buttons)
+        } else {
+            (self.drag_button, &self.physical_buttons)
+        };
+        let Some(button) = drag.filter(|b| buttons.contains(b)) else {
             return ScreenMousePre::NotFired;
         };
         let Some(screen) = self.screen_view_now() else {
@@ -1084,7 +1095,7 @@ impl Game<'_> {
     /// `native_screen_char_typed_pre` for one character, with the focused
     /// box's edit: what the listeners leave of `field` goes back to the box
     /// before the character does. Whether they cancelled the character.
-    fn screen_char_canceled(&mut self, c: char) -> bool {
+    pub(super) fn screen_char_canceled(&mut self, c: char) -> bool {
         if !mod_api::__private::listened(mod_api::HookId::ScreenCharTypedPre)
             || !self.screen_hooks_open()
         {
@@ -5439,6 +5450,11 @@ pub(super) mod particle_count_tests {
         {
             use winit::platform::x11::EventLoopBuilderExtX11;
             builder.with_x11().with_any_thread(true);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_any_thread(true);
         }
         let event_loop = builder.build().unwrap();
         #[allow(deprecated)]

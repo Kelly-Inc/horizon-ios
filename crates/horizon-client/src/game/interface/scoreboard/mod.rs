@@ -107,12 +107,15 @@ impl Game<'_> {
     fn border_path(&self, dim: super::Dim) -> std::path::PathBuf {
         save::dimension_dir(&self.world_root, dim.id()).join("data/minecraft/world_border.dat")
     }
+    fn legacy_border_path(&self) -> std::path::PathBuf {
+        self.world_root.join("data/minecraft/world_border.dat")
+    }
     /// The border `dim`'s level saved. The Overworld also reads the root file older Horizon
     /// builds wrote for their one shared border; the other levels start from the default.
     pub(super) fn load_border(&self, dim: super::Dim) -> horizon_client::worldborder::WorldBorder {
         let mut root = save::read_dat(&self.border_path(dim));
         if root.is_none() && dim == super::Dim::Overworld {
-            root = save::read_dat(&self.world_root.join("data/minecraft/world_border.dat"));
+            root = save::read_dat(&self.legacy_border_path());
         }
         root.as_ref()
             .and_then(|root| root.get("data"))
@@ -120,21 +123,28 @@ impl Game<'_> {
             .unwrap_or_default()
     }
     /// Save the border of the level in place (`SavedData`, one per level).
-    pub(super) fn save_border(&self) {
+    pub(super) fn save_border(&self) -> horizon_client::Result<()> {
         if !self.score.loaded || self.remote.is_some() {
-            return;
+            return Ok(());
         }
-        if self.border != horizon_client::worldborder::WorldBorder::default()
-            && let Err(e) = save::write_dat(
-                &self.border_path(self.dim),
-                Tag::compound([
-                    ("data", self.border.pack()),
-                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-                ]),
-            )
+        let path = self.border_path(self.dim);
+        let default = self.border == horizon_client::worldborder::WorldBorder::default();
+        // A reset overwrites either saved form, so reopening cannot restore
+        // the old limit, including the Overworld's pre-migration fallback.
+        if default
+            && !path.try_exists()?
+            && (self.dim != super::Dim::Overworld || !self.legacy_border_path().try_exists()?)
         {
-            log::warn!("the world border of {} was not written: {e}", self.dim.id());
+            return Ok(());
         }
+        save::write_dat(
+            &path,
+            Tag::compound([
+                ("data", self.border.pack()),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]),
+        )
+        .map_err(|e| format!("the world border of {} was not written: {e}", self.dim.id()).into())
     }
     /// `ScoreboardSaveData` read from `data/minecraft/scoreboard.dat`.
     pub(super) fn load_scoreboard(&mut self) {
@@ -152,27 +162,30 @@ impl Game<'_> {
         self.score.stopwatches = horizon_client::stopwatches::Stopwatches::load(&self.world_root);
         self.sync_score_registries();
     }
-    pub(super) fn save_scoreboard(&mut self) {
+    pub(super) fn save_scoreboard(&mut self) -> horizon_client::Result<()> {
         if !self.score.loaded || self.remote.is_some() {
-            return;
+            return Ok(());
         }
-        self.score.storage.save(&self.world_root);
-        self.score.stopwatches.save(&self.world_root);
+        let files = self
+            .score
+            .storage
+            .save(&self.world_root)
+            .and(self.score.stopwatches.save(&self.world_root));
         // The border is saved with its level (`save_level`).
         let path = self.scoreboard_path();
         let board = &self.score.board;
         if board == &Scoreboard::default() && !path.exists() {
-            return;
+            return files;
         }
-        if let Err(e) = save::write_dat(
+        let board_file = save::write_dat(
             &path,
             Tag::compound([
                 ("data", board.pack()),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]),
-        ) {
-            log::warn!("the scoreboard was not written: {e}");
-        }
+        )
+        .map_err(|e| format!("could not save the scoreboard: {e}").into());
+        files.and(board_file)
     }
     /// The names commands complete: objectives, teams and tracked holders.
     pub(super) fn sync_score_registries(&mut self) {
@@ -1362,3 +1375,43 @@ mod source_holder_tests;
 
 #[cfg(test)]
 mod selector_option_tests;
+
+#[cfg(test)]
+#[test]
+#[ignore = "daily"]
+fn a_reset_border_overrides_both_saved_formats() {
+    use horizon_client::worldborder::WorldBorder;
+    crate::game::native_entity_refs::tests::with_client_game(|game| {
+        let root =
+            std::env::temp_dir().join(format!("horizon-border-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let previous_root = std::mem::replace(&mut game.world_root, root.clone());
+        game.score.loaded = true;
+        game.dim = super::Dim::Overworld;
+        game.border = WorldBorder::default();
+        game.save_border().unwrap();
+        assert!(!game.border_path(game.dim).exists());
+
+        let mut old = WorldBorder::default();
+        old.set_size(50.0);
+        save::write_dat(
+            &game.legacy_border_path(),
+            Tag::compound([("data", old.pack())]),
+        )
+        .unwrap();
+        assert_eq!(game.load_border(game.dim).size(), 50.0);
+        game.save_border().unwrap();
+        assert_eq!(game.load_border(game.dim), WorldBorder::default());
+
+        game.border.set_size(75.0);
+        game.save_border().unwrap();
+        assert_eq!(game.load_border(game.dim).size(), 75.0);
+        game.border = WorldBorder::default();
+        game.save_border().unwrap();
+        assert_eq!(game.load_border(game.dim), WorldBorder::default());
+        assert!(game.legacy_border_path().is_file());
+
+        game.world_root = previous_root;
+        std::fs::remove_dir_all(root).unwrap();
+    });
+}

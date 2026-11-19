@@ -526,23 +526,7 @@ impl Opt {
             },
             _ => self.slider_steps(),
         };
-        let next_pos = if let Some(steps) = steps {
-            let steps = steps as f32;
-            let current = (pos * steps).round();
-            let next = if forward {
-                current + 1.0
-            } else {
-                current - 1.0
-            };
-            (next / steps).clamp(0.0, 1.0)
-        } else {
-            let delta = 1.0 / (width - 8.0).max(1.0);
-            if forward {
-                (pos + delta).min(1.0)
-            } else {
-                (pos - delta).max(0.0)
-            }
-        };
+        let next_pos = crate::settings_shell::slider_step(pos, steps, width, forward);
         self.set_slider(s, next_pos);
     }
     /// The widget message (OptionInstance.toString / CycleButton full name).
@@ -936,6 +920,10 @@ impl Opt {
     }
     /// Set a slider from its 0..1 position (OptionInstance value sets).
     pub fn set_slider(self, s: &mut Settings, v: f32) {
+        if !v.is_finite() {
+            return;
+        }
+        let v = v.clamp(0.0, 1.0);
         if let Opt::ModSetting(i, j) = self {
             let setting = s
                 .mods
@@ -951,7 +939,6 @@ impl Opt {
         if !self.available() {
             return;
         }
-        let v = v.clamp(0.0, 1.0);
         let step = |lo: f32, hi: f32| (lo + v * (hi - lo)).round();
         match self {
             Opt::ChatDelay => values::set(s, v),
@@ -1721,9 +1708,8 @@ pub enum Event {
     OpenShaderOptions,
     /// The Shader Options page closed with changes: save them and load the pack again.
     ShaderOptions,
-    /// The options of `shader_packs[.0]`, a Horizon pack, changed: save them (the pack reloads
-    /// with them).
-    NativePackOptions(usize),
+    /// Save a Horizon pack's options, with the previous values for a failed write.
+    NativePackOptions(usize, Vec<f64>),
     /// Native mod `.0`'s page opened: the game reads its settings' kept values again.
     NativeSettings(usize),
     /// Setting `.1` of native mod `.0`'s page changed (`settings.mods`): the game keeps it and
@@ -2337,6 +2323,22 @@ impl OptionsUi {
                 },
             }
     }
+    pub fn shader_options_save_result(
+        &mut self,
+        options: &crate::shader_options::ShaderOptions,
+        error: Option<&std::io::Error>,
+    ) {
+        self.shader.screen.save_result(options, error);
+    }
+
+    pub fn native_shader_options_save_result(
+        &mut self,
+        pack: &str,
+        error: Option<&std::io::Error>,
+    ) {
+        self.shader.screen.set_save_error(pack, error);
+    }
+
     /// Jump straight to a page (control socket / tests).
     pub fn show(&mut self, page: Page) {
         if page != Page::Main {
@@ -4644,6 +4646,20 @@ mod tests {
     const NONE: EffectiveOutput = EffectiveOutput::NONE;
 
     #[test]
+    fn options_sliders_preserve_audio_and_controls_on_invalid_positions() {
+        let mut settings = Settings::default();
+        let original = (settings.master_volume, settings.sensitivity);
+        for position in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            Opt::Volume(0).set_slider(&mut settings, position);
+            Opt::Sensitivity.set_slider(&mut settings, position);
+        }
+        assert_eq!((settings.master_volume, settings.sensitivity), original);
+        Opt::Volume(0).set_slider(&mut settings, 2.0);
+        Opt::Sensitivity.set_slider(&mut settings, -1.0);
+        assert_eq!((settings.master_volume, settings.sensitivity), (1.0, 0.0));
+    }
+
+    #[test]
     fn pack_options_leave_with_a_change_and_with_nothing_after_its_undo() {
         use crate::settings_shell::Screen as _;
         let mut s = Settings::default();
@@ -6176,6 +6192,53 @@ mod tests {
     }
 
     #[test]
+    fn pointer_cursor_on_the_list_scrollbar_points_then_resizes_while_dragged() {
+        use crate::widgets::{Cursor, take_cursor};
+        let atlas = atlas();
+        let s = Settings::default();
+        let mut ui = OptionsUi::default();
+        // A long list at a size where it scrolls (the same page and window the
+        // wheel test above uses); the bar code is shared by every list page.
+        ui.show(Page::KeyBinds);
+        let frame = |ui: &mut OptionsUi, cursor: (f32, f32)| {
+            let _ = take_cursor();
+            ui.draw_test_frame(
+                &s,
+                NONE,
+                &mut HudBatch::new(
+                    [1708, 960],
+                    crate::hud::GuiScale {
+                        requested: 0,
+                        unicode: false,
+                    },
+                ),
+                &atlas,
+                cursor,
+                &mut |_, _| {},
+            );
+            take_cursor()
+        };
+        // The first frame lays the page out at the batch's GUI size, which is
+        // what `ui.size` then holds; the bar's x comes from that size, not the
+        // window's pixels.
+        let _ = frame(&mut ui, (-10.0, -10.0));
+        let (w, h) = ui.size;
+        let (_, top, bottom, content) = ui.layout(&s, w, h);
+        assert!(
+            ui::scrollbar_thumb(top, bottom, content, ui.scroll).is_some(),
+            "the key binds list has more rows than the window"
+        );
+        // Just inside the bar's left edge, near its top.
+        let over = (ui.scrollbar_x(w) + 1.0, top + 1.0);
+        assert_eq!(frame(&mut ui, over), Cursor::PointingHand);
+        // Pressing the bar holds it: the resize cursor, wherever the pointer is.
+        ui.scrollbar_drag_y = Some(over.1);
+        assert_eq!(frame(&mut ui, over), Cursor::ResizeNs);
+        ui.scrollbar_drag_y = None;
+        assert_eq!(frame(&mut ui, over), Cursor::PointingHand);
+    }
+
+    #[test]
     fn pointer_cursor_leaves_a_disabled_option_without_focusing_it() {
         use crate::widgets::{Cursor, take_cursor};
         let atlas = atlas();
@@ -6308,6 +6371,8 @@ mod tests {
     #[cfg(target_os = "ios")]
     #[test]
     fn extras_keeps_native_zoom_without_a_mod_install_prompt() {
+        use crate::settings_shell::Hosted;
+
         let mut settings = Settings::default();
         let mut ui = OptionsUi::default();
         ui.show(Page::Extras);

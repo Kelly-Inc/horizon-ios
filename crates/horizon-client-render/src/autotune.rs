@@ -105,9 +105,12 @@ impl GpuCullingAuto {
     /// One frame's CPU time, a GPU time where its timestamps have arrived, and its whole time,
     /// in milliseconds. Answers the new state when this frame completed a window that changed it.
     pub fn observe(&mut self, cpu_ms: f32, gpu_ms: Option<f32>, frame_ms: f32) -> Option<bool> {
+        if !frame_ms.is_finite() || frame_ms <= 0.0 || !cpu_ms.is_finite() || cpu_ms < 0.0 {
+            return None;
+        }
         self.clock_ms += f64::from(frame_ms);
         self.cpu.push(cpu_ms);
-        if let Some(gpu) = gpu_ms {
+        if let Some(gpu) = gpu_ms.filter(|gpu| gpu.is_finite() && *gpu > 0.0) {
             self.gpu.push(gpu);
         }
         if self.cpu.len() < WINDOW {
@@ -282,6 +285,19 @@ mod tests {
             assert_eq!(auto.observe(8.0, None, 8.0), None);
         }
         assert!(!auto.on());
+    }
+
+    #[test]
+    fn empty_gpu_timestamps_do_not_look_like_a_cpu_bottleneck() {
+        let mut auto = GpuCullingAuto::new();
+        for gpu in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            for _ in 0..WINDOW * 3 {
+                assert_eq!(auto.observe(8.0, Some(gpu), 8.0), None);
+            }
+        }
+        assert!(!auto.on());
+        assert_eq!(window(&mut auto, 5.0, 2.0), None);
+        assert_eq!(window(&mut auto, 5.0, 2.0), Some(true));
     }
 
     /// A spike in a window doesn't move its verdict: the median ignores it.

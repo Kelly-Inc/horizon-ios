@@ -26,20 +26,29 @@ pub(super) fn insert_text_keys(text: &str) -> Vec<(PhysicalKey, Key)> {
     text.chars()
         .filter_map(|c| {
             let text = smol_str::SmolStr::from_iter([c]);
-            if let Some(code) = text_key_code(&text) {
-                let physical = PhysicalKey::Code(code);
-                Some((physical, logical_key(physical, &text)))
-            } else {
-                let logical = Key::Character(text.clone());
-                key_text(&logical, &text).map(|_| {
-                    (
-                        PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
-                        logical,
-                    )
-                })
-            }
+            let logical = Key::Character(text.clone());
+            key_text(&logical, &text).map(|_| {
+                (
+                    PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+                    logical,
+                )
+            })
         })
         .collect()
+}
+
+/// Multiline text carries line breaks as data, never as separate Return keys.
+pub(super) fn multiline_commit(text: &str) -> Option<String> {
+    if text_key_code(text).is_some() || !text.contains(['\r', '\n']) {
+        return None;
+    }
+    Some(
+        text.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|&c| c == '\n' || (!c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c)))
+            .collect(),
+    )
 }
 
 fn text_key_code(text: &str) -> Option<KeyCode> {
@@ -345,6 +354,16 @@ mod tests {
         }
         assert!(insert_text_keys("").is_empty());
         assert!(insert_text_keys("\u{0}\u{f8ff}").is_empty());
+    }
+
+    #[test]
+    fn embedded_controls_are_text_payload_not_commands() {
+        assert_eq!(multiline_commit("one\r\ntwo\rthree").as_deref(), Some("one\ntwo\nthree"));
+        assert_eq!(multiline_commit("\n"), None);
+        assert_eq!(multiline_commit("UIKeyInputTab"), None);
+        let keys = insert_text_keys("a\tb\u{7f}c");
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|(_, key)| matches!(key, Key::Character(_))));
     }
 
     #[test]

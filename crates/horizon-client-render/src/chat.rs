@@ -1615,18 +1615,21 @@ impl ChatScreen {
         f(&mut self.input);
         self.edited(m, c);
     }
-    /// Typed text (`charTyped` per character).
+    /// Typed text (`charTyped` per character), with suggestions refreshed after every edit.
     pub fn type_text(&mut self, m: &Measure, c: &Commands, text: &str) {
         for ch in text.chars() {
-            if ch >= ' '
-                && ch != '\u{7f}'
-                && ch != '§'
-                && self.input.insert_text(m, &ch.to_string())
-            {
-                self.edited(m, c);
+            if ch >= ' ' && ch != '\u{7f}' && ch != '§' {
+                self.type_commit(m, c, &ch.to_string());
             }
         }
     }
+    /// Insert a filtered composition as one edit and refresh suggestions once.
+    pub fn type_commit(&mut self, m: &Measure, c: &Commands, text: &str) {
+        if self.input.insert_text(m, text) {
+            self.edited(m, c);
+        }
+    }
+
     /// `CommandSuggestions.updateCommandInfo`.
     #[horizon_mod_api_macros::replaceable]
     fn update_command_info(&mut self, m: &Measure, c: &Commands) {

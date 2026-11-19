@@ -730,6 +730,9 @@ impl TextField {
             .filter(|c| *c >= ' ' && *c != '\u{7f}' && *c != '§')
             .collect();
         let insert = crate::ui::utf16_prefix(&filtered, room);
+        if insert.is_empty() && start == end {
+            return false;
+        }
         let n = chars(&insert);
         self.value = format!(
             "{}{}{}",
@@ -1562,5 +1565,10 @@ mod max_length_tests {
         field.max_length = 4;
         field.insert_text(&m, "ab😀");
         assert_eq!(field.value, "ab😀", "four units, both of the emoji's");
+        field.set_value(&m, "abc");
+        assert!(!field.insert_text(&m, "😀"));
+        assert!(!field.insert_text(&m, "§"));
+        assert_eq!(field.value, "abc");
+        assert_eq!(field.cursor, 3);
     }
 }

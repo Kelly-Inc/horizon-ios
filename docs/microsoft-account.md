@@ -1,6 +1,6 @@
 # Microsoft account sign-in and online-mode play
 
-> For this mobile fork, sign in through the native account sheet. iOS builds read `HorizonMSAClientID` from the app’s Info.plist; the mobile workflow fills it from `HORIZON_MSA_CLIENT_ID`, using the official public application ID by default. Use [the mobile issue tracker](https://github.com/heyskylo/horizon-ios/issues) for sign-in problems. The desktop and registration details below are shared engine reference.
+> For this mobile fork, sign in through the native account sheet. iOS builds read `HorizonMSAClientID` from the app’s Info.plist; the mobile workflow fills it from `HORIZON_MSA_CLIENT_ID`, using the official public application ID by default. Use [the mobile issue tracker](https://github.com/Kelly-Inc/horizon-ios/issues) for sign-in problems. The desktop and registration details below are shared engine reference.
 
 Horizon signs players in with their Microsoft account in the launcher and joins online-mode
 (authenticated) servers like vanilla 26.3 does. The launcher plays only with an account that owns
@@ -29,7 +29,7 @@ no Microsoft sign-in"); release builds have it.
    `api.minecraftservices.com/authentication/login_with_xbox` (HTTP 403, "Invalid app registration")
    until Mojang approves them. Apply with the form linked from https://aka.ms/mce-reviewappid
    (Minecraft Java "App ID review"), giving the client ID above, the app name, the project URL
-   (https://github.com/heyskylo/horizon-ios) and a short description ("open-source Minecraft Java
+   (https://github.com/Kelly-Inc/horizon-ios) and a short description ("open-source Minecraft Java
    Edition client written in Rust; signs players in to join online-mode servers"). Approval takes
    days to weeks; sign-in fails at the Minecraft step with "This app is not approved by Mojang yet"
    until then.

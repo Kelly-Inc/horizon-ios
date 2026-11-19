@@ -167,9 +167,12 @@ pub struct MotionClock {
 }
 impl MotionClock {
     pub fn tick(&mut self, time: f64, velocity: (f64, f64)) -> Option<(f64, f64)> {
-        let previous = self.last;
-        self.last = time;
-        if previous == 0.0 || velocity == (0.0, 0.0) {
+        if velocity == (0.0, 0.0) {
+            self.last = 0.0;
+            return None;
+        }
+        let previous = std::mem::replace(&mut self.last, time);
+        if previous == 0.0 {
             return None;
         }
         let acceleration = velocity.0.hypot(velocity.1).powi(2).min(1.0);
@@ -205,14 +208,39 @@ impl Cursor {
     pub fn primary_finger(&self) -> Option<u64> {
         self.primary
     }
-    pub fn surface_finger(&self, id: u64) -> bool {
-        self.fingers
-            .iter()
-            .any(|(finger, _, button)| *finger == id && button.is_none())
-    }
     pub fn set_virtual_mouse(&mut self, enabled: bool) {
         self.direct = !enabled;
     }
+
+    /// Fit the idle cursor as well as its pointer before displaying a new canvas.
+    pub fn fit_size(&mut self, size: (f32, f32)) {
+        if !size.0.is_finite() || !size.1.is_finite() || size.0 <= 0.0 || size.1 <= 0.0 {
+            return;
+        }
+        if let Some(pointer) = &mut self.pointer {
+            pointer.size = (f64::from(size.0), f64::from(size.1));
+            pointer.position.0 = pointer.position.0.clamp(0.0, pointer.size.0);
+            pointer.position.1 = pointer.position.1.clamp(0.0, pointer.size.1);
+        }
+        if let Some(position) = &mut self.position {
+            position.0 = position.0.clamp(0.0, size.0);
+            position.1 = position.1.clamp(0.0, size.1);
+        }
+    }
+    pub fn sync_layout(&mut self, layout: &[(Control, Rect)]) {
+        let next = layout
+            .iter()
+            .find(|(control, _)| *control == Control::Joystick)
+            .map(|(_, rect)| *rect);
+        if self.joystick_rect != next
+            && let Some(id) = self.stick_finger
+        {
+            self.finish_finger(id);
+            self.ignored.push(id);
+        }
+        self.joystick_rect = next;
+    }
+
     /// Button capture is identical over menus and worlds: a key press is not
     /// converted into a click or a different key when the finger moves away.
     pub fn event_controls(
@@ -223,6 +251,9 @@ impl Cursor {
         size: (f32, f32),
         layout: &[(Control, Rect)],
     ) -> Vec<Action> {
+        if phase >= 2 {
+            return self.finish_finger(id).into_iter().collect();
+        }
         if !at.0.is_finite()
             || !at.1.is_finite()
             || !size.0.is_finite()
@@ -232,21 +263,7 @@ impl Cursor {
         {
             return self.cancel();
         }
-        if let Some(i) = self
-            .key_fingers
-            .iter()
-            .position(|(finger, _)| *finger == id)
-        {
-            if phase < 2 {
-                return vec![];
-            }
-            let (_, control) = self.key_fingers.remove(i);
-            return if self.key_fingers.iter().any(|(_, c)| *c == control) {
-                vec![]
-            } else {
-                vec![Action::Key(control, false)]
-            };
-        }
+        self.sync_layout(layout);
         if phase == 0
             && let Some(control) = super::hit(layout, at)
             && !matches!(
@@ -254,8 +271,9 @@ impl Cursor {
                 Control::Joystick | Control::Hotbar(_) | Control::LeftClick | Control::RightClick
             )
         {
+            let mut out: Vec<_> = self.finish_finger(id).into_iter().collect();
             if self.key_fingers.len() >= 32 {
-                return vec![];
+                return out;
             }
             let held = self.key_fingers.iter().any(|(_, c)| *c == control);
             if held {
@@ -263,16 +281,11 @@ impl Cursor {
             } else {
                 self.key_fingers.push((id, control));
             }
-            return if held {
-                vec![]
-            } else {
-                vec![Action::Key(control, true)]
-            };
+            if !held {
+                out.push(Action::Key(control, true));
+            }
+            return out;
         }
-        self.joystick_rect = layout
-            .iter()
-            .find(|(c, _)| *c == Control::Joystick)
-            .map(|(_, r)| *r);
         let rect = |control| {
             layout
                 .iter()
@@ -298,36 +311,39 @@ impl Cursor {
         if !size.0.is_finite() || !size.1.is_finite() || size.0 <= 0.0 || size.1 <= 0.0 {
             return self.cancel();
         }
-        if !at.0.is_finite() || !at.1.is_finite() {
-            return self.event(id, 3, (0.0, 0.0), size, buttons);
+        if phase >= 2 || !at.0.is_finite() || !at.1.is_finite() {
+            return self.finish_finger(id).into_iter().collect();
         }
-        if self.ignored.contains(&id) {
-            if phase >= 2 {
-                self.ignored.retain(|finger| *finger != id);
+        let pointer_at = if self.direct {
+            (at.0.clamp(0.0, size.0), at.1.clamp(0.0, size.1))
+        } else {
+            at
+        };
+        let pointer_at = (f64::from(pointer_at.0), f64::from(pointer_at.1));
+        // A reused touch ID starts a new gesture, even when the previous
+        // gesture's terminal event never reached this cursor.
+        let mut out: Vec<_> = if phase == 0 {
+            self.finish_finger(id).into_iter().collect()
+        } else {
+            if self.ignored.contains(&id)
+                || self.key_fingers.iter().any(|(finger, _)| *finger == id)
+            {
+                return vec![];
             }
-            return vec![];
-        }
+            Vec::new()
+        };
+        self.fit_size(size);
         let pointer = self
             .pointer
             .get_or_insert_with(|| Pointer::new((f64::from(size.0), f64::from(size.1))));
-        pointer.size = (f64::from(size.0), f64::from(size.1));
-        pointer.position.0 = pointer.position.0.clamp(0.0, pointer.size.0);
-        pointer.position.1 = pointer.position.1.clamp(0.0, pointer.size.1);
         if self.position.is_none() || !self.direct {
             self.position = Some((pointer.position.0 as f32, pointer.position.1 as f32));
         }
-        let mut out = Vec::new();
         if self.stick_finger == Some(id) {
-            let Some(r) = self.joystick_rect else {
-                self.stick_finger = None;
-                self.joystick.velocity = (0.0, 0.0);
-                return out;
-            };
-            if phase >= 2 {
-                self.joystick.finish(r, false);
-                self.stick_finger = None;
-            } else if phase == 1 {
+            if let Some(r) = self.joystick_rect {
                 self.joystick.sample(r, at, false);
+            } else {
+                self.finish_finger(id);
             }
             return out;
         }
@@ -343,11 +359,11 @@ impl Cursor {
             && let Some(r) = self.joystick_rect.filter(|r| hit_rect(*r, at))
         {
             self.stick_finger = Some(id);
+            self.clock = MotionClock::default();
             self.joystick.sample(r, at, false);
             return out;
         }
         if phase == 0 {
-            out.extend(self.event(id, 3, at, size, buttons));
             if self.fingers.len() >= 32 {
                 return out;
             }
@@ -372,7 +388,7 @@ impl Cursor {
                 self.primary = Some(id);
                 let p = self.pointer.as_mut().unwrap().point(
                     0,
-                    (f64::from(at.0), f64::from(at.1)),
+                    pointer_at,
                     false,
                     !self.direct,
                 );
@@ -386,7 +402,7 @@ impl Cursor {
                     self.primary = Some(id);
                     let p = self.pointer.as_mut().unwrap().point(
                         0,
-                        (f64::from(at.0), f64::from(at.1)),
+                        pointer_at,
                         false,
                         !self.direct,
                     );
@@ -396,7 +412,7 @@ impl Cursor {
                 if self.primary == Some(id) {
                     let p = self.pointer.as_mut().unwrap().point(
                         2,
-                        (f64::from(at.0), f64::from(at.1)),
+                        pointer_at,
                         false,
                         !self.direct,
                     );
@@ -405,28 +421,47 @@ impl Cursor {
                 }
                 self.fingers[i].1 = at;
             }
-            if phase >= 2 {
-                self.fingers.remove(i);
-                if self.primary == Some(id) {
-                    self.primary = None;
-                }
-                if let Some(right) = button
-                    && !self.held(right)
-                {
-                    out.push(Action::Button(right, false));
-                }
-            }
         }
         out
     }
+
+    fn finish_finger(&mut self, id: u64) -> Option<Action> {
+        self.ignored.retain(|finger| *finger != id);
+        if self.stick_finger == Some(id) {
+            self.stick_finger = None;
+            self.joystick
+                .finish(self.joystick_rect.unwrap_or_default(), false);
+        }
+        if let Some(i) = self
+            .key_fingers
+            .iter()
+            .position(|(finger, _)| *finger == id)
+        {
+            let (_, control) = self.key_fingers.remove(i);
+            return (!self.key_fingers.iter().any(|(_, c)| *c == control))
+                .then_some(Action::Key(control, false));
+        }
+        let i = self.fingers.iter().position(|finger| finger.0 == id)?;
+        let (_, _, button) = self.fingers.remove(i);
+        if self.primary == Some(id) {
+            self.primary = None;
+        }
+        button
+            .filter(|right| !self.held(*right))
+            .map(|right| Action::Button(right, false))
+    }
+
     pub fn tick(&mut self, time: f64) -> Option<Action> {
         let delta = self.clock.tick(time, self.joystick.velocity)?;
         let pointer = self.pointer.as_mut()?;
+        // Joystick deltas and absolute touch samples have separate origins.
+        let touch_origin = pointer.last;
         let mut at = pointer.point(3, delta, false, !self.direct);
+        pointer.last = touch_origin;
         if self.direct {
             let previous = self.position.unwrap_or((0.0, 0.0));
-            at.0 += f64::from(previous.0);
-            at.1 += f64::from(previous.1);
+            at.0 = (at.0 + f64::from(previous.0)).clamp(0.0, pointer.size.0);
+            at.1 = (at.1 + f64::from(previous.1)).clamp(0.0, pointer.size.1);
         }
         self.position = Some((at.0 as f32, at.1 as f32));
         Some(Action::Move(at.0 as f32, at.1 as f32))
@@ -502,6 +537,48 @@ mod tests {
         assert!(c.event(2, 3, (5., 85.), (100., 100.), B).is_empty());
     }
     #[test]
+    fn cancelling_a_click_preserves_another_fingers_pointer_drag() {
+        let mut cursor = Cursor::default();
+        let size = (100.0, 100.0);
+        let layout = [(Control::LeftClick, B[0])];
+        cursor.event_controls(1, 0, (30.0, 30.0), size, &layout);
+        cursor.event_controls(2, 0, (5.0, 85.0), size, &layout);
+
+        assert_eq!(
+            cursor.event_controls(2, 3, (5.0, 85.0), size, &layout),
+            [Action::Button(false, false)]
+        );
+        assert!(
+            cursor
+                .event_controls(3, 3, (f32::NAN, f32::NAN), size, &layout)
+                .is_empty()
+        );
+        assert_eq!(
+            cursor.event_controls(1, 1, (34.0, 32.0), size, &layout),
+            [Action::Move(54.0, 52.0)]
+        );
+    }
+
+    #[test]
+    fn menu_joystick_motion_preserves_the_surface_finger_origin() {
+        let mut cursor = Cursor {
+            joystick_rect: Some([0.0, 0.0, 40.0, 40.0]),
+            ..Default::default()
+        };
+        let size = (100.0, 100.0);
+        cursor.event(1, 0, (70.0, 70.0), size, B);
+        cursor.event(2, 0, (30.0, 20.0), size, B);
+        assert!(cursor.tick(1.0).is_none());
+        let Some(Action::Move(x, y)) = cursor.tick(1.0 + 1.0 / 60.0) else {
+            panic!("joystick did not move the cursor");
+        };
+        assert_eq!(
+            cursor.event(1, 1, (74.0, 72.0), size, B),
+            [Action::Move(x + 4.0, y + 2.0)]
+        );
+    }
+
+    #[test]
     fn joystick_emits_diagonal_keys_and_has_deadzone() {
         assert_eq!(stick_keys([0., 0., 100., 100.], (50., 50.)), 0);
         assert_eq!(stick_keys([0., 0., 100., 100.], (100., 0.)), 9);
@@ -548,11 +625,20 @@ mod tests {
             c.event(2, 0, (5., 85.), (100., 100.), B),
             [Action::Button(false, true)]
         );
-        c.event(1, 2, (30., 10.), (100., 100.), B);
+        c.sync_layout(&[]);
+        assert_eq!(c.joystick.velocity, (0.0, 0.0));
         assert!(c.tick(2.0).is_none());
+        c.event(1, 2, (30., 10.), (100., 100.), B);
         assert!(c.held(false));
         assert_eq!(c.cancel(), [Action::Button(false, false)]);
         assert!(c.tick(3.0).is_none());
+        c.sync_layout(&[(Control::Joystick, [0., 0., 40., 40.])]);
+        c.event(3, 0, (30., 10.), (100., 100.), B);
+        assert!(c.tick(20.0).is_none());
+        assert!(c.tick(20.0 + 1.0 / 60.0).is_some());
+        c.event(3, 2, (30., 10.), (100., 100.), B);
+        c.event(4, 0, (30., 10.), (100., 100.), B);
+        assert!(c.tick(40.0).is_none());
     }
     #[test]
     fn source_axis_quirk_and_sticky_deadzone_remain_explicit() {
@@ -592,6 +678,30 @@ mod tests {
         assert_eq!(c.cancel(), [Action::Key(Control::Left, false)]);
         assert!(c.cancel().is_empty());
     }
+    #[test]
+    fn direct_cursor_stays_inside_the_menu_during_motion_and_resize() {
+        let mut cursor = Cursor::default();
+        cursor.set_virtual_mouse(false);
+        cursor.event(1, 0, (98.0, 2.0), (100.0, 100.0), B);
+        cursor.joystick.velocity = (0.5, 0.5);
+        assert!(cursor.tick(1.0).is_none());
+        assert_eq!(cursor.tick(1.0 + 1.0 / 60.0), Some(Action::Move(100.0, 0.0)));
+        assert_eq!(
+            cursor.event(1, 1, (160.0, -10.0), (100.0, 100.0), B),
+            [Action::Move(100.0, 0.0)]
+        );
+
+        cursor.fit_size((70.0, 70.0));
+        assert_eq!(cursor.position, Some((70.0, 0.0)));
+
+        let compact_buttons = [[0.0, 40.0, 20.0, 20.0], [40.0, 40.0, 20.0, 20.0]];
+        assert_eq!(
+            cursor.event(2, 0, (5.0, 55.0), (60.0, 60.0), compact_buttons),
+            [Action::Button(false, true)]
+        );
+        assert_eq!(cursor.position, Some((60.0, 0.0)));
+    }
+
     #[test]
     fn direct_pointer_and_joystick_keep_the_callback_cursor_position() {
         let mut c = Cursor::default();

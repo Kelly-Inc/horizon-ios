@@ -540,6 +540,7 @@ dependencies = [
  "wasm-encoder 0.261.0",
  "wasmparser 0.261.0",
  "wasmtime",
+ "wat",
  "zip",
 ]
 
@@ -1851,6 +1852,7 @@ dependencies = [
  "horizon-bench",
  "horizon-chat-filter",
  "horizon-client-core",
+ "horizon-client-gameplay",
  "horizon-client-input",
  "horizon-client-lib",
  "horizon-client-render",
@@ -1862,6 +1864,7 @@ dependencies = [
  "horizon-friends",
  "horizon-game-discovery",
  "horizon-gamecontroller",
+ "horizon-gameplay",
  "horizon-guest-stack",
  "horizon-hdr",
  "horizon-hooks",
@@ -1926,6 +1929,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-client-gameplay"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "horizon-client-lib",
+ "horizon-core",
+ "horizon-world",
+ "log",
+ "serde_json",
+]
+
+[[package]]
 name = "horizon-client-input"
 version = "0.1.0"
 dependencies = [
@@ -1937,6 +1952,7 @@ dependencies = [
  "horizon-theme",
  "log",
  "png",
+ "serde_json",
  "winit",
 ]
 
@@ -2063,6 +2079,7 @@ dependencies = [
  "lz4_flex",
  "miniz_oxide 0.8.9",
  "naga",
+ "objc2-foundation 0.3.2",
  "png",
  "pollster",
  "rustix 1.1.5",
@@ -2202,6 +2219,19 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-game-controller",
  "objc2-ui-kit 0.3.2",
+]
+
+[[package]]
+name = "horizon-gameplay"
+version = "0.1.0"
+dependencies = [
+ "horizon-client-lib",
+ "horizon-core",
+ "horizon-mod-runtime",
+ "horizon-threads",
+ "horizon-world",
+ "log",
+ "serde_json",
 ]
 
 [[package]]
@@ -2754,6 +2784,7 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2 0.5.10",
+ "tempfile",
 ]
 
 [[package]]

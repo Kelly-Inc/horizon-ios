@@ -60,6 +60,7 @@ declare_class!(
 
         #[method(resignKeyWindow)]
         fn resign_key_window(&self) {
+            release_window_hardware_keys(self);
             let mtm = MainThreadMarker::new().unwrap();
             app_state::handle_nonuser_event(
                 mtm,
@@ -72,6 +73,21 @@ declare_class!(
         }
     }
 );
+
+/// Losing key-window or scene status need not resign the view's first responder.
+pub(super) fn release_window_hardware_keys(window: &UIWindow) {
+    let Some(view) = window.rootViewController().and_then(|controller| {
+        // Don't load a new view while the app is losing focus.
+        unsafe { controller.viewIfLoaded() }
+    }) else {
+        return;
+    };
+    if view.is_kind_of::<WinitView>() {
+        // SAFETY: The UIKit class check above verifies the allocated type.
+        let view: Retained<WinitView> = unsafe { Retained::cast(view) };
+        view.release_hardware_keys();
+    }
+}
 
 impl WinitUIWindow {
     pub(crate) fn new(

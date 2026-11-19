@@ -25,7 +25,9 @@ use std::{
     time::Duration,
 };
 
-use super::{Installed, MAX_PACKED, Pack, park_failed_archive, sanitize, unique, with_home_access};
+use super::{
+    Installed, MAX_PACKED, Pack, acquire_home_access, park_archive_with_access, sanitize, unique,
+};
 
 /// The most a sender may put in the request line and headers.
 const MAX_HEADER: usize = 16 * 1024;
@@ -95,6 +97,15 @@ const MAX_GUESSES: usize = 30;
 /// connection from its own process, because a loop that only wakes when something knocks could be
 /// left holding the port -- and a phone that has started loading its game must not keep a door open.
 const POLL: Duration = Duration::from_millis(20);
+
+/// Prevent an upload from starting while recovery switches loaders or download sources.
+pub struct UploadSlot(Arc<Line>);
+
+impl Drop for UploadSlot {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::Release);
+    }
+}
 
 impl Session {
     /// Listen for an archive in `home` (`Documents` on a phone) until this is dropped.
@@ -183,6 +194,14 @@ impl Session {
         self.line.busy.load(Ordering::Relaxed)
     }
 
+    /// Take the same slot used by upload admission.
+    pub fn reserve_upload_slot(&self) -> io::Result<UploadSlot> {
+        if self.line.busy.swap(true, Ordering::Acquire) {
+            return Err(io::Error::other("Wait for the current upload to finish."));
+        }
+        Ok(UploadSlot(self.line.clone()))
+    }
+
     /// Everything the listener has said since the last frame.
     pub fn poll(&mut self) -> Vec<News> {
         let mut news = Vec::new();
@@ -195,7 +214,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.line.stop.store(true, Ordering::Relaxed);
+        self.line.stop.store(true, Ordering::Release);
         // The loop notices within one poll, so this returns in milliseconds and the port is shut --
         // not merely meant to be shut sometime soon.
         if let Some(thread) = self.thread.take() {
@@ -348,7 +367,7 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
             "that is larger than a phone will hold\n",
         );
     }
-    if line.busy.swap(true, Ordering::Relaxed) {
+    if line.busy.swap(true, Ordering::Acquire) {
         return respond(
             stream,
             503,
@@ -359,10 +378,18 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
     struct Busy<'a>(&'a AtomicBool);
     impl Drop for Busy<'_> {
         fn drop(&mut self) {
-            self.0.store(false, Ordering::Relaxed);
+            self.0.store(false, Ordering::Release);
         }
     }
     let _busy = Busy(&line.busy);
+    if line.stop.load(Ordering::Acquire) {
+        return respond(
+            stream,
+            503,
+            "text/plain",
+            "the phone has closed the upload session\n",
+        );
+    }
 
     let name = sanitize(
         request
@@ -387,20 +414,31 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
     }
     // Land it where the cable route lands it, and let one path unpack it: a phone that dies between
     // these two lines still leaves an archive in `Documents` for the next launch to install.
-    let mut landed = None;
-    let installed = with_home_access(&line.home, || {
+    let installed = (|| -> crate::Result<Installed> {
+        // The startup scanner can see the ZIP as soon as it lands. Keep the
+        // same transaction through install so it cannot consume our upload.
+        let access = acquire_home_access(&line.home)?;
+        if line.stop.load(Ordering::Acquire) {
+            return Err("the phone stopped listening".into());
+        }
         let mut archive = line.home.join(format!("{name}.zip"));
         if super::download::reserved_archive(&archive) {
             archive = line.home.join(format!("Upload {name}.zip"));
         }
         let archive = unique(&archive);
         fs::rename(&part, &archive)?;
-        Ok(archive)
-    })
-    .and_then(|archive| {
-        landed = Some(archive.clone());
-        Pack::open(&archive)?.install(&line.home)
-    })
+        Pack::open(&archive)
+            .and_then(|pack| pack.install_with_access(&line.home, &access, || true))
+            .inspect_err(|_| {
+                // Claim a failed upload for recovery before another scanner can retry it.
+                if let Err(error) = park_archive_with_access(&archive, &access) {
+                    log::warn!(
+                        "Horizon: could not park failed upload {}: {error}",
+                        archive.display()
+                    );
+                }
+            })
+    })()
     .inspect(|installed| {
         let _ = line.sender.send(News::Installed(installed.clone()));
     });
@@ -415,17 +453,7 @@ fn upload(stream: &mut TcpStream, line: &Line, request: Request) -> io::Result<(
             ),
         ),
         Err(error) => {
-            // Park it the way the startup scan does, so the same failure is not retried every launch.
-            if let Some(archive) = landed {
-                if let Err(park_error) = park_failed_archive(&line.home, &archive) {
-                    log::warn!(
-                        "Horizon: could not park failed upload {}: {park_error}",
-                        archive.display()
-                    );
-                }
-            } else {
-                let _ = fs::remove_file(&part);
-            }
+            let _ = fs::remove_file(&part);
             let message = format!("the phone could not use that archive: {error}");
             let _ = line.sender.send(News::Refused {
                 error: message.clone(),
@@ -641,6 +669,22 @@ mod tests {
             )
             .starts_with(&header(404))
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn retry_reserves_the_slot_used_by_wifi_uploads() {
+        let home = temp_home("retry-slot");
+        let session = Session::start(&home).unwrap();
+        let slot = session.reserve_upload_slot().unwrap();
+        assert!(session.reserve_upload_slot().is_err());
+        let request = format!(
+            "PUT /upload HTTP/1.1\r\nX-Horizon-Pin: {}\r\nContent-Length: 0\r\n\r\n",
+            session.pin()
+        );
+        assert!(ask(session.port(), request, &[]).starts_with(&header(503)));
+        drop(slot);
+        assert!(session.reserve_upload_slot().is_ok());
         fs::remove_dir_all(home).unwrap();
     }
 

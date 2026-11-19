@@ -68,6 +68,14 @@ impl PackPrompt {
 }
 
 impl ServerPackState {
+    fn publish_active(&mut self, ok: bool) -> bool {
+        let Some(server) = self.pending_active.take().filter(|_| ok) else {
+            return false;
+        };
+        self.active = server;
+        true
+    }
+
     /// The `ToastManager` slots the download toasts hold.
     pub(super) fn toast_slots(&self) -> impl Iterator<Item = usize> + '_ {
         self.notifiers
@@ -92,6 +100,8 @@ pub(super) struct ServerPackState {
     user: (String, u128),
     /// The packs loaded on top of the player's own, bottom first.
     pub(super) active: Vec<packs::Pack>,
+    /// The server's next list is pending until resource publication succeeds.
+    pub(super) pending_active: Option<Vec<packs::Pack>>,
     /// The download batches' notifiers, oldest first.
     notifiers: Vec<PackNotifier>,
     /// `SystemToastId.PACK_LOAD_FAILURE`: the toast `Minecraft.clearResourcePacksOnError` adds.
@@ -144,6 +154,8 @@ impl PackNotifier {
             changed |= match event {
                 download::Progress::RequestStart => {
                     self.count += 1;
+                    self.size = None;
+                    self.bytes = None;
                     true
                 }
                 download::Progress::DownloadStart(size) => {
@@ -228,6 +240,7 @@ impl Game<'_> {
             return false;
         }
         self.pack_reload = None;
+        self.server_packs.pending_active = None;
         true
     }
 
@@ -385,19 +398,7 @@ impl Game<'_> {
         if let Some(address) = &self.server_packs.address {
             let file = multiplayer::servers_file(&saves());
             let _guard = servers::lock();
-            let (mut list, mut hidden) = servers::load_all(&file);
-            let mut found = false;
-            for entry in list.iter_mut().filter(|s| &s.ip == address) {
-                entry.accept_textures = setting;
-                found = true;
-            }
-            // Not among the shown entries: the hidden ones (a Direct Connection's).
-            if !found {
-                for entry in hidden.iter_mut().filter(|s| &s.ip == address) {
-                    entry.accept_textures = setting;
-                }
-            }
-            if let Err(e) = servers::save_all(&file, &list, &hidden) {
+            if let Err(e) = servers::update_pack_preference(&file, address, setting) {
                 log::warn!("Horizon: could not save {}: {e}", file.display());
             }
         }
@@ -418,13 +419,6 @@ impl Game<'_> {
         }
         self.drive_pack_reload();
         self.drive_pack_browser();
-        // One reload at a time: the player's own waits under its overlay
-        // before the server's packs can ask for theirs (`ServerPacks` keeps
-        // its own reload from overlapping).
-        let selection_reloading = self
-            .pack_reload
-            .as_ref()
-            .is_some_and(|r| r.kind() == ReloadKind::Selection);
         let finished = self
             .server_packs
             .queue
@@ -434,7 +428,15 @@ impl Game<'_> {
         for batch in finished {
             self.server_packs.packs.downloaded(batch);
         }
-        while !selection_reloading && self.server_packs.packs.wants_tick() {
+        // The staging worker can finish before the renderer and integrated
+        // server commit. Do not let another reload enter during that gap.
+        while !self.content_reload_busy()
+            && !self
+                .pack_reload
+                .as_ref()
+                .is_some_and(|reload| reload.kind() == ReloadKind::Selection)
+            && self.server_packs.packs.wants_tick()
+        {
             let tick = self.server_packs.packs.tick();
             if !tick.download.is_empty() {
                 self.start_pack_downloads(tick.download);
@@ -498,7 +500,7 @@ impl Game<'_> {
             self.finish_pack_reload(false);
             return;
         };
-        self.server_packs.active = server;
+        self.server_packs.pending_active = Some(server);
         if let Err(e) = self.spawn_pack_reload(ReloadKind::Server) {
             log::error!("Horizon: could not start the pack reload worker: {e}");
             self.finish_pack_reload(false);
@@ -506,6 +508,14 @@ impl Game<'_> {
     }
     /// `ServerPacks::reloaded` and the recovery reload it can ask for.
     pub(super) fn finish_pack_reload(&mut self, ok: bool) {
+        if self.server_packs.publish_active(ok) {
+            // The newly applied pack may change whether leaf culling is safe.
+            let leaf_culling = self.effective_leaf_culling();
+            if self.streaming.leaf_culling != leaf_culling {
+                self.streaming.leaf_culling = leaf_culling;
+                self.all_sections_changed();
+            }
+        }
         if let Some(recovery) = self.server_packs.packs.reloaded(ok) {
             self.start_pack_reload(&recovery);
         }
@@ -628,6 +638,37 @@ mod tests {
     use super::*;
     use download::Progress::*;
 
+    #[test]
+    fn a_failed_server_reload_keeps_the_pack_that_is_still_rendering() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pack.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("pack.mcmeta", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        serde_json::to_writer(
+            &mut zip,
+            &serde_json::json!({"pack":{"description":"Fixture","pack_format":packs::RESOURCE_FORMAT.0}}),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let pack = packs::server_pack(1, &path).unwrap();
+        let mut state = ServerPackState {
+            pending_active: Some(vec![pack]),
+            ..Default::default()
+        };
+
+        assert!(state.active.is_empty());
+        assert!(state.publish_active(true));
+        let id = state.active[0].id.clone();
+        state.pending_active = Some(Vec::new());
+        assert!(!state.publish_active(false));
+        assert_eq!(state.active[0].id, id);
+        assert!(state.pending_active.is_none());
+        state.pending_active = Some(Vec::new());
+        assert!(state.publish_active(true));
+        assert!(state.active.is_empty());
+    }
+
     fn notifier(total: usize, events: &[download::Progress]) -> PackNotifier {
         let (send, receive) = std::sync::mpsc::channel();
         for event in events {
@@ -659,6 +700,23 @@ mod tests {
             texts(&n).1.unwrap()["with"],
             serde_json::json!([{"text": "1.3 KB"}])
         );
+    }
+
+    #[test]
+    fn a_new_request_clears_the_previous_packs_progress() {
+        let n = notifier(
+            2,
+            &[
+                RequestStart,
+                DownloadStart(Some(400)),
+                Bytes(400),
+                RequestFinished(true),
+                RequestStart,
+            ],
+        );
+        let (title, message) = texts(&n);
+        assert_eq!(title["with"], serde_json::json!([2, 2]));
+        assert_eq!(message, None);
     }
 
     #[test]

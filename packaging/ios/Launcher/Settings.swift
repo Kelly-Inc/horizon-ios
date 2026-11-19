@@ -141,13 +141,13 @@ struct SettingsPage: View {
             TouchControlsSettings()
             SectionHeader(title: "Game files")
             GameFilesCard(
-                download: download, missing: !GameFolder.hasGameFiles || link.repairingGameFiles,
-                repairing: link.repairingGameFiles
+                download: download, missing: !link.hasGameFiles || link.needsGameFiles,
+                repairing: link.repairingGameFiles, retryLoader: link.retryInstalledFiles, offersFileImport: true
             )
 
             SectionHeader(title: "About")
             SecondaryButton(title: "What's New", icon: "sparkles") { showingNews = true }
-            About(version: link.version)
+            About(version: link.version, hasGameFiles: link.hasGameFiles, repairingGameFiles: link.repairingGameFiles)
             LogsSettings()
         }
         .sheet(isPresented: $showingNews) {
@@ -163,14 +163,20 @@ struct SettingsPage: View {
 
 private struct About: View {
     let version: String
+    let hasGameFiles: Bool
+    let repairingGameFiles: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             line("Horizon for iPhone and iPad", Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
             line("Build", Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "")
             line("Minecraft: Java Edition", version)
-            line("Game files", GameFolder.hasGameFiles ? "Installed" : "Not installed")
-            Link(destination: URL(string: "https://github.com/heyskylo/horizon-ios")!) {
+            if repairingGameFiles {
+                line("Game files", "Needs repair")
+            } else {
+                line("Game files", hasGameFiles ? "Installed" : "Not installed")
+            }
+            Link(destination: URL(string: "https://github.com/Kelly-Inc/horizon-ios")!) {
                 Label("Source code on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
                     .font(Theme.sans(13, .semiBold)).foregroundStyle(Theme.accentText)
             }

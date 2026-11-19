@@ -70,6 +70,12 @@ fn quick_play_server(saves: &std::path::Path, address: &str, name: String) -> Pe
 }
 
 impl StartupMenu {
+    pub(super) fn worlds_changed(&mut self) {
+        if let Some(title) = self.title.as_mut() {
+            title.worlds_changed();
+        }
+    }
+
     pub fn new(options: &Options, pack_error: Option<&str>) -> Result<Self> {
         let pending = if let Some(address) = &options.server {
             Some(quick_play_server(
@@ -87,6 +93,7 @@ impl StartupMenu {
                     seed: Some(options.seed),
                     creative: options.creative,
                     create: None,
+                    world_folder: WorldFolder::OpenOrCreate,
                     from_title: false,
                 })
         };
@@ -259,6 +266,7 @@ impl StartupMenu {
                 seed: None,
                 creative: false,
                 create: None,
+                world_folder: WorldFolder::Existing,
                 from_title: true,
             },
             Action::Create {
@@ -273,6 +281,7 @@ impl StartupMenu {
                 seed,
                 creative,
                 create: Some(Box::new(options)),
+                world_folder: WorldFolder::New,
                 from_title: true,
             },
             Action::Connect {
@@ -292,23 +301,53 @@ impl StartupMenu {
         self.perf.world_opening();
     }
 
-    fn shortcut(&mut self, event: &KeyEvent) -> Option<clipboard::EditShortcut> {
-        let edit = if cfg!(any(target_os = "macos", target_os = "ios")) {
+    fn edit_modifier(&self) -> bool {
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
             self.modifiers.super_key()
         } else {
             self.modifiers.control_key()
-        };
+        }
+    }
+
+    fn types_text(&self) -> bool {
+        clipboard::types_text(
+            self.edit_modifier(),
+            self.modifiers.alt_key(),
+            clipboard::ALTGR_IS_CTRL_ALT,
+        )
+    }
+
+    fn shortcut(&self, event: &KeyEvent) -> Option<clipboard::EditShortcut> {
         clipboard::edit_shortcut(
             clipboard::shortcut_letter(&event.logical_key, event.physical_key),
-            edit,
+            self.edit_modifier(),
             self.modifiers.shift_key(),
             self.modifiers.alt_key(),
         )
     }
 
+    fn title_tab_shortcut(&mut self, key: KeyCode) -> bool {
+        if self.options_open || self.pending.is_some() || self.win.is_some() {
+            return false;
+        }
+        let edit = self.edit_modifier();
+        let shift = self.modifiers.shift_key();
+        self.title
+            .as_mut()
+            .and_then(|title| title.tab_bar_key(key, edit, shift))
+            .is_some()
+    }
+
     /// `Screen.keyPressed` on the title screens: the action a key starts (Enter confirms, see `confirm_key` in title.rs).
     fn title_key(&mut self, event: &KeyEvent, viewport: (f32, f32)) -> Action {
         let shortcut = self.shortcut(event);
+        if shortcut.is_none()
+            && let PhysicalKey::Code(key) = event.physical_key
+            && self.title_tab_shortcut(key)
+        {
+            return Action::None;
+        }
+        let typed = event.text.as_deref().filter(|_| self.types_text());
         let Some(title) = &mut self.title else {
             return Action::None;
         };
@@ -324,21 +363,6 @@ impl StartupMenu {
             {
                 title.search_changed();
             }
-            return Action::None;
-        }
-        // `TabNavigationBar.keyPressed` comes before the open tab's own
-        // widgets: Ctrl plus a digit or Tab picks a tab instead of reaching
-        // them.
-        let ctrl = if cfg!(target_os = "macos") {
-            self.modifiers.super_key()
-        } else {
-            self.modifiers.control_key()
-        };
-        if let PhysicalKey::Code(key) = event.physical_key
-            && title
-                .tab_bar_key(key, ctrl, self.modifiers.shift_key())
-                .is_some()
-        {
             return Action::None;
         }
         match event.physical_key {
@@ -380,6 +404,10 @@ impl StartupMenu {
                 title.arrow_key(key, viewport, self.modifiers.shift_key());
             }
             _ => {
+                let backspace = event.physical_key == PhysicalKey::Code(KeyCode::Backspace);
+                if !backspace && typed.is_none() {
+                    return Action::None;
+                }
                 let cleared = !title.has_caret_field()
                     && title
                         .focused_field()
@@ -387,11 +415,11 @@ impl StartupMenu {
                 if cleared {
                     title.search_changed();
                 }
-                if event.physical_key == PhysicalKey::Code(KeyCode::Backspace) {
+                if backspace {
                     if !cleared {
                         title.backspace();
                     }
-                } else if let Some(text) = &event.text {
+                } else if let Some(text) = typed {
                     title.type_text(text);
                 }
             }
@@ -533,6 +561,19 @@ impl Loading {
             self.settings.save(&Game::options_path());
         }
     }
+    fn refresh_menu_video_modes(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let monitor = window.current_monitor().or_else(|| window.primary_monitor());
+        if let Some(modes) = self.video_modes.refresh_monitor(monitor)
+            && self.settings.video_modes != modes
+        {
+            self.settings.video_modes = modes;
+            self.menu.options.layout_changed();
+        }
+    }
+
     pub(super) fn apply_menu_settings(&mut self) {
         if let Some(renderer) = &mut self.renderer {
             renderer.gamma = self.settings.gamma;
@@ -544,16 +585,8 @@ impl Loading {
             gui.atlas.font.uniform = self.settings.force_unicode;
             gui.atlas.font.japanese = self.settings.japanese_glyphs;
         }
+        self.refresh_menu_video_modes();
         if let Some(window) = self.window.clone() {
-            let monitor = window
-                .current_monitor()
-                .or_else(|| window.primary_monitor());
-            if let Some(modes) = self
-                .video_modes
-                .refresh(monitor, horizon_client::window::monitor_video_modes)
-            {
-                self.settings.video_modes = modes;
-            }
             let preferred = self
                 .settings
                 .file
@@ -565,7 +598,7 @@ impl Loading {
                 self.settings.fullscreen,
                 self.settings.file.bool("exclusiveFullscreen"),
                 preferred,
-                false,
+                self.menu.options_open && self.menu.options.video_open(),
             );
         }
         self.update_menu_cursor();
@@ -731,23 +764,38 @@ impl Loading {
                     self.settings.shader_packs =
                         horizon_client::shader_pack_list::scan(&Game::shader_packs_dir());
                 }
-                Event::ShaderPack => self.save_menu_settings(),
+                Event::ShaderPack => {
+                    self.save_menu_settings();
+                    super::shader_packs::retry_selected_shader(&self.settings);
+                }
                 Event::OpenShaderOptions => {
-                    self.settings.shader_options = super::shader_packs::read_shader_options(
-                        &self.settings.horizon.shader_pack,
-                        &self.settings.language,
-                        &horizon_shaders::Macros::standard(),
-                    );
+                    let name = &self.settings.horizon.shader_pack;
+                    if !self
+                        .settings
+                        .shader_options
+                        .as_ref()
+                        .is_some_and(|options| options.pack == *name && options.changed)
+                    {
+                        self.settings.shader_options = super::shader_packs::read_shader_options(
+                            name,
+                            &self.settings.language,
+                            &horizon_shaders::Macros::standard(),
+                        );
+                    }
                 }
                 Event::ShaderOptions => {
-                    if let Some(options) = self.settings.shader_options.take() {
-                        super::shader_packs::write_shader_options(&options);
-                    }
+                    super::shader_packs::persist_shader_options(
+                        &mut self.settings,
+                        &mut self.menu.options,
+                    );
                 }
-                Event::NativePackOptions(i) => {
-                    if let Some(pack) = self.settings.shader_packs.get(i) {
-                        pack.save_values(&Game::shader_packs_dir());
-                    }
+                Event::NativePackOptions(i, previous) => {
+                    super::shader_packs::persist_native_shader_options(
+                        &mut self.settings,
+                        &mut self.menu.options,
+                        i,
+                        previous,
+                    );
                 }
                 Event::OpenShaderPackFolder => {
                     let dir = Game::shader_packs_dir();
@@ -815,11 +863,7 @@ impl Loading {
             return;
         }
         let menu = &mut self.menu;
-        let control_with_quirk = if cfg!(target_os = "macos") {
-            menu.modifiers.super_key()
-        } else {
-            menu.modifiers.control_key()
-        };
+        let control_with_quirk = menu.edit_modifier();
         let edit_box_focused = if menu.options_open {
             menu.options.typing()
         } else if menu.win.is_some() || menu.pending.is_some() {
@@ -979,6 +1023,10 @@ impl Loading {
         {
             return false;
         }
+        // Give the title's tab bar first refusal on modified Tab.
+        if self.menu.title_tab_shortcut(key) {
+            return true;
+        }
         let Some(nav) = key_focus::nav_of(key, self.menu.modifiers.shift_key()) else {
             return false;
         };
@@ -1131,6 +1179,18 @@ impl Loading {
         self.menu.key_synthetic = was;
     }
 
+    /// A resize or focus loss ends the active drag without clicking the new layout.
+    pub(in crate::game) fn finish_menu_drags(&mut self) {
+        self.menu.dragging = false;
+        if let Some(title) = &mut self.menu.title {
+            title.release();
+            title.release_field();
+        }
+        let mut events = self.menu.options.release();
+        events.retain(|event| !matches!(event, Event::ButtonClick));
+        self.menu_option_events(events);
+    }
+
     pub(super) fn menu_event(
         &mut self,
         event_loop: &dyn EventLoopCtl,
@@ -1185,6 +1245,7 @@ impl Loading {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                self.finish_menu_drags();
                 // On AirPlay the surface is the display's, sized by it.
                 if let Some(r) = &mut self.renderer
                     && !r.targeted()
@@ -1214,13 +1275,7 @@ impl Loading {
             WindowEvent::Focused(false) => {
                 self.menu.modifiers = ModifiersState::empty();
                 self.menu.physical_keys.clear();
-                self.menu.dragging = false;
-                if let Some(title) = &mut self.menu.title {
-                    title.release();
-                    title.release_field();
-                }
-                let events = self.menu.options.release();
-                self.menu_option_events(events);
+                self.finish_menu_drags();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && self.menu.pending.is_some() =>
@@ -1371,12 +1426,8 @@ impl Loading {
                     });
                     if !handled && let PhysicalKey::Code(key) = event.physical_key {
                         self.menu.options.modifiers = glfw_modifiers(self.menu.modifiers);
-                        let events = self.menu.options.key(
-                            &mut self.settings,
-                            atlas,
-                            key,
-                            event.text.as_deref(),
-                        );
+                        let text = event.text.as_deref().filter(|_| self.menu.types_text());
+                        let events = self.menu.options.key(&mut self.settings, atlas, key, text);
                         self.menu_option_events(events);
                     }
                 } else {
@@ -1395,6 +1446,9 @@ impl Loading {
             // The one screen a game with no files can draw, in the one font it has without them.
             self.draw_import(batch);
             return;
+        }
+        if self.menu.options_open && self.menu.options.video_open() {
+            self.refresh_menu_video_modes();
         }
         let logs = horizon_client::logging::recent_lines();
         let Some(gui) = &self.gui else {
@@ -1596,7 +1650,7 @@ mod tests {
         Loading {
             window: None,
             renderer: None,
-            airplay: None,
+            airplay: Default::default(),
             boot: horizon_client::hud::HudAtlas::boot(),
             gui: None,
             settings: Settings::default(),
@@ -1618,9 +1672,64 @@ mod tests {
             title_drawn: false,
             menu: StartupMenu::default(),
             import: None,
+            file_download_attempted: false,
             brand: Default::default(),
             error: None,
         }
+    }
+
+    #[test]
+    fn file_download_start_failure_does_not_consume_the_startup_attempt() {
+        let scratch = tempfile::tempdir().unwrap();
+        let blocked_home = scratch.path().join("file");
+        std::fs::write(&blocked_home, b"cannot be a directory").unwrap();
+        let (_, receiver) = std::sync::mpsc::channel();
+        let mut loader = loading(receiver);
+        let url = "http://127.0.0.1:1/game.zip";
+
+        for _ in 0..2 {
+            let error = loader
+                .start_automatic_game_files(url.into(), &blocked_home)
+                .err()
+                .expect("a regular file cannot be the download folder");
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(!loader.file_download_attempted);
+        }
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn recovery_loads_the_installed_root_instead_of_the_rejected_root() {
+        if super::super::native_entity_refs::tests::run_fresh_cases(
+            "game::startup_menu::tests::recovery_loads_the_installed_root_instead_of_the_rejected_root",
+            "HORIZON_IMPORT_RECOVERY_ROOT_CHILD",
+            &["import"],
+        ) {
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let rejected = scratch.path().join("bundled-resources");
+        let installed = scratch.path().join("resources");
+        for root in [&rejected, &installed] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(root.join("horizon-resources.json"), b"fixture").unwrap();
+        }
+        let (_, receiver) = std::sync::mpsc::channel();
+        let mut loading = loading(receiver);
+        loading.options = Options::parse(
+            [
+                "--resources".into(),
+                rejected.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        loading.vanilla_root = rejected;
+
+        loading.files_arrived(installed.clone()).unwrap();
+        assert_eq!(loading.options.as_ref().unwrap().resources, installed);
+        assert_eq!(loading.vanilla_root, installed);
+        loading.handle.take().unwrap().join().unwrap();
     }
 
     #[test]
@@ -1655,6 +1764,7 @@ mod tests {
                     pending: Some(PendingWorldEntry::Local {
                         folder: "test".into(),
                         from_title: true,
+                        world_folder: WorldFolder::New,
                         name: None,
                         seed: Some(1),
                         creative: true,

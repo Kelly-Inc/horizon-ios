@@ -1202,7 +1202,11 @@ impl Game<'_> {
         let Some(Some(edit)) = open.focus.and_then(|i| open.fields.get_mut(i)) else {
             return;
         };
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let multiline = matches!(edit, Field::Multi(_));
+        let text: String = text
+            .chars()
+            .filter(|&c| !c.is_control() || (multiline && c == '\n'))
+            .collect();
         if !text.is_empty() {
             edit.insert_text(&self.gui.atlas.font, &text);
         }

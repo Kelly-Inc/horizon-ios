@@ -23,9 +23,8 @@ pub(crate) fn slider_unsnapped(opt: Opt, held: bool, moved: Instant) -> bool {
 /// `Options.unlogMouse`: the stored sensitivity as its hundredth-log step,
 /// -200..=100, which the `IntRange(-200, 100)` slider runs over (0.01 to 10.0).
 pub(crate) fn step(value: f32) -> f32 {
-    (value.max(1.0e-6).log10() * 100.0)
-        .floor()
-        .clamp(-200.0, 100.0)
+    // Use the persisted step calculation so applying a slider never moves its thumb.
+    crate::options_file::wheel_step(f64::from(value.max(1.0e-6))).clamp(-200.0, 100.0) as f32
 }
 /// `IntRange(-200, 100).toSliderValue`: the step over the slider's span.
 pub(crate) fn kind(value: f32) -> Kind {
@@ -35,7 +34,7 @@ pub(crate) fn kind(value: f32) -> Kind {
 /// floor(map(v, 0, 1, -200, 101)), the last step clamped, as 10^(i/100).
 pub(crate) fn from_slider(v: f32) -> f32 {
     let i = (v.clamp(0.0, 1.0) * 301.0).floor() - 200.0;
-    10.0_f32.powf(i.clamp(-200.0, 100.0) / 100.0)
+    crate::options_file::log_mouse(i.clamp(-200.0, 100.0) as i32) as f32
 }
 
 #[cfg(test)]
@@ -61,6 +60,11 @@ mod tests {
         assert!((from_slider(0.0) - 0.01).abs() < 1e-6);
         assert!((from_slider(1.0) - 10.0).abs() < 1e-4);
         assert!((from_slider(1.0 / 3.0) - 0.1).abs() < 1e-5);
+        for selected in -200..=100 {
+            let position = (selected as f32 + 200.5) / 301.0;
+            let snapped = (selected as f32 + 200.0) / 300.0;
+            assert_eq!(wheel_pos(from_slider(position)), snapped);
+        }
         // The value setter goes through the same mapping.
         let mut s = Settings::default();
         set_slider(Opt::WheelSensitivity, &mut s, 2.0 / 3.0);

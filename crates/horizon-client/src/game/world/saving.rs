@@ -1,6 +1,6 @@
 //! The save screen freezes simulation, but keeps pumping window events while
 //! snapshots are prepared in small batches and the region workers drain.
-use super::{Game, loading_frame};
+use super::{Dim, Game, loading_frame};
 use horizon_client::{Result, hud::HudBatch};
 use std::{
     collections::{HashSet, VecDeque},
@@ -12,6 +12,9 @@ pub(super) struct ClosingSave {
     close: bool,
     reply: Option<std::sync::mpsc::Sender<String>>,
     started: Instant,
+    queued_chunks: Vec<(i32, i32)>,
+    retried_writes: bool,
+    parked: Option<(Dim, VecDeque<Dim>)>,
     stage: Stage,
 }
 enum Stage {
@@ -51,9 +54,15 @@ impl Game<'_> {
                 close: true,
                 reply: None,
                 started: Instant::now(),
+                queued_chunks: Vec::new(),
+                retried_writes: false,
+                parked: None,
                 stage: Stage::Quit,
             });
             return Ok(());
+        }
+        if self.integrated.is_none() && self.remote.is_none() {
+            self.admit_level_save()?;
         }
         if self.integrated.is_some() {
             // Minecraft.disconnect: the client logs out before its server halts.
@@ -70,6 +79,9 @@ impl Game<'_> {
                 close: true,
                 reply: None,
                 started: Instant::now(),
+                queued_chunks: Vec::new(),
+                retried_writes: false,
+                parked: None,
                 stage: Stage::Server,
             });
         } else if self.remote.is_some() {
@@ -86,6 +98,9 @@ impl Game<'_> {
                 close: true,
                 reply: None,
                 started: Instant::now(),
+                queued_chunks: Vec::new(),
+                retried_writes: false,
+                parked: None,
                 stage: Stage::Quit,
             });
         } else {
@@ -98,6 +113,9 @@ impl Game<'_> {
                 close: true,
                 reply: None,
                 started: Instant::now(),
+                queued_chunks: Vec::new(),
+                retried_writes: false,
+                parked: Some((self.dim, self.levels.parked_dims().into())),
                 stage: Stage::Generation,
             });
         }
@@ -115,10 +133,9 @@ impl Game<'_> {
         if self.pending_save.is_some() {
             return Err("a world save is already in progress".into());
         }
+        self.admit_level_save()?;
         if all {
-            self.world
-                .modified
-                .extend(self.world.chunks.keys().copied());
+            self.mark_all_resident_chunks_for_save();
         }
         self.keys.clear();
         self.physical_keys.clear();
@@ -129,6 +146,9 @@ impl Game<'_> {
             close: false,
             reply: Some(reply),
             started: Instant::now(),
+            queued_chunks: Vec::new(),
+            retried_writes: false,
+            parked: Some((self.dim, self.levels.parked_dims().into())),
             stage: Stage::Generation,
         });
         Ok(())
@@ -141,6 +161,9 @@ impl Game<'_> {
             return Ok(false);
         };
         let result = (|| -> Result<bool> {
+            if !matches!(&save.stage, Stage::Quit | Stage::Server) {
+                self.admit_level_save()?;
+            }
             match &mut save.stage {
                 Stage::Quit => Ok(true),
                 Stage::Server => {
@@ -196,7 +219,7 @@ impl Game<'_> {
                             self.pack.assets.registry,
                             world_biomes!(self),
                         )?;
-                        self.world.modified.remove(&key);
+                        save.queued_chunks.push(key);
                         keys.pop_front();
                         if started.elapsed() >= SNAPSHOT_BUDGET {
                             break;
@@ -221,17 +244,53 @@ impl Game<'_> {
                     }
                     if keys.is_empty() {
                         self.prune_entity_memory();
-                        self.save_raids();
+                        self.save_border()?;
+                        self.save_raids()?;
                         self.save.save_attachments(&self.world.attachments)?;
                         self.save_chunk_tickets()?;
-                        self.save_game_metadata()?;
+                        if save
+                            .parked
+                            .as_ref()
+                            .is_none_or(|(origin, _)| self.dim == *origin)
+                        {
+                            self.save_game_metadata()?;
+                        }
                         save.stage = Stage::Writes;
                     }
                     Ok(false)
                 }
                 Stage::Writes => {
                     let players = self.finish_player_autosaves(false)?;
-                    Ok(self.save.writes_finished()? && players)
+                    match self.save.writes_finished() {
+                        Err(_) if !save.retried_writes && self.save.retry_failed_writes()? => {
+                            save.retried_writes = true;
+                            return Ok(false);
+                        }
+                        result => {
+                            if !result? || !players {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    for key in save.queued_chunks.drain(..) {
+                        self.world.modified.remove(&key);
+                    }
+                    if let Some((origin, remaining)) = &mut save.parked {
+                        if let Some(next) = remaining.pop_front() {
+                            self.enter_level(next)?;
+                            if save.close {
+                                self.streaming.abort_generation();
+                            }
+                            save.stage = Stage::Generation;
+                            save.started = Instant::now();
+                            save.retried_writes = false;
+                            return Ok(false);
+                        }
+                        if self.dim != *origin {
+                            self.enter_level(*origin)?;
+                        }
+                    }
+                    Ok(true)
                 }
             }
         })();
@@ -259,17 +318,33 @@ impl Game<'_> {
                     Ok(false)
                 }
             }
-            other => {
-                if let Err(error) = &other
-                    && let Some(reply) = save.reply.take()
+            Err(mut error) => {
+                if let Some((origin, _)) = &save.parked
+                    && self.dim != *origin
+                    && let Err(restore) = self.enter_level(*origin)
                 {
+                    error = format!("{error}; could not restore the original dimension: {restore}")
+                        .into();
+                    save.close = true;
+                }
+                if let Some(reply) = save.reply.take() {
                     let _ =
                         reply.send(serde_json::json!({ "error": error.to_string() }).to_string());
                 }
-                // Keep ownership (and the lock) on errors too. Native shutdown
-                // sees the same durable-write failure instead of declaring success.
+                if !save.close && !save.quit {
+                    log::warn!("Horizon: control save failed: {error}");
+                    self.clock.reset();
+                    self.previous = Instant::now();
+                    return Ok(false);
+                }
+                // Keep ownership (and the lock) while shutdown reports the
+                // durable-write failure.
                 self.pending_save = Some(save);
-                other
+                Err(error)
+            }
+            Ok(false) => {
+                self.pending_save = Some(save);
+                Ok(false)
             }
         }
     }
@@ -335,6 +410,14 @@ impl Game<'_> {
             self.world_icon = None;
             return;
         }
+        if self
+            .ui
+            .screenshot_writes
+            .iter()
+            .any(|write| write.targets(&icon.path))
+        {
+            return;
+        }
         // takeAutoScreenshot only saves with every loaded section rendered, or
         // the icon would picture the holes the streamer has not filled yet.
         if self.streaming.pending() != 0
@@ -352,16 +435,15 @@ impl Game<'_> {
         if renderer.drawn_sections <= 10 {
             return;
         }
-        if renderer.screenshot.is_some() {
-            // F2's or an agent's screenshot owns the frame this time; ours
-            // comes around again with the next attempt.
+        if self.pending_screenshot.is_some() || renderer.screenshot_busy() {
+            // Wait for the queued frame or readback to finish before trying again.
             return;
         }
         let path = icon.path.clone();
         if let Some(icon) = self.world_icon.as_mut() {
             icon.last_attempt = Some(Instant::now());
         }
-        renderer.screenshot = Some(horizon_client::gfx::ScreenshotRequest {
+        renderer.request_screenshot(horizon_client::gfx::ScreenshotRequest {
             path,
             size: Some([64, 64]),
             scaled: false,
@@ -374,7 +456,7 @@ impl Game<'_> {
     /// Save the level in place: its changed chunks, its entities and its raids.
     pub(super) fn save_level(&mut self, wait: bool) -> Result<()> {
         self.admit_level_save()?;
-        self.save_border();
+        self.save_border()?;
         self.save_chunk_tickets()?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -393,21 +475,34 @@ impl Game<'_> {
         }
         let keys: Vec<_> = self.world.modified.iter().copied().collect();
         self.save.save_attachments(&self.world.attachments)?;
-        for key in &keys {
-            self.world.modified.remove(key);
-        }
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
         self.native_full_chunk_snapshots(&chunks);
         self.save
             .save_later(&chunks, self.pack.assets.registry, world_biomes!(self))?;
+        // Keep the dirty marks if the writer refuses these snapshots.
+        for key in &keys {
+            self.world.modified.remove(key);
+        }
         // Prepare entities while the chunk writer runs, then use one barrier.
+        let finished = self.save_entities(false).and_then(|()| {
+            let raids = self.save_raids();
+            // Retry retained snapshots once, including edits from unloaded chunks.
+            if wait && let Err(error) = self.save.flush() {
+                if !self.save.retry_failed_writes()? {
+                    return Err(error);
+                }
+                self.save.flush()?;
+            }
+            raids
+        });
+        if let Err(error) = finished {
+            // Restore the submitted keys without clearing any edits made
+            // after the snapshots were taken.
+            self.world.modified.extend(keys);
+            return Err(error);
+        }
         if !wait {
             self.world.modified.autosaved(&keys, Instant::now());
-        }
-        self.save_entities(false)?;
-        self.save_raids();
-        if wait {
-            self.save.flush()?;
         }
         if mod_api::__private::listened(mod_api::HookId::LevelSave) {
             self.native_level_save(self.dim.id());

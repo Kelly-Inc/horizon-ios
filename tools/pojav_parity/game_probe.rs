@@ -1,5 +1,5 @@
 //! Test endpoints for the production touch-to-game adapter, not an alternative
-//! implementation. The driver inserts the current Game::touch_act and key_of.
+//! implementation. The driver inserts the current touch dispatch and mapping methods.
 use crate::touch::{Control, Out};
 use serde_json::{Value, json};
 mod horizon_ios_launcher {pub fn native_gestures_available()->bool{true}}
@@ -42,13 +42,16 @@ impl Game {
     fn shared_default_acts(&self,_:MouseButton,_:Option<&str>)->bool{true}
     fn touch_key_held(&self,_:KeyCode)->bool{false}
     fn debug_key(&mut self,_:KeyCode,_:horizon_client::debug_keys::KeyAction)->bool{false}
+    fn touch_cancel_debug_modifier(&mut self,_:KeyCode) {}
     fn touch_holds_mouse_mapping(&self,_:MouseButton)->bool{false}
 GAME_TOUCH_RAW_KEY
+GAME_TOUCH_CANCEL_KEY
+GAME_TOUCH_MAP_RAW_KEY
 GAME_TOUCH_RAW_BUTTON
 GAME_TOUCH_ACT
-    pub fn dispatch(&mut self,out:Vec<Out>,scale:f32)->Vec<Value> {
+    pub fn dispatch(&mut self,out:Vec<Out>,scale:f32,cancelled:bool)->Vec<Value> {
         self.events.clear();self.mouse.motion.clear();
-        self.touch_act(out,scale).unwrap();
+        self.touch_act(out,scale,cancelled).unwrap();
         self.events.append(&mut self.mouse.motion);
         std::mem::take(&mut self.events)
     }

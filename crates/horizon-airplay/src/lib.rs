@@ -124,12 +124,94 @@ pub fn screen(playing: bool, split: bool) -> Option<Screen> {
     }
 }
 
-/// Update the covers after the primary renderer has attempted to attach.
-pub fn rendering(on_display: bool) {
+/// Whether an AirPlay scene is connected, independent of its renderer.
+pub fn display_connected() -> bool {
     #[cfg(target_os = "ios")]
-    ios::rendering(on_display);
+    return ios::display_connected();
     #[cfg(not(target_os = "ios"))]
-    let _ = on_display;
+    false
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presentation {
+    Detached,
+    WaitingForFrame,
+    Presented,
+}
+
+impl Presentation {
+    pub fn for_frame(attached: bool, presented: bool) -> Self {
+        if !attached {
+            Self::Detached
+        } else if presented {
+            Self::Presented
+        } else {
+            Self::WaitingForFrame
+        }
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn drawable_pixels(width: f64, height: f64, scale: f64) -> Option<(u32, u32)> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let pixels = (width * scale, height * scale);
+    let valid = |side: f64| (1.0..=f64::from(u32::MAX)).contains(&side.round());
+    (valid(pixels.0) && valid(pixels.1)).then(|| (pixels.0.round() as u32, pixels.1.round() as u32))
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn split_heights(height: f64, scale: f64) -> (f64, f64) {
+    let Some((_, pixels)) = drawable_pixels(height, height, scale) else {
+        return (0.0, 0.0);
+    };
+    // Both views share one pixel-aligned seam, even when the display has an odd height.
+    let top = f64::from(pixels / 2) / scale;
+    (top, height - top)
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::Presentation;
+
+    #[test]
+    fn external_view_requires_drawable_dimensions() {
+        assert_eq!(
+            super::drawable_pixels(960.0, 540.0, 2.0),
+            Some((1920, 1080))
+        );
+        assert_eq!(super::drawable_pixels(0.0, 540.0, 2.0), None);
+        assert_eq!(super::drawable_pixels(960.0, 0.1, 2.0), None);
+        assert_eq!(super::drawable_pixels(f64::INFINITY, 540.0, 2.0), None);
+    }
+
+    #[test]
+    fn split_layout_fills_the_view_when_dimensions_change() {
+        assert_eq!(super::split_heights(0.0, 2.0), (0.0, 0.0));
+        assert_eq!(super::split_heights(720.0, 2.0), (360.0, 360.0));
+        let (top, bottom) = super::split_heights(540.5, 2.0);
+        assert_eq!((top, bottom), (270.0, 270.5));
+        assert_eq!(top + bottom, 540.5);
+    }
+
+    #[test]
+    fn attaching_is_not_yet_presenting_and_a_phone_frame_does_not_count() {
+        assert_eq!(
+            Presentation::for_frame(true, false),
+            Presentation::WaitingForFrame
+        );
+        assert_eq!(Presentation::for_frame(true, true), Presentation::Presented);
+        assert_eq!(Presentation::for_frame(false, true), Presentation::Detached);
+    }
+}
+
+/// Update the covers after evaluating the primary renderer's target and frame.
+pub fn rendering(presentation: Presentation) {
+    #[cfg(target_os = "ios")]
+    ios::rendering(presentation);
+    #[cfg(not(target_os = "ios"))]
+    let _ = presentation;
 }
 
 /// The second player's view: the bottom half, while [`screen`] splits the display.
@@ -160,13 +242,13 @@ pub fn phone_controls(buttons: Option<&[Button]>) {
 
 #[cfg(target_os = "ios")]
 mod ios {
-    use super::{Button, MainThreadRelease, Screen};
+    use super::{Button, MainThreadRelease, Presentation, Screen};
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly, Message, define_class};
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
     use objc2_ui_kit::{
-        NSTextAlignment, UIApplication, UIColor, UIFont, UILabel, UIScene,
+        NSTextAlignment, UIApplication, UIColor, UIFont, UILabel, UIScene, UISceneActivationState,
         UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIView, UIViewAutoresizing,
         UIViewController, UIWindow, UIWindowScene, UIWindowSceneDelegate,
         UIWindowSceneSessionRoleApplication,
@@ -209,7 +291,8 @@ mod ios {
         cover: Option<Cover>,
         idle: Retained<UILabel>,
         playing: bool,
-        rendering: bool,
+        target: Option<(u64, (u32, u32))>,
+        presentation: Presentation,
     }
 
     thread_local! {
@@ -286,7 +369,8 @@ mod ios {
             cover: None,
             idle,
             playing: false,
-            rendering: false,
+            target: None,
+            presentation: Presentation::Detached,
         });
     }
 
@@ -298,8 +382,7 @@ mod ios {
 
     fn install_state(state: State) {
         let previous = STATE.with(|slot| slot.borrow_mut().replace(state));
-        // A new scene can connect before the old scene's disconnect arrives.
-        // The phone window still retains the old cover until it is removed.
+        // The old window can outlive the external scene.
         remove_cover(previous);
     }
 
@@ -317,18 +400,31 @@ mod ios {
         remove_cover(disconnected);
     }
 
-    /// The phone's own window: the one in the scene with the application role.
+    /// Find the visible window in the application scene, preferring the active key window.
     fn phone_window(mtm: MainThreadMarker) -> Option<Retained<UIWindow>> {
         let app = UIApplication::sharedApplication(mtm);
         // SAFETY: a UIKit constant, read on the main thread.
         let role = unsafe { UIWindowSceneSessionRoleApplication };
-        app.connectedScenes().iter().find_map(|scene| {
-            let scene = scene.downcast::<UIWindowScene>().ok()?;
+        let mut best = None;
+        for scene in app.connectedScenes().iter() {
+            let Ok(scene) = scene.downcast::<UIWindowScene>() else {
+                continue;
+            };
             if *scene.session().role() != *role {
-                return None;
+                continue;
             }
-            scene.windows().firstObject()
-        })
+            let active = scene.activationState() == UISceneActivationState::ForegroundActive;
+            for window in scene.windows().iter() {
+                if window.isHidden() {
+                    continue;
+                }
+                let priority = (active, window.isKeyWindow());
+                if best.as_ref().is_none_or(|(current, _)| priority > *current) {
+                    best = Some((priority, window));
+                }
+            }
+        }
+        best.map(|(_, window)| window)
     }
 
     fn label(mtm: MainThreadMarker, frame: CGRect, text: &str, size: f64) -> Retained<UILabel> {
@@ -344,8 +440,7 @@ mod ios {
     /// A black view over the phone's window that says where the game is, and takes the touches the hidden
     /// controls would have. Made when first shown: the phone's window may not exist yet when a display that
     /// was already connected joins at launch.
-    fn cover_phone(mtm: MainThreadMarker) -> Option<Cover> {
-        let window = phone_window(mtm)?;
+    fn cover_phone(mtm: MainThreadMarker, window: &UIWindow) -> Cover {
         let bounds: CGRect = window.bounds();
         let view = UIView::initWithFrame(UIView::alloc(mtm), bounds);
         view.setAutoresizingMask(flexible());
@@ -357,60 +452,97 @@ mod ios {
         pad.setAutoresizingMask(flexible());
         view.addSubview(&pad);
         window.addSubview(&view);
-        Some(Cover {
+        Cover {
             view,
             label: text,
             pad,
             drawn: Vec::new(),
-        })
-    }
-
-    fn screen_of(state: &State, view: &View) -> Screen {
-        let bounds = view.view.bounds();
-        let scale = state.scene.screen().scale();
-        Screen {
-            id: view.id,
-            size: (
-                (bounds.size.width * scale).round().max(1.0) as u32,
-                (bounds.size.height * scale).round().max(1.0) as u32,
-            ),
-            view: view.handle.clone(),
         }
     }
 
-    /// The display's halves, made new each time it splits: added over the whole view's own layers, which may
-    /// still hold the last frame drawn on all of it.
+    fn screen_of(state: &State, view: &View) -> Option<Screen> {
+        let bounds = view.view.bounds();
+        let scale = state.scene.screen().scale();
+        let size = super::drawable_pixels(bounds.size.width, bounds.size.height, scale)?;
+        Some(Screen {
+            id: view.id,
+            size,
+            view: view.handle.clone(),
+        })
+    }
+
+    /// Make new target views when split-screen starts.
     fn halves(state: &State) -> (View, View) {
         let mtm = MainThreadMarker::from(&*state.view.view);
-        let bounds = state.view.view.bounds();
-        let half = bounds.size.height / 2.0;
-        let make = |y: f64, mask: UIViewAutoresizing| {
-            let frame = CGRect::new(CGPoint::new(0.0, y), CGSize::new(bounds.size.width, half));
-            let view = UIView::initWithFrame(UIView::alloc(mtm), frame);
-            view.setAutoresizingMask(
-                mask | UIViewAutoresizing::FlexibleWidth | UIViewAutoresizing::FlexibleHeight,
-            );
+        let make = || {
+            let view = UIView::new(mtm);
             view.setBackgroundColor(Some(&UIColor::blackColor()));
             state.view.view.addSubview(&view);
             View::new(view, mtm)
         };
-        (
-            make(0.0, UIViewAutoresizing::FlexibleBottomMargin),
-            make(half, UIViewAutoresizing::FlexibleTopMargin),
-        )
+        (make(), make())
+    }
+
+    fn layout_halves(state: &State) {
+        let Some((top, bottom)) = &state.halves else {
+            return;
+        };
+        let bounds = state.view.view.bounds();
+        let scale = state.scene.screen().scale();
+        let (top_height, bottom_height) = super::split_heights(bounds.size.height, scale);
+        for (view, y, height) in [
+            (top, bounds.origin.y, top_height),
+            (bottom, bounds.origin.y + top_height, bottom_height),
+        ] {
+            let frame = CGRect::new(
+                CGPoint::new(bounds.origin.x, y),
+                CGSize::new(bounds.size.width, height),
+            );
+            if view.view.frame() != frame {
+                view.view.setFrame(frame);
+            }
+        }
     }
 
     fn update_covers(state: &mut State) {
-        let on_display = state.playing && state.rendering;
-        state.idle.setHidden(on_display);
-        if !on_display {
+        // Wait for an external frame before covering the phone.
+        let attached = state.playing && state.presentation != Presentation::Detached;
+        let presented = state.playing && state.presentation == Presentation::Presented;
+        state.idle.setHidden(attached);
+        if !attached {
             state.view.view.bringSubviewToFront(&state.idle);
         }
-        if on_display && state.cover.is_none() {
-            state.cover = cover_phone(MainThreadMarker::from(&*state.view.view));
+        if presented
+            && state.cover.as_ref().is_none_or(|cover| {
+                cover.view.window().is_none_or(|window| {
+                    window.isHidden()
+                        || !window.isKeyWindow()
+                        || window.windowScene().is_none_or(|scene| {
+                            scene.activationState() != UISceneActivationState::ForegroundActive
+                        })
+                })
+            })
+        {
+            let mtm = MainThreadMarker::from(&*state.view.view);
+            if let Some(window) = phone_window(mtm) {
+                if let Some(cover) = &state.cover {
+                    // Reattach when UIKit replaces the phone window.
+                    if cover
+                        .view
+                        .window()
+                        .is_none_or(|old| !std::ptr::eq(&*old, &*window))
+                    {
+                        cover.view.removeFromSuperview();
+                        cover.view.setFrame(window.bounds());
+                        window.addSubview(&cover.view);
+                    }
+                } else {
+                    state.cover = Some(cover_phone(mtm, &window));
+                }
+            }
         }
         if let Some(cover) = &state.cover {
-            let shown = on_display && !PHONE_GAME.with(Cell::get);
+            let shown = presented && !PHONE_GAME.with(Cell::get);
             cover.view.setHidden(!shown);
             if shown && let Some(window) = cover.view.superview() {
                 window.bringSubviewToFront(&cover.view);
@@ -418,13 +550,13 @@ mod ios {
         }
     }
 
-    pub(super) fn rendering(on_display: bool) {
+    pub(super) fn rendering(presentation: Presentation) {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
             if let Some(state) = state.as_mut()
-                && state.rendering != on_display
+                && state.presentation != presentation
             {
-                state.rendering = on_display;
+                state.presentation = presentation;
                 update_covers(state);
             }
         });
@@ -443,50 +575,76 @@ mod ios {
                 };
                 state.idle.setText(Some(&NSString::from_str(message)));
             }
-            if !playing {
-                state.rendering = false;
-            }
+            let split = playing && split;
             if split && state.halves.is_none() {
                 state.halves = Some(halves(state));
             } else if !split && let Some((top, bottom)) = state.halves.take() {
                 top.view.removeFromSuperview();
                 bottom.view.removeFromSuperview();
             }
-            update_covers(state);
+            if !playing || !split {
+                PHONE_GAME.with(|phone| phone.set(false));
+                if let Some(cover) = &state.cover {
+                    show_guest_controls(cover, false);
+                }
+            }
+            layout_halves(state);
             let view = state.halves.as_ref().map_or(&state.view, |(top, _)| top);
-            playing.then(|| screen_of(state, view))
+            let screen = if playing { screen_of(state, view) } else { None };
+            let target = screen.as_ref().map(|s| (s.id, s.size));
+            // A previous frame cannot justify covering the phone on a new target.
+            if !playing || state.target != target {
+                state.target = target;
+                state.presentation = Presentation::Detached;
+            }
+            update_covers(state);
+            screen
         })
+    }
+
+    pub(super) fn display_connected() -> bool {
+        STATE.with(|state| state.borrow().is_some())
     }
 
     pub(super) fn second_screen() -> Option<Screen> {
         STATE.with(|s| {
             let state = s.borrow();
-            let state = state.as_ref()?;
+            let state = state.as_ref().filter(|state| state.playing)?;
+            layout_halves(state);
             let (_, bottom) = state.halves.as_ref()?;
-            Some(screen_of(state, bottom))
+            screen_of(state, bottom)
         })
     }
 
+    // A visibility change applies even if no new frame is presented.
     pub(super) fn phone_shows_game(on: bool) {
-        PHONE_GAME.with(|p| p.set(on));
-        STATE.with(|s| {
-            if let Some(cover) = s.borrow().as_ref().and_then(|st| st.cover.as_ref())
-                && on
-            {
-                cover.view.setHidden(true);
-            }
-        });
+        if PHONE_GAME.with(|value| value.replace(on)) != on {
+            STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    update_covers(state);
+                }
+            });
+        }
+    }
+
+    fn show_guest_controls(cover: &Cover, show: bool) {
+        // With guest controls, touches go through to the game underneath.
+        cover.view.setUserInteractionEnabled(!show);
+        cover.label.setHidden(show);
+        cover.pad.setHidden(!show);
     }
 
     pub(super) fn phone_controls(buttons: Option<&[Button]>) {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
-            let Some(cover) = state.as_mut().and_then(|st| st.cover.as_mut()) else {
+            let Some(state) = state.as_mut() else {
                 return;
             };
-            // With controls, the touches go through to the game's view under the cover.
-            cover.view.setUserInteractionEnabled(buttons.is_none());
-            cover.label.setHidden(buttons.is_some());
+            let buttons = buttons.filter(|_| state.playing && state.halves.is_some());
+            let Some(cover) = state.cover.as_mut() else {
+                return;
+            };
+            show_guest_controls(cover, buttons.is_some());
             let buttons = buttons.unwrap_or_default();
             if cover.drawn == buttons {
                 return;

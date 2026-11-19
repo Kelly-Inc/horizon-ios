@@ -166,7 +166,7 @@ impl Game<'_> {
                     }
                 };
                 // Discard obsolete local results before any GPU/server publication.
-                if kind == ReloadKind::Selection && self.pending_pack_reload {
+                if self.pack_selection_superseded(kind) {
                     return;
                 }
                 if !self
@@ -276,6 +276,11 @@ impl Game<'_> {
     /// Rebuild the same request over the actual running content; preserve its
     /// Server callback until that request really finishes.
     fn restage_applied_content(&mut self, kind: ReloadKind, error: String) {
+        if self.pack_selection_superseded(kind) {
+            // Any applied client resources were rolled back by the caller.
+            // The pending request will build from that restored generation.
+            return;
+        }
         log::warn!("Horizon: content switch deferred: {error}");
         self.ui.options.mods_note = Some(error);
         let selection = self
@@ -466,6 +471,8 @@ mod transaction_tests {
         client.begin_chat_screen("keep", false);
         client.begin_content_reload(ReloadKind::Selection, stage(&client, next.clone()));
         assert!(client.content_reload_busy());
+        client.ime_preedit("ignored", Some((0, 7)));
+        assert!(!horizon_client::preedit::composing());
         client.ime_commit("ignored");
         assert_eq!(client.ui.chat_screen.as_ref().unwrap().input.value, "keep");
         let entry = PendingWorldEntry::Server {
@@ -489,6 +496,31 @@ mod transaction_tests {
             "GPU apply is not the server acknowledgment"
         );
         assert!(client.content_reload_busy());
+        {
+            use std::io::Write;
+
+            let saves = Game::game_dir().join("saves");
+            std::fs::create_dir_all(&saves).unwrap();
+            let world = tempfile::tempdir_in(saves).unwrap();
+            let packs = world.path().join("resourcepacks");
+            std::fs::create_dir(&packs).unwrap();
+            let mut zip =
+                zip::ZipWriter::new(std::fs::File::create(packs.join("resources.zip")).unwrap());
+            zip.start_file("pack.mcmeta", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            write!(
+                zip,
+                "{}",
+                serde_json::json!({"pack":{"description":"Fixture","pack_format":horizon_client::packs::RESOURCE_FORMAT.0}})
+            )
+            .unwrap();
+            zip.finish().unwrap();
+            client.server_packs_world_pack(world.path().file_name().unwrap().to_str().unwrap());
+            client.tick_server_packs();
+            assert!(client.server_packs.active.is_empty());
+            assert!(client.pack_reload.is_none());
+            client.server_packs = Default::default();
+        }
         assert!(tasks.run_next(&mut server));
         client.poll_content_reload();
         assert!(!client.content_reload_busy());
@@ -501,7 +533,10 @@ mod transaction_tests {
         client.finish_reload_input_disarm(&TestLoop);
         client.title = None;
         client.begin_chat_screen("keep", false);
+        client.ime_preedit("accept", Some((0, 6)));
+        assert!(horizon_client::preedit::composing());
         client.ime_commit(" accepted");
+        assert!(!horizon_client::preedit::composing());
         assert_eq!(
             client.ui.chat_screen.as_ref().unwrap().input.value,
             "keep accepted"
@@ -527,6 +562,28 @@ mod transaction_tests {
         assert_eq!(client.settings.resource_packs, ["vanilla"]);
         wait_pack(&mut client);
         assert_eq!(client.options.resources, next.root.prepared());
+
+        // A new selection can arrive after client publication but before the
+        // server rejects the old transaction. Restore the renderer without
+        // restaging the old request or clearing the new settings.
+        client.begin_content_reload(ReloadKind::Selection, stage(&client, initial.clone()));
+        assert!(tasks.run_next(&mut server));
+        client.poll_content_reload();
+        assert_eq!(client.options.resources, root);
+        client.settings.resource_packs = vec!["file/newer.zip".into()];
+        client.reload_packs();
+        assert!(client.pending_pack_reload);
+        server.damage_tag_generation = server.damage_tag_generation.wrapping_add(1);
+        assert!(tasks.run_next(&mut server));
+        client.poll_content_reload();
+        assert!(!client.content_reload_busy());
+        assert!(client.pack_reload.is_none());
+        assert!(client.pending_pack_reload);
+        assert_eq!(client.settings.resource_packs, ["file/newer.zip"]);
+        assert_eq!(client.options.resources, next.root.prepared());
+        assert_eq!(server.options.resources, next.root.prepared());
+        client.pending_pack_reload = false;
+        client.settings.resource_packs = vec!["vanilla".into()];
 
         // The latest choice supersedes a fully prepared result before GPU
         // publication; no commit enters the original server's task queue.

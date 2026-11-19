@@ -11,17 +11,23 @@ use horizon_client::shader_options::ShaderOptions;
 use horizon_client::text::Text;
 use horizon_shaders::{BlockIds, Macros, Pack, Properties, dimension_folder_named, load_post};
 
-use super::native_shaders::{fingerprint, outcome, remember};
+use super::native_shaders::{clear_refusal, fingerprint, outcome, remember};
 use super::{Dim, Game};
 use horizon_client_render::render_geometry::EntitySpan;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-/// The values the player chose for pack `name`'s options (`shaderpacks/<name>.txt`).
-fn chosen_shader_options(name: &str) -> BTreeMap<String, String> {
-    let file = Game::shader_packs_dir().join(horizon_shaders::chosen_file(name));
-    std::fs::read_to_string(file)
+/// The classic pack and its per-pack option file live beside each other.
+pub(super) fn classic_options_path(pack: &Path) -> Option<PathBuf> {
+    let name = pack.file_name()?.to_str()?;
+    Some(pack.with_file_name(horizon_shaders::chosen_file(name)))
+}
+
+fn chosen_shader_options(pack: &Path) -> BTreeMap<String, String> {
+    classic_options_path(pack)
+        .and_then(|file| std::fs::read_to_string(file).ok())
         .map(|text| horizon_shaders::parse_chosen(&text))
         .unwrap_or_default()
 }
@@ -36,7 +42,8 @@ pub(super) fn read_shader_options(
     if name.starts_with("horizon:") {
         return None;
     }
-    let pack = match Pack::open(&Game::shader_packs_dir().join(name)) {
+    let path = Game::shader_packs_dir().join(name);
+    let pack = match Pack::open(&path) {
         Ok(pack) => pack,
         Err(e) => {
             log::warn!("shader pack {name}: {e}");
@@ -45,7 +52,7 @@ pub(super) fn read_shader_options(
     };
     let options = horizon_shaders::options(&pack);
     let lang = horizon_shaders::Lang::load(&pack, language);
-    let chosen = chosen_shader_options(name);
+    let chosen = chosen_shader_options(&path);
     let pack = pack.with_chosen(chosen.clone());
     let text = pack.read_text("shaders.properties").unwrap_or_default();
     let properties = Properties::parse(&text, &horizon_shaders::properties_macros(&pack, macros));
@@ -60,18 +67,61 @@ pub(super) fn read_shader_options(
 }
 
 /// Saves the values chosen on the Shader Options page; none chosen removes the file.
-pub(super) fn write_shader_options(options: &ShaderOptions) {
-    let file = Game::shader_packs_dir().join(horizon_shaders::chosen_file(&options.pack));
-    let saved = if options.chosen.is_empty() {
-        std::fs::remove_file(&file).or_else(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => Ok(()),
-            _ => Err(e),
-        })
+fn write_shader_options(options: &ShaderOptions) -> std::io::Result<()> {
+    let pack = Game::shader_packs_dir().join(&options.pack);
+    let file = classic_options_path(&pack).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing shader file name")
+    })?;
+    if options.chosen.is_empty() {
+        match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
     } else {
-        std::fs::write(&file, horizon_shaders::chosen_text(&options.chosen))
+        let text = horizon_shaders::chosen_text(&options.chosen);
+        horizon_client_core::config_file::write_atomic(&file, text.as_bytes())?;
+    }
+    clear_refusal(&pack);
+    Ok(())
+}
+
+pub(super) fn persist_shader_options(
+    settings: &mut horizon_client::settings::Settings,
+    ui: &mut horizon_client::options_ui::OptionsUi,
+) -> bool {
+    let Some(options) = settings.shader_options.take() else {
+        return false;
     };
-    if let Err(e) = saved {
-        log::warn!("shader pack {}: {}: {e}", options.pack, file.display());
+    let saved = write_shader_options(&options);
+    ui.shader_options_save_result(&options, saved.as_ref().err());
+    if let Err(error) = saved {
+        log::warn!(
+            "shader pack {}: could not save settings: {error}",
+            options.pack
+        );
+        settings.shader_options = Some(options);
+        return false;
+    }
+    true
+}
+
+pub(super) fn persist_native_shader_options(
+    settings: &mut horizon_client::settings::Settings,
+    ui: &mut horizon_client::options_ui::OptionsUi,
+    index: usize,
+    previous: Vec<f64>,
+) {
+    let Some(pack) = settings.shader_packs.get_mut(index) else {
+        return;
+    };
+    let saved = pack.save_values(&Game::shader_packs_dir());
+    ui.native_shader_options_save_result(&pack.file, saved.as_ref().err());
+    if let Err(error) = saved {
+        log::warn!(
+            "shader pack {}: could not save settings: {error}",
+            pack.file
+        );
+        pack.values = previous;
     }
 }
 
@@ -214,7 +264,40 @@ thread_local! {
     static LAST_DISABLED: RefCell<Option<Value>> = const { RefCell::new(None) };
     static OPTIONS_REVISION: Cell<u64> = const { Cell::new(0) };
 }
+
+fn clear_shader_report() {
+    REPORT.with_borrow_mut(Option::take);
+}
+
+fn clear_pending_shader_report(name: &str, dimension: i32) {
+    REPORT.with_borrow_mut(|report| {
+        if report.as_ref().is_some_and(|value| {
+            value["pending"] == true && value["pack"] == name && value["dimension"] == dimension
+        }) {
+            *report = None;
+        }
+    });
+}
+
+fn shader_failure_notes(reason: &str, details: &[String]) -> Vec<String> {
+    std::iter::once(reason)
+        .filter(|reason| !reason.is_empty())
+        .chain(details.iter().map(String::as_str).filter(|note| *note != reason))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub(super) fn record_report(name: &str, dimension: i32, programs: &[String], notes: &[String]) {
+    record_shader_report(name, dimension, programs, notes, false);
+}
+
+fn record_shader_report(
+    name: &str,
+    dimension: i32,
+    programs: &[String],
+    notes: &[String],
+    pending: bool,
+) {
     // The summary refusal alone cannot diagnose a pack: keep the parser/compiler
     // notes in the exported game log as well as the in-game report.
     for note in notes {
@@ -223,14 +306,20 @@ pub(super) fn record_report(name: &str, dimension: i32, programs: &[String], not
     REPORT.with_borrow_mut(|report| {
         *report = Some(json!({
             "pack": name, "dimension": dimension, "programs": programs, "notes": notes,
+            "pending": pending,
         }))
     });
 }
-pub(super) fn record_reload_error(name: &str, dimension: i32, errors: &[String]) {
+pub(super) fn record_reload_error(
+    name: &str,
+    dimension: i32,
+    errors: &[String],
+    previous_active: bool,
+) {
     let previous: Vec<String> = REPORT.with_borrow(|report| {
         report
             .as_ref()
-            .filter(|r| r["pack"].as_str() == Some(name))
+            .filter(|r| previous_active && r["pack"].as_str() == Some(name))
             .and_then(|r| r["programs"].as_array())
             .map(|programs| {
                 programs
@@ -252,40 +341,47 @@ pub(super) fn record_reload_error(name: &str, dimension: i32, errors: &[String])
 #[path = "shader_packs/selection.rs"]
 mod selection;
 
-pub(super) fn command(
-    settings: &mut horizon_client::settings::Settings,
-    words: &[&str],
-    line: &str,
-) -> horizon_client::Result<Option<(Value, bool)>> {
-    let Some(verb @ ("shader-pack" | "shader-pack-set")) = words.first().copied() else {
-        return Ok(None);
-    };
-    let root = std::env::current_dir()?;
-    let packs = horizon_client::shader_pack_list::scan(&root.join("shaderpacks"));
-    let arg = line.trim_start().strip_prefix(verb).unwrap_or("").trim();
-    let find_pack = |name: &str| {
-        packs
-            .iter()
-            .find(|pack| pack.key == name)
-            .or_else(|| packs.iter().find(|pack| pack.file == name))
-    };
-    let canonical =
-        |name: &str| find_pack(name).map_or_else(|| name.to_owned(), |pack| pack.key.clone());
-    let current = canonical(&settings.horizon.shader_pack);
-    let replacement = selection::change(verb, arg, &current, canonical)?;
-    let changed = replacement.is_some();
-    if let Some(name) = replacement {
-        if !name.is_empty() && find_pack(&name).is_none() {
-            return Err(format!("no shader pack {name} in shaderpacks/").into());
-        }
-        settings
-            .horizon
-            .select_shader_pack(&root, name)
-            .map_err(|error| format!("could not save the shader selection: {error}"))?;
-        LAST_DISABLED.with_borrow_mut(Option::take);
+fn failed_shader_report(key: &str, file: &str) -> bool {
+    REPORT.with_borrow(|report| {
+        report.as_ref().is_some_and(|report| {
+            let name = report["pack"].as_str();
+            (name == Some(key) || name == Some(file))
+                && report["pending"] != true
+                && report["programs"].as_array().is_some_and(Vec::is_empty)
+        })
+    })
+}
+
+/// Selecting a pack again is an explicit request to retry its cached failure.
+pub(super) fn retry_selected_shader(settings: &horizon_client::settings::Settings) -> bool {
+    let name = &settings.horizon.shader_pack;
+    if name.is_empty() {
+        return false;
     }
+    let (key, path) = horizon_client::shader_pack_list::resolve(&Game::shader_packs_dir(), name);
+    clear_refusal(&path)
+        || failed_shader_report(
+            &key,
+            path.file_name()
+                .and_then(|file| file.to_str())
+                .unwrap_or(name),
+        )
+}
+
+fn listed_pack<'a>(
+    packs: &'a [horizon_client::shader_pack_list::Entry],
+    name: &str,
+) -> Option<&'a horizon_client::shader_pack_list::Entry> {
+    packs
+        .iter()
+        .find(|pack| pack.key == name)
+        .or_else(|| packs.iter().find(|pack| pack.file == name))
+}
+
+/// Runtime state for polling without opening any pack files.
+fn shader_status(settings: &horizon_client::settings::Settings) -> Value {
     let picked = &settings.horizon.shader_pack;
-    let selected_pack = find_pack(picked);
+    let selected_pack = listed_pack(&settings.shader_packs, picked);
     let selected = (!picked.is_empty())
         .then(|| selected_pack.map_or(picked.as_str(), |pack| pack.key.as_str()));
     let report = REPORT.with_borrow(|report| {
@@ -302,16 +398,61 @@ pub(super) fn command(
         .is_none()
         .then(|| LAST_DISABLED.with_borrow(Clone::clone))
         .flatten();
+    json!({"selected": selected, "runtime": report, "last_disabled": last_disabled})
+}
+
+pub(super) fn command(
+    settings: &mut horizon_client::settings::Settings,
+    words: &[&str],
+    line: &str,
+) -> horizon_client::Result<Option<(Value, bool)>> {
+    let Some(verb @ ("shader-pack" | "shader-pack-set" | "shader-pack-status")) =
+        words.first().copied()
+    else {
+        return Ok(None);
+    };
+    if verb == "shader-pack-status" {
+        return Ok(Some((shader_status(settings), false)));
+    }
+    let root = std::env::current_dir()?;
+    let directory = root.join("shaderpacks");
+    let packs = horizon_client::shader_pack_list::scan(&directory);
+    let arg = line.trim_start().strip_prefix(verb).unwrap_or("").trim();
+    let find_pack = |name: &str| listed_pack(&packs, name);
+    let canonical =
+        |name: &str| find_pack(name).map_or_else(|| name.to_owned(), |pack| pack.key.clone());
+    let current = canonical(&settings.horizon.shader_pack);
+    let replacement = selection::change(verb, arg, &current, canonical)?;
+    let mut changed = false;
+    if let Some(name) = replacement {
+        let pack = find_pack(&name);
+        if !name.is_empty() && pack.is_none() {
+            return Err(format!("no shader pack {name} in shaderpacks/").into());
+        }
+        let path = pack.map(|pack| directory.join(&pack.file));
+        let save = verb == "shader-pack" || current != name;
+        if save {
+            settings
+                .horizon
+                .select_shader_pack(&root, name)
+                .map_err(|error| format!("could not save the shader selection: {error}"))?;
+        }
+        let retried = path.as_deref().is_some_and(clear_refusal)
+            || pack.is_some_and(|pack| failed_shader_report(&pack.key, &pack.file));
+        changed = save || retried;
+        if changed {
+            LAST_DISABLED.with_borrow_mut(Option::take);
+            REPORT.with_borrow_mut(Option::take);
+        }
+    }
     let list: Vec<Value> = packs
         .iter()
-        .map(|pack| json!({"name": pack.file, "key": pack.key, "title":pack.title, "problem":null}))
+        .map(|pack| json!({"name": pack.file, "key": pack.key, "title": pack.title, "problem": null}))
         .collect();
-    let selected = selected.map(str::to_owned);
     settings.shader_packs = packs;
-    Ok(Some((
-        json!({"packs":list,"selected":selected,"runtime":report,"last_disabled":last_disabled}),
-        changed,
-    )))
+    let mut response = shader_status(settings);
+    response["packs"] = json!(list);
+    Ok(Some((response, changed)))
 }
 
 /// Prefer the connection's current block tags, including a local integrated server's.
@@ -421,10 +562,131 @@ pub(super) struct PackIds {
     pub(super) separate_ao: bool,
 }
 
-pub(super) struct PendingClassicPack {
+pub(super) struct ClassicPack {
     path: std::path::PathBuf,
     stamp: Option<u64>,
-    ids: PackIds,
+    /// The named level used to resolve dimension.properties. Legacy slots can be shared.
+    dimension_name: &'static str,
+    /// IDs waiting for a successful GPU report. When active, the game owns them.
+    pending_ids: Option<PackIds>,
+    /// This dimension reached normal rendering without starting a GPU compile.
+    refused: bool,
+    /// The source was a ZIP when loaded, so periodic reload checks are cheap.
+    watch_zip: bool,
+    /// A subsequent target size can succeed even with the same shader source.
+    failed_target_size: Option<[u32; 2]>,
+}
+
+impl ClassicPack {
+    pub(super) fn refusal(
+        path: &std::path::Path,
+        stamp: Option<u64>,
+        dimension_name: &'static str,
+    ) -> Self {
+        Self {
+            path: path.to_owned(),
+            stamp,
+            dimension_name,
+            pending_ids: None,
+            refused: true,
+            watch_zip: false,
+            failed_target_size: None,
+        }
+    }
+
+    pub(super) fn watched_stamp(&self, path: &std::path::Path) -> Option<Option<u64>> {
+        // Poll metadata for running ZIPs. Walking every file in a directory pack
+        // would put regular filesystem traversal on the render thread.
+        let running_zip = self.pending_ids.is_none() && self.watch_zip;
+        (self.path == path && (self.refused || running_zip)).then_some(self.stamp)
+    }
+
+    fn retry_for_target(&self, size: [u32; 2]) -> bool {
+        self.failed_target_size.is_some_and(|failed| failed != size)
+    }
+
+    fn matches_report(
+        &self,
+        path: &std::path::Path,
+        stamp: Option<u64>,
+        dimension_name: &str,
+        active: bool,
+    ) -> bool {
+        !self.refused
+            && self.path == path
+            && self.stamp == stamp
+            && self.dimension_name == dimension_name
+            && (!active || self.pending_ids.is_some())
+    }
+}
+
+#[test]
+fn classic_pack_accepts_a_gpu_failure_after_activation() {
+    use std::path::Path;
+
+    let path = Path::new("shader.zip");
+    let dimension = "minecraft:overworld";
+    let mut pack = ClassicPack {
+        path: path.into(),
+        stamp: Some(1),
+        dimension_name: dimension,
+        pending_ids: Some(PackIds::default()),
+        refused: false,
+        watch_zip: true,
+        failed_target_size: None,
+    };
+    assert!(pack.matches_report(path, Some(1), dimension, false));
+    assert!(pack.matches_report(path, Some(1), dimension, true));
+    assert!(!pack.matches_report(path, Some(1), "server:island", true));
+    assert!(pack.pending_ids.take().is_some());
+    assert!(pack.matches_report(path, Some(1), dimension, false));
+    assert!(!pack.matches_report(path, Some(1), "server:island", false));
+    assert!(!pack.matches_report(path, Some(1), dimension, true));
+    assert!(!pack.matches_report(path, Some(2), dimension, false));
+    assert!(!pack.matches_report(Path::new("other.zip"), Some(1), dimension, false));
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn replacing_a_running_classic_zip_schedules_a_reload() {
+    use super::native_shaders::NativeShaders;
+    use std::fs;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("shader.zip");
+    let replacement = directory.path().join("replacement.zip");
+    fs::write(&path, b"old").unwrap();
+    let stamp = fingerprint(&path);
+    assert!(stamp.is_some());
+    let mut state = NativeShaders::default();
+    state.classic = Some(ClassicPack {
+        path: path.clone(),
+        stamp,
+        dimension_name: "minecraft:overworld",
+        pending_ids: None,
+        refused: false,
+        watch_zip: true,
+        failed_target_size: None,
+    });
+    assert_eq!(state.check_classic_source(&path, true, false), None);
+
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&replacement, b"new").unwrap();
+    fs::File::open(&replacement)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    fs::rename(replacement, &path).unwrap();
+
+    // Start with an expired polling interval and the same accepted pack.
+    let mut ready = NativeShaders::default();
+    ready.classic = state.classic.take();
+    let changed = fingerprint(&path);
+    assert_ne!(stamp, changed);
+    assert_eq!(
+        ready.check_classic_source(&path, true, false),
+        Some(changed)
+    );
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -442,7 +704,24 @@ struct ParsedPack {
     ids: BlockIds,
     entity_ids: PackIds,
 }
+struct ParserCompletion {
+    report_name: String,
+    key: LoadKey,
+    result: Result<ParsedPack, String>,
+}
+
+#[derive(Default)]
+pub(super) struct ParserInbox(Arc<Mutex<Option<ParserCompletion>>>);
+
+impl ParserInbox {
+    fn lock(&self) -> MutexGuard<'_, Option<ParserCompletion>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 struct PendingLoad {
+    inbox: Weak<Mutex<Option<ParserCompletion>>>,
+    report_name: String,
     worker: Option<std::thread::JoinHandle<()>>,
     key: LoadKey,
     result: std::sync::mpsc::Receiver<Result<ParsedPack, String>>,
@@ -466,31 +745,44 @@ pub(super) fn shutdown_parser() -> bool {
         {
             let _ = worker.join();
         }
+        // A fresh engine in the launcher has no live shader programs. Keep
+        // the last failure separately so it is still available after Quit.
+        REPORT.with_borrow_mut(Option::take);
         true
     })
 }
 fn parser_busy() -> bool {
     PENDING_LOAD.with_borrow(|pending| pending.is_some())
 }
-fn poll_parser() -> Option<(LoadKey, Result<ParsedPack, String>)> {
+// Any renderer can retire the worker. Only its owner receives the result.
+fn complete_parser() {
     PENDING_LOAD.with_borrow_mut(|pending| {
-        let load = pending.as_ref()?;
+        let Some(load) = pending.as_ref() else { return };
         if load
             .worker
             .as_ref()
             .is_some_and(|worker| !worker.is_finished())
         {
-            return None;
+            return;
         }
         let result = match load.result.try_recv() {
             Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err("Shader parser worker failed".into())
             }
         };
-        let key = pending.take().unwrap().key;
-        Some((key, result))
+        let load = pending.take().unwrap();
+        if let Some(inbox) = load.inbox.upgrade() {
+            *inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(ParserCompletion {
+                    report_name: load.report_name,
+                    key: load.key,
+                    result,
+                });
+        } else {
+            clear_pending_shader_report(&load.report_name, load.key.dimension);
+        }
     })
 }
 const SOURCE_PANIC: &str = "Shader source compiler panicked: ";
@@ -500,6 +792,8 @@ fn parse_source<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String
 }
 
 fn start_parser(
+    inbox: &ParserInbox,
+    name: &str,
     key: LoadKey,
     inputs: horizon_shaders::GameInputs,
     macros: Macros,
@@ -508,7 +802,7 @@ fn start_parser(
     let path = key.path.clone();
     let dimension = key.dimension;
     let dimension_name = key.dimension_name.clone();
-    let options = chosen_shader_options(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+    let options = chosen_shader_options(&path);
     let (sender, result) = std::sync::mpsc::channel();
     let _worker =
         std::thread::Builder::new()
@@ -589,6 +883,8 @@ fn start_parser(
             .map_err(|error| format!("Could not start shader parser: {error}"))?;
     PENDING_LOAD.with_borrow_mut(|pending| {
         *pending = Some(PendingLoad {
+            inbox: Arc::downgrade(&inbox.0),
+            report_name: name.to_owned(),
             key,
             result,
             worker: Some(_worker),
@@ -607,20 +903,24 @@ impl Game<'_> {
             return Ok(None);
         };
         if changed {
-            if let Some(renderer) = &mut self.renderer {
-                renderer.drop_shader_packs();
-            }
-            self.native_shaders = super::native_shaders::NativeShaders::picking("");
-            if self.clear_shader_mesh_state() {
-                self.all_sections_changed();
-            }
-            REPORT.with_borrow_mut(Option::take);
+            self.reset_shader_selection();
         }
         Ok(Some(response))
     }
 
+    pub(super) fn reset_shader_selection(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.drop_shader_packs();
+        }
+        self.native_shaders = super::native_shaders::NativeShaders::picking("");
+        if self.clear_shader_mesh_state() {
+            self.all_sections_changed();
+        }
+    }
+
     /// Settle shader jobs without rendering, including while the launcher covers the game.
     pub(super) fn poll_shader_workers(&mut self) {
+        complete_parser();
         let selected = picked_pack(&self.settings).to_owned();
         if !selected.is_empty() {
             // In-game settings can pick a shader without the launcher command.
@@ -641,33 +941,54 @@ impl Game<'_> {
             Dim::Nether => -1,
             Dim::End => 1,
         };
+        let dimension_name = self.dim.id();
         let mut failed = None;
         if let Some(renderer) = &mut self.renderer {
             // A selection or dimension transition stops old programs before consuming
             // their report. Otherwise an old failure can quarantine the new selection,
             // including while the launcher covers the game before its next world frame.
             if selection_changed
+                || self
+                    .native_shaders
+                    .classic
+                    .as_ref()
+                    .is_some_and(|pack| pack.dimension_name != dimension_name)
                 || renderer
                     .shader_pack_dimension()
                     .is_some_and(|old| old != dimension)
             {
                 renderer.drop_shader_packs();
+                REPORT.with_borrow_mut(Option::take);
                 self.pack_ids = None;
-                self.native_shaders.pending_classic = None;
+                self.native_shaders.classic = None;
             }
-            if let Some((dimension, programs, notes)) = renderer.take_shader_report() {
-                if let Some(pending) = self.native_shaders.pending_classic.take()
-                    && pending.path == selected_path
-                    && pending.stamp == fingerprint(&pending.path)
+            if let Some(report) = renderer.take_shader_report() {
+                let (dimension, programs, notes) =
+                    (report.dimension, report.programs, report.notes);
+                let active = !programs.is_empty();
+                if let Some(mut classic) = self.native_shaders.classic.take()
+                    && classic.matches_report(
+                        &selected_path,
+                        fingerprint(&selected_path),
+                        dimension_name,
+                        active,
+                    )
                 {
-                    let active = !programs.is_empty();
-                    remember(&pending.path, pending.stamp, active);
-                    self.pack_ids = active.then_some(pending.ids);
-                    if !active {
+                    if active {
+                        remember(&classic.path, classic.stamp, true);
+                        self.pack_ids = classic.pending_ids.take();
+                        self.native_shaders.classic = Some(classic);
+                    } else if let Some(size) = report.failed_target_size {
+                        self.pack_ids = None;
+                        classic.refused = true;
+                        classic.failed_target_size = Some(size);
+                        self.native_shaders.classic = Some(classic);
+                    } else {
+                        self.pack_ids = None;
                         failed = Some((
                             selected.clone(),
-                            pending.path,
-                            pending.stamp,
+                            classic.path,
+                            classic.stamp,
                             dimension,
                             notes.clone(),
                         ));
@@ -675,43 +996,34 @@ impl Game<'_> {
                     record_report(&selected, dimension, &programs, &notes);
                 } else {
                     renderer.drop_shader_packs();
+                    REPORT.with_borrow_mut(Option::take);
                     self.pack_ids = None;
-                    self.native_shaders.pending_classic = None;
+                    self.native_shaders.classic = None;
                 }
             }
-            PENDING_LOAD.with_borrow_mut(|pending| {
-                if let Some(load) = pending.as_ref()
-                    && load
-                        .worker
-                        .as_ref()
-                        .is_none_or(|worker| worker.is_finished())
-                {
-                    let desired = LoadKey {
-                        stamp: fingerprint(&selected_path),
-                        path: selected_path,
-                        resources: self.options.resources.clone(),
-                        options_revision: OPTIONS_REVISION.with(Cell::get),
-                        dimension,
-                        dimension_name: self.dim.id().to_owned(),
-                        context: renderer.shader_context_key(),
-                    };
-                    if load.key == desired {
-                        return;
+            let mut ready = self.shader_parser.lock();
+            if let Some(load) = ready.as_ref() {
+                let desired = LoadKey {
+                    stamp: fingerprint(&selected_path),
+                    path: selected_path,
+                    resources: self.options.resources.clone(),
+                    options_revision: OPTIONS_REVISION.with(Cell::get),
+                    dimension,
+                    dimension_name: dimension_name.to_owned(),
+                    context: renderer.shader_context_key(),
+                };
+                if load.key != desired {
+                    if self.native_shaders.classic.is_none() {
+                        clear_pending_shader_report(&load.report_name, load.key.dimension);
                     }
-                    match load.result.try_recv() {
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                        _ => {
-                            *pending = None;
-                        }
-                    }
+                    *ready = None;
                 }
-            });
+            }
         }
         if let Some((name, path, stamp, dimension, notes)) = failed {
-            // This report is a completed GPU job, never the pending notice.
-            // Apply the same quarantine as the synchronous loader so a pack
-            // that the device refuses is not retried on every app launch.
-            self.shader_pack_failed(&name, &path, stamp, dimension, &notes.join("; "), &notes);
+            // A compile or resize failure uses the same fallback as a source failure.
+            let reason = notes.first().map_or("The shader pack could not be loaded.", String::as_str);
+            self.shader_pack_failed(&name, &path, stamp, dimension, reason, &notes);
         }
     }
 
@@ -736,6 +1048,7 @@ impl Game<'_> {
     /// Drop mesh settings from a pack that no longer draws. The caller invalidates
     /// the existing meshes, or folds that into a resource reload already in progress.
     pub(super) fn clear_shader_mesh_state(&mut self) -> bool {
+        clear_shader_report();
         self.pack_ids = None;
         let classic_changed = self.update_classic_mesh_flags();
         let translucent_changed = !self.streaming.translucent_layers.is_empty();
@@ -754,7 +1067,15 @@ impl Game<'_> {
         sky: &horizon_client::environment::Sky,
     ) -> PackInputs {
         self.poll_shader_workers();
-        let completed = poll_parser();
+        // A shader API 0.2 pack whose terrain takes the quads' looks (their tint, shade, ambient
+        // occlusion, face and light level apart): every quad carries its look, so the world
+        // meshes again once when the renderer's sections start or stop carrying them, and never
+        // otherwise.
+        let looks = self.renderer.as_ref().is_some_and(|r| r.terrain_looks());
+        if self.streaming.looks != looks {
+            self.streaming.looks = looks;
+            self.all_sections_changed();
+        }
         let selected = picked_pack(&self.settings).to_owned();
         let path = self.native_shaders.resolve_path(
             &Self::shader_packs_dir(),
@@ -768,7 +1089,6 @@ impl Game<'_> {
             path.to_string_lossy().into_owned()
         };
         if self.native_shaders.picked != picked {
-            REPORT.with_borrow_mut(Option::take);
             self.native_shaders.select(&picked);
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
@@ -793,23 +1113,28 @@ impl Game<'_> {
             Dim::Nether => -1,
             Dim::End => 1,
         };
+        let dimension_name = self.dim.id();
         let native = (dev_pack().is_none() && selected.starts_with("horizon:"))
             || horizon_shader_api::package::is_pack(&path);
+        let waiting_for_parser = parser_busy() && self.shader_parser.lock().is_none();
         if native {
             // One of Horizon's own packs (game/modding/native_shaders.rs).
             self.tick_native_shader_pack(&path);
-        } else if let Some(renderer) = &mut self.renderer
+        } else if self.screenshot_sequence.is_none()
+            && let Some(renderer) = &mut self.renderer
             && let Some(stamp) = self.native_shaders.check_classic_source(
                 &path,
-                renderer.shader_pack_dimension() == Some(dimension),
-                parser_busy(),
+                renderer.shader_pack_dimension() == Some(dimension)
+                    && !self.native_shaders.classic.as_ref().is_some_and(|classic| {
+                        classic.retry_for_target(renderer.shader_pack_target_size())
+                    }),
+                waiting_for_parser,
             )
         {
-            // A changed source can recover from a refusal that marked this
-            // dimension loaded without an active shader.
+            // A replaced source supersedes the programs or fallback loaded for this dimension.
             if renderer.shader_pack_dimension() == Some(dimension) {
                 renderer.drop_shader_packs();
-                self.native_shaders.pending_classic = None;
+                self.native_shaders.classic = None;
                 self.pack_ids = None;
             }
             // Lava uses the solid terrain program. Supply its sprite layers before
@@ -826,10 +1151,14 @@ impl Game<'_> {
                 resources: self.options.resources.clone(),
                 options_revision: OPTIONS_REVISION.with(Cell::get),
                 dimension,
-                dimension_name: self.dim.id().to_owned(),
+                dimension_name: dimension_name.to_owned(),
                 context: renderer.shader_context_key(),
             };
-            let ready = completed.and_then(|(at, result)| (at == key).then_some(result));
+            let ready = self
+                .shader_parser
+                .lock()
+                .take()
+                .and_then(|parsed| (parsed.key == key).then_some(parsed.result));
             if let Some(result) = ready {
                 match result {
                     Ok(mut parsed) => {
@@ -856,45 +1185,46 @@ impl Game<'_> {
                         );
                         renderer.set_separate_ao(parsed.entity_ids.separate_ao);
                         self.pack_ids = None;
-                        self.native_shaders.pending_classic = None;
+                        self.native_shaders.classic = None;
                         match renderer.set_shader_pack_at_frame_boundary(
                             dimension,
                             parsed.post,
                             &table,
                         ) {
                             Ok(report) => {
-                                self.native_shaders.pending_classic = Some(PendingClassicPack {
+                                self.native_shaders.classic = Some(ClassicPack {
                                     path: path.clone(),
                                     stamp,
-                                    ids: parsed.entity_ids,
+                                    dimension_name,
+                                    pending_ids: Some(parsed.entity_ids),
+                                    refused: false,
+                                    watch_zip: path.is_file()
+                                        && path
+                                            .extension()
+                                            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip")),
+                                    failed_target_size: None,
                                 });
                                 if let Some((programs, notes)) = report {
-                                    record_report(&name, dimension, &programs, &notes);
+                                    record_shader_report(&name, dimension, &programs, &notes, true);
                                 }
                             }
                             Err(refused) => {
-                                let mut notes = refused.notes;
-                                notes.push(refused.reason.clone());
-                                if self.shader_pack_failed(
-                                    &name,
-                                    &path,
-                                    stamp,
-                                    dimension,
-                                    &refused.reason,
-                                    &notes,
-                                ) {
-                                    record_report(&name, dimension, &[], &notes);
-                                }
+                                // The pack lacks programs or inputs for this dimension.
+                                // The next named dimension can use a different shader folder.
+                                self.native_shaders.classic =
+                                    Some(ClassicPack::refusal(&path, stamp, dimension_name));
+                                let notes = shader_failure_notes(&refused.reason, &refused.notes);
+                                record_report(&name, dimension, &[], &notes);
                             }
                         }
                     }
                     Err(_) if fingerprint(&path) != stamp => {
+                        clear_pending_shader_report(&name, dimension);
                         self.pack_ids = None;
-                        self.native_shaders.pending_classic = None;
+                        self.native_shaders.classic = None;
                         renderer.drop_shader_packs();
                     }
                     Err(error) => {
-                        remember(&path, stamp, false);
                         let report = if error.starts_with(SOURCE_PANIC) {
                             self.shader_pack_failed(
                                 &name,
@@ -906,7 +1236,8 @@ impl Game<'_> {
                             )
                         } else {
                             self.pack_ids = None;
-                            self.native_shaders.pending_classic = None;
+                            self.native_shaders.classic =
+                                Some(ClassicPack::refusal(&path, stamp, dimension_name));
                             let _ = renderer.set_shader_pack(dimension, None, &[]);
                             true
                         };
@@ -915,13 +1246,31 @@ impl Game<'_> {
                         }
                     }
                 }
-            } else {
+            } else if !parser_busy() {
                 let inputs = renderer.pack_inputs();
                 let mut macros = Macros::standard();
                 renderer.define_pack_macros(&mut macros);
-                match start_parser(key,inputs,macros,self.pack.source.clone()) {
-                    Ok(())=>record_report(&name,dimension,&[],&["Processing shader sources in the background. Normal rendering remains active until ready.".into()]),
-                    Err(error)=>{let _ = renderer.set_shader_pack(dimension,None,&[]);record_report(&name,dimension,&[],&[error]);}
+                match start_parser(
+                    &self.shader_parser,
+                    &name,
+                    key,
+                    inputs,
+                    macros,
+                    self.pack.source.clone(),
+                ) {
+                    Ok(()) => record_shader_report(
+                        &name,
+                        dimension,
+                        &[],
+                        &["Processing shader sources in the background. Normal rendering remains active until ready.".into()],
+                        true,
+                    ),
+                    Err(error) => {
+                        self.native_shaders.classic =
+                            Some(ClassicPack::refusal(&path, stamp, dimension_name));
+                        let _ = renderer.set_shader_pack(dimension, None, &[]);
+                        record_report(&name, dimension, &[], &[error]);
+                    }
                 }
             }
         }
@@ -1058,12 +1407,14 @@ impl Game<'_> {
             .is_some_and(|ids| ids.blocks.has_block_tags())
             || self
                 .native_shaders
-                .pending_classic
+                .classic
                 .as_ref()
-                .is_some_and(|pack| pack.ids.blocks.has_block_tags())
+                .and_then(|pack| pack.pending_ids.as_ref())
+                .is_some_and(|ids| ids.blocks.has_block_tags())
         {
+            clear_shader_report();
             self.pack_ids = None;
-            self.native_shaders.pending_classic = None;
+            self.native_shaders.classic = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
             }
@@ -1077,18 +1428,26 @@ impl Game<'_> {
             renderer.define_pack_macros(&mut macros);
         }
         let name = &self.settings.horizon.shader_pack;
+        if self
+            .settings
+            .shader_options
+            .as_ref()
+            .is_some_and(|options| options.pack == *name && options.changed)
+        {
+            return;
+        }
         self.settings.shader_options = read_shader_options(name, &self.settings.language, &macros);
     }
 
     /// The Shader Options page closed with changes: they are saved, and the pack loads again.
     pub(super) fn save_shader_options(&mut self) {
-        let Some(options) = self.settings.shader_options.take() else {
+        if !persist_shader_options(&mut self.settings, &mut self.ui.options) {
             return;
-        };
-        write_shader_options(&options);
+        }
         OPTIONS_REVISION.with(|revision| revision.set(revision.get().wrapping_add(1)));
+        clear_shader_report();
         self.pack_ids = None;
-        self.native_shaders.pending_classic = None;
+        self.native_shaders.classic = None;
         if let Some(renderer) = &mut self.renderer {
             renderer.drop_shader_packs();
         }
@@ -1107,8 +1466,9 @@ impl Game<'_> {
         notes: &[String],
     ) -> bool {
         if fingerprint(path) != stamp {
+            clear_shader_report();
             self.pack_ids = None;
-            self.native_shaders.pending_classic = None;
+            self.native_shaders.classic = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.drop_shader_packs();
             }
@@ -1117,16 +1477,14 @@ impl Game<'_> {
         remember(path, stamp, false);
         log::error!("shader pack {name}: turned off: {error}");
         self.pack_ids = None;
+        self.native_shaders.classic = None;
         if let Some(renderer) = &mut self.renderer {
             // Marks this dimension as loaded, without a pack, so it is not tried again (without
             // a pack this can't fail).
             let _ = renderer.set_shader_pack(dimension, None, &[]);
         }
         if !name.is_empty() && dev_pack().is_none() && self.settings.horizon.shader_pack == name {
-            let mut notes = notes.to_vec();
-            if notes.is_empty() && !error.is_empty() {
-                notes.push(error.to_owned());
-            }
+            let mut notes = shader_failure_notes(error, notes);
             if let Err(error) = self
                 .settings
                 .horizon
@@ -1135,7 +1493,7 @@ impl Game<'_> {
                 // The failed shader must stay off for this session even if
                 // the disk cannot record the change for the next launch.
                 self.settings.horizon.shader_pack.clear();
-                notes.push(format!("Could not save the Off selection: {error}"));
+                notes.insert(1.min(notes.len()), format!("Could not save the Off selection: {error}"));
             }
             LAST_DISABLED.with_borrow_mut(|report| {
                 *report = Some(json!({"pack": name, "dimension": dimension, "notes": notes}));
@@ -1682,6 +2040,8 @@ mod integration_tests {
         });
         PENDING_LOAD.with_borrow_mut(|pending| {
             *pending = Some(PendingLoad {
+                inbox: Weak::new(),
+                report_name: "shutdown.zip".into(),
                 key: LoadKey {
                     path: "shutdown.zip".into(),
                     stamp: None,
@@ -1771,9 +2131,54 @@ mod integration_tests {
         assert_eq!(&table[(4 + 7) * 5..(4 + 8) * 5], &[404, 0, 404, 1, 3]);
     }
     #[test]
+    fn shader_failure_notes_keep_the_reason_ahead_of_diagnostics() {
+        let reason = "Required shader programs are unavailable";
+        let mut details: Vec<_> = (0..10).map(|index| format!("Diagnostic {index}")).collect();
+        details.push(reason.into());
+        let notes = shader_failure_notes(reason, &details);
+        assert_eq!(notes.first().map(String::as_str), Some(reason));
+        assert_eq!(&notes[1..], &details[..10]);
+    }
+
+    #[test]
+    fn discarding_obsolete_shader_work_only_clears_its_pending_report() {
+        record_shader_report("B.zip", -1, &[], &["Parsing".into()], true);
+        clear_pending_shader_report("A.zip", -1);
+        clear_pending_shader_report("B.zip", 0);
+        REPORT.with_borrow(|report| assert!(report.is_some()));
+        clear_pending_shader_report("B.zip", -1);
+        REPORT.with_borrow(|report| assert!(report.is_none()));
+
+        record_report("B.zip", 0, &["final".into()], &[]);
+        clear_pending_shader_report("B.zip", 0);
+        REPORT.with_borrow(|report| {
+            assert_eq!(report.as_ref().unwrap()["programs"], json!(["final"]));
+        });
+
+        clear_shader_report();
+        REPORT.with_borrow(|report| assert!(report.is_none()));
+    }
+
+    #[test]
+    fn shader_runtime_reports_distinguish_pending_work_from_empty_results() {
+        record_shader_report("A.zip", 0, &[], &["Compiling".into()], true);
+        REPORT.with_borrow(|report| {
+            let report = report.as_ref().unwrap();
+            assert_eq!(report["pending"], true);
+            assert_eq!(report["programs"], json!([]));
+        });
+        record_report("A.zip", 0, &[], &["Unsupported program".into()]);
+        REPORT.with_borrow_mut(|report| {
+            let report = report.take().unwrap();
+            assert_eq!(report["pending"], false);
+            assert_eq!(report["programs"], json!([]));
+        });
+    }
+
+    #[test]
     fn failed_native_reload_reports_the_active_previous_programs() {
         record_report("Example.hshader", 0, &["sky".into(), "post".into()], &[]);
-        record_reload_error("Example.hshader", 0, &["bad shader".into()]);
+        record_reload_error("Example.hshader", 0, &["bad shader".into()], true);
         REPORT.with_borrow(|report| {
             let report = report.as_ref().unwrap();
             assert_eq!(report["programs"], json!(["sky", "post"]));
@@ -1785,12 +2190,31 @@ mod integration_tests {
             );
         });
         REPORT.with_borrow_mut(Option::take);
-        record_reload_error("Other.hshader", 0, &["bad initial shader".into()]);
+        record_reload_error("Other.hshader", 0, &["bad initial shader".into()], false);
         REPORT.with_borrow(|report| assert_eq!(report.as_ref().unwrap()["programs"], json!([])));
         REPORT.with_borrow_mut(Option::take);
     }
     #[test]
-    fn parser_results_are_nonblocking_and_collected_once() {
+    fn failed_reload_does_not_report_programs_the_renderer_dropped() {
+        record_report("Example.hshader", 0, &["sky".into()], &[]);
+        record_reload_error("Example.hshader", 0, &["manifest refused".into()], false);
+        REPORT.with_borrow(|report| {
+            let report = report.as_ref().unwrap();
+            assert_eq!(report["programs"], json!([]));
+            assert_eq!(report["notes"], json!(["manifest refused"]));
+        });
+        LAST_DISABLED.with_borrow_mut(|failure| *failure = Some(json!({"pack": "Failed.zip"})));
+        assert!(shutdown_parser());
+        REPORT.with_borrow(|report| assert!(report.is_none()));
+        LAST_DISABLED.with_borrow_mut(|failure| {
+            assert_eq!(failure.take(), Some(json!({"pack": "Failed.zip"})));
+        });
+    }
+
+    #[test]
+    fn parser_results_are_nonblocking_and_reach_only_the_owner() {
+        let owner = ParserInbox::default();
+        let other = ParserInbox::default();
         let (send, result) = std::sync::mpsc::channel();
         let key = LoadKey {
             path: "test.zip".into(),
@@ -1803,18 +2227,23 @@ mod integration_tests {
         };
         PENDING_LOAD.with_borrow_mut(|pending| {
             *pending = Some(PendingLoad {
+                inbox: Arc::downgrade(&owner.0),
+                report_name: "test.zip".into(),
                 key: key.clone(),
                 result,
                 worker: None,
             })
         });
-        assert!(poll_parser().is_none());
+        complete_parser();
+        assert!(owner.lock().is_none());
         send.send(Err("test error".into()))
             .unwrap_or_else(|_| panic!("receiver dropped"));
-        let (at, result) = poll_parser().unwrap();
-        assert!(at == key && result.is_err());
+        complete_parser();
+        assert!(other.lock().is_none());
         assert!(!parser_busy());
-        assert!(poll_parser().is_none());
+        let parsed = owner.lock().take().unwrap();
+        assert!(parsed.key == key && parsed.result.is_err());
+        assert!(owner.lock().is_none());
     }
 }
 

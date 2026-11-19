@@ -133,7 +133,11 @@ impl Game<'_> {
             let write = self.ui.screenshot_writes.remove(index);
             if write.chat {
                 self.release_screenshot_name(&write.save.original);
-                self.finish_screenshot(&path, &result, write.message);
+                let message = write.message.or_else(|| {
+                    let hdr = result.as_ref().ok()?.hdr_path.as_deref()?;
+                    Some(super::chat::screenshot_saved_line(&path, Some(hdr)))
+                });
+                self.finish_screenshot(&path, &result.map(|saved| saved.size), message);
             } else if let Err(error) = result {
                 log::warn!("Horizon: couldn't save the world icon: {error}");
             }

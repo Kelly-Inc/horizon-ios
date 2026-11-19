@@ -70,6 +70,20 @@ impl EntityCullDecision {
     }
 }
 
+/// What the entity culler calls on its host beyond the scene: the game's own occlusion
+/// methods, which mods target. Each runs the method of this type of the same name
+/// (`hidden_sync`, `hidden_sync_camera_bounds`, `terrain_sections_occlude`).
+pub trait OcclusionHost {
+    fn entity_hidden_sync(
+        &self,
+        vertices: Option<&[Vertex]>,
+        start: usize,
+        bounds: Option<Aabb>,
+    ) -> bool;
+    fn entity_hidden_sync_camera_bounds(&self, lo: glam::Vec3, hi: glam::Vec3) -> bool;
+    fn terrain_sections_occlude(&self, bounds: Aabb) -> bool;
+}
+
 /// The entity culler's state for this frame and what it keeps between frames.
 #[derive(Default)]
 pub struct EntityOcclusion {
@@ -126,27 +140,10 @@ impl EntityOcclusion {
         }
     }
 
-    pub fn cull_camera_bounds(
+    pub fn hidden_camera_bounds(
         &self,
         scene: SectionScene<'_>,
-        mode: EntityCullingMode,
-        lo: glam::Vec3,
-        hi: glam::Vec3,
-    ) -> bool {
-        if self.hidden_camera_bounds(scene, mode, lo, hi) {
-            if mode == EntityCullingMode::Asynchronous
-                && let Some(culler) = &self.asynchronous
-            {
-                culler.record_entity_vertices_culled(2);
-            }
-            return true;
-        }
-        false
-    }
-
-    fn hidden_camera_bounds(
-        &self,
-        scene: SectionScene<'_>,
+        host: &impl OcclusionHost,
         mode: EntityCullingMode,
         lo: glam::Vec3,
         hi: glam::Vec3,
@@ -180,14 +177,14 @@ impl EntityOcclusion {
                         }
                     }
                 } else {
-                    self.hidden_sync_camera_bounds(scene, lo, hi)
+                    host.entity_hidden_sync_camera_bounds(lo, hi)
                 }
             }
-            EntityCullingMode::Synchronous => self.hidden_sync_camera_bounds(scene, lo, hi),
+            EntityCullingMode::Synchronous => host.entity_hidden_sync_camera_bounds(lo, hi),
         }
     }
 
-    fn hidden_sync_camera_bounds(
+    pub fn hidden_sync_camera_bounds(
         &self,
         scene: SectionScene<'_>,
         lo: glam::Vec3,
@@ -203,6 +200,7 @@ impl EntityOcclusion {
     pub fn decide(
         &self,
         scene: SectionScene<'_>,
+        host: &impl OcclusionHost,
         mode: EntityCullingMode,
         render_id: u32,
         render_bounds: Aabb,
@@ -212,7 +210,7 @@ impl EntityOcclusion {
         // would make coarse walls falsely visible and force mesh generation.
         let margin = Vec3::new(1.0e-4, 1.0e-4, 1.0e-4);
         let bounds = render_bounds.inflate(margin);
-        if self.terrain_sections_occlude(scene, bounds) {
+        if host.terrain_sections_occlude(bounds) {
             if let Some(culler) = &self.asynchronous {
                 culler.record_entity_culled();
             }
@@ -221,7 +219,7 @@ impl EntityOcclusion {
         match mode {
             EntityCullingMode::Off => EntityCullDecision::Bypass,
             EntityCullingMode::Synchronous => {
-                if self.hidden_sync(scene, None, 0, Some(bounds)) {
+                if host.entity_hidden_sync(None, 0, Some(bounds)) {
                     EntityCullDecision::Hidden
                 } else {
                     EntityCullDecision::CheckVertices
@@ -229,7 +227,7 @@ impl EntityOcclusion {
             }
             EntityCullingMode::Asynchronous => {
                 let Some(culler) = &self.asynchronous else {
-                    return if self.hidden_sync(scene, None, 0, Some(bounds)) {
+                    return if host.entity_hidden_sync(None, 0, Some(bounds)) {
                         EntityCullDecision::Hidden
                     } else {
                         EntityCullDecision::CheckVertices
@@ -267,7 +265,7 @@ impl EntityOcclusion {
 
     /// Reject entities whose padded render bounds lie entirely in sections the
     /// terrain visibility graph cannot reach. Unknown graph cells fail open.
-    fn terrain_sections_occlude(&self, scene: SectionScene<'_>, bounds: Aabb) -> bool {
+    pub fn terrain_sections_occlude(&self, scene: SectionScene<'_>, bounds: Aabb) -> bool {
         if !self.section_visibility_valid || (self.sync.is_none() && self.asynchronous.is_none()) {
             return false;
         }
@@ -301,6 +299,7 @@ impl EntityOcclusion {
     pub fn hidden(
         &self,
         scene: SectionScene<'_>,
+        host: &impl OcclusionHost,
         mode: EntityCullingMode,
         vertices: Option<&[Vertex]>,
         start: usize,
@@ -308,7 +307,7 @@ impl EntityOcclusion {
     ) -> bool {
         match mode {
             EntityCullingMode::Off => false,
-            EntityCullingMode::Synchronous => self.hidden_sync(scene, vertices, start, bounds),
+            EntityCullingMode::Synchronous => host.entity_hidden_sync(vertices, start, bounds),
             EntityCullingMode::Asynchronous => {
                 if let Some(culler) = &self.asynchronous {
                     if !culler.camera_is_stationary() {
@@ -339,13 +338,13 @@ impl EntityOcclusion {
                         }
                     }
                 } else {
-                    self.hidden_sync(scene, vertices, start, bounds)
+                    host.entity_hidden_sync(vertices, start, bounds)
                 }
             }
         }
     }
 
-    fn hidden_sync(
+    pub fn hidden_sync(
         &self,
         scene: SectionScene<'_>,
         vertices: Option<&[Vertex]>,

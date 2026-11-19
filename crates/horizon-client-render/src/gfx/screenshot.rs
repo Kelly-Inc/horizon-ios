@@ -21,12 +21,13 @@ pub(super) struct HdrScreenshot {
 }
 
 /// Files successfully written for a requested screenshot.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SavedScreenshot {
     pub size: [u32; 2],
     pub hdr_path: Option<PathBuf>,
 }
 
-type SaveOutcome = (PathBuf, std::result::Result<[u32; 2], String>);
+type SaveOutcome = (PathBuf, std::result::Result<SavedScreenshot, String>);
 
 /// A screenshot being encoded after the owning-thread hook has returned.
 pub struct ScreenshotSave {
@@ -93,7 +94,7 @@ impl PendingScreenshot {
         ScreenshotSave::spawn(self.path.clone(), move || {
             let result = match destination {
                 Some((root, name)) => self.save_in(&root, &name),
-                None => self.save(),
+                None => self.save_with_details(),
             }
             .map_err(|e| e.to_string());
             (self.path, result)
@@ -151,7 +152,7 @@ impl PendingScreenshot {
 
     /// Validate a mod's relative file name at the write boundary, then save
     /// both copies inside `root`. No destination may traverse a symbolic link.
-    pub fn save_in(&mut self, root: &Path, file_name: &str) -> Result<[u32; 2]> {
+    pub fn save_in(&mut self, root: &Path, file_name: &str) -> Result<SavedScreenshot> {
         let path = screenshot_destination(root, file_name)?;
         if self.hdr.is_some() {
             // A `Path` puts the sibling's name after the OS's separator; the name stays portable.
@@ -166,8 +167,7 @@ impl PendingScreenshot {
         std::fs::create_dir_all(path.parent().expect("destination has a parent"))?;
         let staged = stage_screenshot(&path, |file| encode_sdr(image, file))?;
         self.path = publish_player_screenshot(staged, &path)?;
-        let _ = self.save_hdr(false);
-        Ok(size)
+        Ok(SavedScreenshot { size, hdr_path: self.save_hdr(false) })
     }
 }
 
@@ -326,7 +326,13 @@ mod tests {
             let save = ScreenshotSave::spawn(path.clone(), move || {
                 entered.send(std::thread::current().id()).unwrap();
                 blocked.recv().unwrap();
-                (path, Ok([1, 1]))
+                (
+                    path,
+                    Ok(SavedScreenshot {
+                        size: [1, 1],
+                        hdr_path: None,
+                    }),
+                )
             });
             assert!(queued.send((owner, save)).is_ok());
         });
@@ -353,7 +359,8 @@ mod tests {
             );
             std::thread::yield_now();
         };
-        assert_eq!(completed, (save.original.clone(), Ok([1, 1])));
+        assert_eq!(completed.0, save.original);
+        assert_eq!(completed.1.unwrap().size, [1, 1]);
         // Once a ready result can be consumed, dropping it cannot wait for
         // a live encoder. The quit supervisor uses this same readiness gate.
         assert!(
@@ -375,7 +382,9 @@ mod tests {
             .receiver
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        assert_eq!(result, Ok([1, 1]));
+        let saved = result.unwrap();
+        assert_eq!(saved.size, [1, 1]);
+        assert_eq!(saved.hdr_path, Some(root.path().join("changed_2-hdr.png")));
         assert_eq!(path, root.path().join("changed_2.png"));
         assert_eq!(std::fs::read(orphan).unwrap(), b"old");
         assert!(root.path().join("changed_2-hdr.png").exists());
@@ -406,7 +415,10 @@ mod tests {
         let mut pending = frame(original.clone(), true);
         assert!(!original.exists());
         assert_eq!(
-            pending.save_in(root.path(), "album/changed.png").unwrap(),
+            pending
+                .save_in(root.path(), "album/changed.png")
+                .unwrap()
+                .size,
             [1, 1]
         );
         assert!(!original.exists());
@@ -430,7 +442,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut pending = frame(root.path().join("unused.png"), false);
         pending.image_mut().rgba = vec![9, 8, 7, 255];
-        assert_eq!(pending.save_in(root.path(), "changed.png").unwrap(), [1, 1]);
+        let saved = pending.save_in(root.path(), "changed.png").unwrap();
+        assert_eq!(saved.size, [1, 1]);
+        assert_eq!(saved.hdr_path, None, "no HDR copy, none named");
         let file = std::fs::File::open(root.path().join("changed.png")).unwrap();
         let mut reader = png::Decoder::new(std::io::BufReader::new(file))
             .read_info()

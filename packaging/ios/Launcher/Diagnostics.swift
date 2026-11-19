@@ -113,7 +113,7 @@ enum Diagnostics {
         if bytes.count > maximum {
             bytes = bytes.prefix(maximum - 32)
             // Repair clipped UTF-8 at the boundary.
-            bytes = Data((String(decoding: bytes, as: UTF8.self) + "\n[truncated]\n").utf8)
+            bytes = Data((String(decoding: bytes, as: UTF8.self) + "\n[log shortened]\n").utf8)
         }
         return bytes
     }

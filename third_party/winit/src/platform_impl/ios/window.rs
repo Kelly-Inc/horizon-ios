@@ -292,7 +292,15 @@ impl Inner {
                 msg_send_id![&*scene, pointerLockState]
             });
             if state.is_none() {
-                return Err(ExternalError::NotSupported(NotSupportedError::new()));
+                // iPhone has no UIKit pointer lock. GameController still delivers a mouse's raw
+                // deltas and buttons, so with one attached the lock is virtual: captured input is
+                // forwarded as if locked (the system pointer stays drawn).
+                if !super::hardware_mouse::any_connected() {
+                    return Err(ExternalError::NotSupported(NotSupportedError::new()));
+                }
+                self.view.set_mouse_captured(true);
+                self.lock_watch.borrow_mut().request(false, Instant::now());
+                return Ok(());
             }
         }
         self.view_controller.set_pointer_locked(locked);

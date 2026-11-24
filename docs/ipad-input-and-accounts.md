@@ -16,6 +16,11 @@ launcher presentation, and focus loss release capture. UIKit may decline a captu
 window re-requests a missing lock four times a second (up to 8 times) before logging a warning, and
 hides the system pointer over the game while the cursor is hidden but the lock is not held.
 
+On iPhone, which has no pointer lock, an attached mouse captures virtually: it turns the view and
+clicks in play while the system pointer stays visible. Enable the mouse in Settings > Accessibility
+> Touch > AssistiveTouch > Devices > Pointer Devices. A mouse that starts moving during play takes the
+view over from touch.
+
 Touch overlays follow the last input device used. Connecting hardware alone does not hide them;
 touch input or disconnection of the last-used device restores them. Controllers remain supported.
 The app minimum stays iOS 16. See [the vendored patch notes](../third_party/winit/HORIZON.md)

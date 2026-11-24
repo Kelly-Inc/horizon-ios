@@ -14,6 +14,13 @@ on:
         type: string
         required: false
         default: ""
+      registry_mods:
+        description: >-
+          Native mods from the Horizon registry (playhorizon.dev/mods), by id, space or comma separated:
+          `veinsweep carryon`, `all` for every one, `-id` to switch one off (`all -mekanism`). The ids in
+          packaging/ios/native-mods/selection.txt are added. `list` only prints the registry's native mods.
+        type: string
+        default: ""
       bundled:
         description: >-
           Also build in the .hnmod files committed in packaging/ios/native-mods/ (shulker_peek, freecam_plus,
@@ -49,7 +56,21 @@ env:
   MIXINS_REV: 5a64af938ec86b00d53d16a408aabc0038fb3e57
 
 jobs:
+  catalog:
+    if: ${{ inputs.registry_mods == 'list' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: List the registry's native mods
+        run: |
+          python3 -I tools/ci/ios_registry_mods.py --list > mods.tsv
+          { echo "### Native mods in the Horizon registry"; echo; echo '| id | newest version that is not broken | name |'; echo '|---|---|---|';
+            awk -F'\t' '{printf "| `%s` | %s | %s |\n", $1, $2, $3}' mods.tsv; } >> "$GITHUB_STEP_SUMMARY"
   ipa:
+    if: ${{ inputs.registry_mods != 'list' }}
     runs-on: ${{ vars.MAC_RUNNER || 'macos-26' }}
     timeout-minutes: 120
     defaults:
@@ -86,6 +107,15 @@ jobs:
               echo "bundled: $f"
             done
           done
+      - name: Fetch registry mods
+        env:
+          PICKS: ${{ inputs.registry_mods }}
+        run: |
+          set -euo pipefail -f
+          mkdir -p "$RUNNER_TEMP/mods"
+          # shellcheck disable=SC2086  # the picks are words on purpose
+          python3 -I tools/ci/ios_registry_mods.py --out "$RUNNER_TEMP/mods" \
+            --selection packaging/ios/native-mods/selection.txt -- $PICKS
       - name: Fetch the mods
         env:
           MODS: ${{ inputs.mods }}
@@ -108,17 +138,37 @@ jobs:
             done < <(find "$dest" -name horizon-mixin.toml -not -path '*/.git/*')
             [ "$found" = 1 ] || { echo "::error::$repo holds no horizon-mixin.toml"; exit 1; }
           done <<< "$MODS"
+      - name: Re-pin the mods to this commit
+        if: ${{ inputs.repin }}
+        run: |
+          set -euo pipefail
+          for t in "$RUNNER_TEMP"/mods/*/horizon-mixin.toml; do
+            sed -E -i.bak "s/^(horizon_revision[[:space:]]*=[[:space:]]*\")[0-9a-f]{40}(\")/\1$GITHUB_SHA\2/" "$t"
+            grep -q "$GITHUB_SHA" "$t" || { echo "::error::could not re-pin $t"; exit 1; }
+            rm -f "$t.bak"
+          done
+      - name: Leave out mods horizon-mixins refuses
+        run: |
+          set -uo pipefail
+          # Each mod is applied alone first: a mod this source cannot take (a renamed function, a missing hook
+          # point) is left out with a warning instead of failing the whole build, as the launcher does.
+          for dir in "$RUNNER_TEMP"/mods/*/; do
+            name="$(basename "$dir")"
+            rm -rf "$RUNNER_TEMP/one" "$RUNNER_TEMP/one-out"; mkdir -p "$RUNNER_TEMP/one"
+            cp -a "$dir" "$RUNNER_TEMP/one/$name"
+            if "$RUNNER_TEMP/mixins/bin/horizon-mixins" apply --workspace . --mods "$RUNNER_TEMP/one" --out "$RUNNER_TEMP/one-out" > "$RUNNER_TEMP/one.log" 2>&1; then
+              echo "ok: $name"
+            else
+              echo "::warning::$name left out: $(head -c 300 "$RUNNER_TEMP/one.log" | tr '\n' ' ')"
+              rm -rf "$dir"
+            fi
+          done
+          rm -rf "$RUNNER_TEMP/one" "$RUNNER_TEMP/one-out"
       - name: Apply the mods to the game's source
         run: |
           set -euo pipefail
-          ls "$RUNNER_TEMP/mods" | grep -q . || { echo "::error::No mods: tick bundled or list some"; exit 1; }
-          if [ "${{ inputs.repin }}" = "true" ]; then
-            for t in "$RUNNER_TEMP"/mods/*/horizon-mixin.toml; do
-              sed -E -i.bak "s/^(horizon_revision[[:space:]]*=[[:space:]]*\")[0-9a-f]{40}(\")/\1$GITHUB_SHA\2/" "$t"
-              grep -q "$GITHUB_SHA" "$t" || { echo "::error::could not re-pin $t"; exit 1; }
-              rm -f "$t.bak"
-            done
-          fi
+          ls "$RUNNER_TEMP/mods" | grep -q . || { echo "::error::No mods left: tick bundled, name some, or see the warnings above"; exit 1; }
+          echo "Building with: $(ls "$RUNNER_TEMP/mods" | tr '\n' ' ')"
           "$RUNNER_TEMP/mixins/bin/horizon-mixins" apply --workspace . --mods "$RUNNER_TEMP/mods" --out "$RUNNER_TEMP/patched"
           # The rest of the job builds from the patched workspace; fail here, not in Cargo, if it is not one.
           test -f "$RUNNER_TEMP/patched/Cargo.toml" || { echo "::error::horizon-mixins did not write a workspace to --out"; exit 1; }

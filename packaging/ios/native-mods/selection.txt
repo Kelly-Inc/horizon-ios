@@ -1,0 +1,9 @@
+# Native mods from the Horizon registry (https://playhorizon.dev/mods?kind=native-mod) that the ios-mods
+# workflow builds in every run, one id per line or several per line. Delete a line or put # in front of it to
+# switch a mod off; a leading - (for example `all` then `-mekanism`) switches one off after `all`.
+# Run the workflow with registry_mods = list to print every id. Start small: each mod adds build time, size and
+# a chance that the game stops compiling. The bundled .hnmod files in this folder are separate (the `bundled` input).
+#
+# veinsweep
+# carryon
+# dynamicfps

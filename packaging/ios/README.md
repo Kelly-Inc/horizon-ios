@@ -268,3 +268,19 @@ it applies them with horizon-mixins, builds the patched game for `aarch64-apple-
 `Horizon-game-mods-unsigned.ipa` to sideload. Changing the mod list means a new run. A mod pins the Horizon commit it
 was made for (`horizon_revision` in its `horizon-mixin.toml`); one pinned to another commit is refused by
 horizon-mixins, so build from a fork commit the mod supports. Not yet run on a Mac runner.
+
+### Picking mods from the registry
+
+The same workflow can build in any native mod listed at [playhorizon.dev/mods](https://playhorizon.dev/mods?kind=native-mod),
+read from the registry's `index.json`. Which ones is chosen when the IPA is built, not on the phone: a native mod is
+compiled into the game, so it cannot be switched on and off at runtime.
+
+1. Run **ios-mods** with `registry_mods` = `list`: the run summary lists every native mod's id and newest usable version.
+2. Choose: run it with `registry_mods` = `veinsweep carryon` (ids), `all`, or `all -mekanism` (a leading `-` switches one off),
+   or keep standing choices in `packaging/ios/native-mods/selection.txt` (one id per line, `#` switches a line off). Both are added.
+   Untick `bundled` to leave out the three .hnmod files in that folder.
+3. Each file is checked against the index's size and SHA-256 (not its minisign signature), applied alone first, and left
+   out with a warning if horizon-mixins refuses it on this source; the rest are applied together and compiled.
+
+`all` is unlikely to build: mods are pinned to different Horizon commits, some conflict, and every one adds compile time
+and app size. Add a few at a time. Not yet run against the real registry.

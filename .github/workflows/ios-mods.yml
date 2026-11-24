@@ -12,7 +12,20 @@ on:
           Native mods, one per line: a GitHub repo `owner/repo` or `owner/repo@ref`. Each repo's root, or the
           folders in it, that hold a horizon-mixin.toml are used.
         type: string
-        required: true
+        required: false
+        default: ""
+      bundled:
+        description: >-
+          Also build in the .hnmod files committed in packaging/ios/native-mods/ (shulker_peek, freecam_plus,
+          horizonmatica).
+        type: boolean
+        default: true
+      repin:
+        description: >-
+          Re-pin every mod's horizon_revision to this commit, as the desktop launcher does for a mod built on another
+          Nightly. A mod that needs its exact commit may then fail to compile; the log says where.
+        type: boolean
+        default: true
       trust_native_code:
         description: >-
           I read the source of every mod above. Native mods are native code with full access to the game and
@@ -58,6 +71,21 @@ jobs:
           targets: ${{ env.IOS_TARGET }}
       - name: Build horizon-mixins
         run: cargo install --locked --git https://github.com/horizon-rust/horizon-mixins --rev "$MIXINS_REV" --root "$RUNNER_TEMP/mixins" horizon-mixins-cli
+      - name: Unpack the bundled mods
+        if: ${{ inputs.bundled }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mods" "$RUNNER_TEMP/unpack"
+          for f in packaging/ios/native-mods/*.hnmod; do
+            id="$(basename "$f" .hnmod)"
+            unzip -q -o "$f" -d "$RUNNER_TEMP/unpack/$id"
+            # An .hnmod is horizon-native.json plus mixins/<id>/, which holds the horizon-mixin.toml.
+            for dir in "$RUNNER_TEMP/unpack/$id"/mixins/*/; do
+              test -f "$dir/horizon-mixin.toml" || { echo "::error::$f has no mixins/<id>/horizon-mixin.toml"; exit 1; }
+              cp -a "${dir%/}" "$RUNNER_TEMP/mods/b-$(basename "$dir")"
+              echo "bundled: $f"
+            done
+          done
       - name: Fetch the mods
         env:
           MODS: ${{ inputs.mods }}
@@ -83,6 +111,14 @@ jobs:
       - name: Apply the mods to the game's source
         run: |
           set -euo pipefail
+          ls "$RUNNER_TEMP/mods" | grep -q . || { echo "::error::No mods: tick bundled or list some"; exit 1; }
+          if [ "${{ inputs.repin }}" = "true" ]; then
+            for t in "$RUNNER_TEMP"/mods/*/horizon-mixin.toml; do
+              sed -E -i.bak "s/^(horizon_revision[[:space:]]*=[[:space:]]*\")[0-9a-f]{40}(\")/\1$GITHUB_SHA\2/" "$t"
+              grep -q "$GITHUB_SHA" "$t" || { echo "::error::could not re-pin $t"; exit 1; }
+              rm -f "$t.bak"
+            done
+          fi
           "$RUNNER_TEMP/mixins/bin/horizon-mixins" apply --workspace . --mods "$RUNNER_TEMP/mods" --out "$RUNNER_TEMP/patched"
           # The rest of the job builds from the patched workspace; fail here, not in Cargo, if it is not one.
           test -f "$RUNNER_TEMP/patched/Cargo.toml" || { echo "::error::horizon-mixins did not write a workspace to --out"; exit 1; }
